@@ -23,7 +23,7 @@ from typing import Optional
 
 import nltk
 import torch
-from nemo_text_processing.g2p.data.data_utils import english_word_tokenize
+from nemo_text_processing.g2p.data.data_utils import english_word_tokenize, ipa_word_tokenize
 
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
@@ -263,7 +263,7 @@ class IPAG2P(BaseG2p):
     def __init__(
         self,
         phoneme_dict,
-        word_tokenize_func=english_word_tokenize,
+        locale="en-US",
         apply_to_oov_word=None,
         ignore_ambiguous_words=True,
         heteronyms=None,
@@ -280,13 +280,7 @@ class IPAG2P(BaseG2p):
         Args:
             phoneme_dict (str, Path, Dict): Path to file in CMUdict format or dictionary of CMUdict-like entries.
                 Must be given for IPA G2P. (Consider using scripts/tts_dataset_files/ipa_cmudict-0.7b_nv22.06.txt.)
-            word_tokenize_func: Function for tokenizing text to words.
-                It has to return List[Tuple[Union[str, List[str]], bool]] where every tuple denotes word
-                representation and flag whether to leave unchanged or not.
-                It is expected that unchangeable word representation will be represented as List[str], other
-                cases are represented as str.
-                It is useful to mark word as unchangeable which is already in phoneme representation.
-                Defaults to the English word tokenizer.
+            locale: Locale used to determine tokenization logic.
             apply_to_oov_word: Function that will be applied to out of phoneme_dict word.
             ignore_ambiguous_words: Whether to not handle word via phoneme_dict with ambiguous phoneme sequences.
                 Defaults to True.
@@ -357,6 +351,11 @@ class IPAG2P(BaseG2p):
                 "This may be intended if phonemes and chars are both valid inputs, otherwise, "
                 "you may see unexpected deletions in your input."
             )
+
+        if locale == "en-US":
+            word_tokenize_func = english_word_tokenize
+        else:
+            word_tokenize_func = ipa_word_tokenize
 
         super().__init__(
             phoneme_dict=self.phoneme_dict,
