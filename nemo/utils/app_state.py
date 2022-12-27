@@ -47,7 +47,9 @@ class AppState(metaclass=Singleton):
         self._tensor_model_parallel_size = None
         self._tensor_model_parallel_group = None
         self._pipeline_model_parallel_size = None
+        self._virtual_pipeline_model_parallel_size = None
         self._pipeline_model_parallel_group = None
+        self._pipeline_model_parallel_split_rank = None
         self._is_megatron_initialized = False
         self._data_parallel_size = None
         self._data_parallel_group = None
@@ -153,6 +155,22 @@ class AppState(metaclass=Singleton):
         self._pipeline_model_parallel_size = size
 
     @property
+    def virtual_pipeline_model_parallel_size(self):
+        """ Property returns the number of GPUs in each model parallel group.
+            Returns:
+                Number of GPUs in each model parallel group.
+        """
+        return self._virtual_pipeline_model_parallel_size
+
+    @virtual_pipeline_model_parallel_size.setter
+    def virtual_pipeline_model_parallel_size(self, size):
+        """ Property sets the size of the virtual pipeline parallel model.
+            Args:
+                size (int):  Number of modules in each pipeline parallel model.
+        """
+        self._virtual_pipeline_model_parallel_size = size
+
+    @property
     def data_parallel_size(self):
         """ Property returns the number of GPUs in each data parallel group.
             Returns:
@@ -202,65 +220,97 @@ class AppState(metaclass=Singleton):
 
     @property
     def tensor_model_parallel_rank(self):
-        """ Property returns the model parallel rank.
+        """ Property returns the tensor model parallel rank.
             Returns:
-                Model parallel rank.
+                Tensor model parallel rank.
         """
         return self._tensor_model_parallel_rank
 
     @tensor_model_parallel_rank.setter
     def tensor_model_parallel_rank(self, rank):
-        """ Property sets the model parallel rank.
+        """ Property sets the tensor model parallel rank.
             Args:
-                rank (int):  Model parallel rank.
+                rank (int):  Tensor model parallel rank.
         """
         self._tensor_model_parallel_rank = rank
 
     @property
     def tensor_model_parallel_group(self):
-        """ Property returns the model parallel group.
+        """ Property returns the tensor model parallel group.
             Returns:
-                Model parallel group.
+                Tensor model parallel group.
         """
         return self._tensor_model_parallel_group
 
     @tensor_model_parallel_group.setter
     def tensor_model_parallel_group(self, group):
-        """ Property sets the model parallel group.
+        """ Property sets the tensor model parallel group.
             Args:
-                group:  Model parallel group.
+                group:  Tensor model parallel group.
         """
         self._tensor_model_parallel_group = group
 
     @property
     def pipeline_model_parallel_rank(self):
-        """ Property returns the model parallel rank.
+        """ Property returns the pipeline model parallel rank.
             Returns:
-                Model parallel rank.
+                Pipeline model parallel rank.
         """
         return self._pipeline_model_parallel_rank
 
     @pipeline_model_parallel_rank.setter
     def pipeline_model_parallel_rank(self, rank):
-        """ Property sets the model parallel rank.
+        """ Property sets the pipeline model parallel rank.
             Args:
-                rank (int):  Model parallel rank.
+                rank (int):  Pipeline model parallel rank.
         """
         self._pipeline_model_parallel_rank = rank
 
     @property
-    def pipeline_model_parallel_group(self):
-        """ Property returns the model parallel group.
+    def virtual_pipeline_model_parallel_rank(self):
+        """ Property returns the virtual pipeline parallel rank.
             Returns:
-                Model parallel group.
+                Model parallel rank.
+        """
+        return self._virtual_pipeline_model_parallel_rank
+
+    @virtual_pipeline_model_parallel_rank.setter
+    def virtual_pipeline_model_parallel_rank(self, rank):
+        """ Property sets the virtual pipeline parallel rank.
+            Args:
+                rank (int):  Virtual pipeline parallel rank.
+        """
+        self._virtual_pipeline_model_parallel_rank = rank
+
+    @property
+    def pipeline_model_parallel_split_rank(self):
+        """ Property returns the rank at which Encoder and Decoder are split into different pipelines for Megatrron Encoder-Decoder models.
+            Returns:
+                Pipeline model parallel split rank.
+        """
+        return self._pipeline_model_parallel_split_rank
+
+    @pipeline_model_parallel_split_rank.setter
+    def pipeline_model_parallel_split_rank(self, rank):
+        """ Property sets the rank at which Encoder and Decoder are split into different pipelines for Megatrron Encoder-Decoder models.
+            Args:
+                rank (int): Model parallel split rank.
+        """
+        self._pipeline_model_parallel_split_rank = rank
+
+    @property
+    def pipeline_model_parallel_group(self):
+        """ Property returns the pipeline model parallel group.
+            Returns:
+                Pipeline model parallel group.
         """
         return self._pipeline_model_parallel_group
 
     @pipeline_model_parallel_group.setter
     def pipeline_model_parallel_group(self, group):
-        """ Property sets the model parallel group.
+        """ Property sets the pipeline model parallel group.
             Args:
-                group:  Model parallel group.
+                group:  Pipeline model parallel group.
         """
         self._pipeline_model_parallel_group = group
 

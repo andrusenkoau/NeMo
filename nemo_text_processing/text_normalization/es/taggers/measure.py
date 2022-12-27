@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pynini
 from nemo_text_processing.text_normalization.en.graph_utils import (
     NEMO_ALPHA,
-    NEMO_DIGIT,
     NEMO_NON_BREAKING_SPACE,
+    NEMO_SIGMA,
     NEMO_SPACE,
     GraphFst,
     convert_space,
@@ -23,23 +24,11 @@ from nemo_text_processing.text_normalization.en.graph_utils import (
 )
 from nemo_text_processing.text_normalization.es.graph_utils import strip_cardinal_apocope
 from nemo_text_processing.text_normalization.es.utils import get_abs_path
+from pynini.lib import pynutil
 
-try:
-    import pynini
-    from pynini.lib import pynutil
-
-    unit = pynini.string_file(get_abs_path("data/measures/measurements.tsv"))
-    unit_plural_fem = pynini.string_file(get_abs_path("data/measures/measurements_plural_fem.tsv"))
-    unit_plural_masc = pynini.string_file(get_abs_path("data/measures/measurements_plural_masc.tsv"))
-
-    PYNINI_AVAILABLE = True
-
-except (ModuleNotFoundError, ImportError):
-    unit = None
-    unit_plural_fem = None
-    unit_plural_masc = None
-
-    PYNINI_AVAILABLE = False
+unit = pynini.string_file(get_abs_path("data/measures/measurements.tsv"))
+unit_plural_fem = pynini.string_file(get_abs_path("data/measures/measurements_plural_fem.tsv"))
+unit_plural_masc = pynini.string_file(get_abs_path("data/measures/measurements_plural_masc.tsv"))
 
 
 class MeasureFst(GraphFst):
@@ -98,7 +87,7 @@ class MeasureFst(GraphFst):
         subgraph_decimal = decimal.fst + insert_space + pynini.closure(NEMO_SPACE, 0, 1) + unit_plural
 
         subgraph_cardinal = (
-            (optional_graph_negative + (pynini.closure(NEMO_DIGIT) - "1")) @ cardinal.fst
+            (optional_graph_negative + (NEMO_SIGMA - "1")) @ cardinal.fst
             + insert_space
             + pynini.closure(delete_space, 0, 1)
             + unit_plural
@@ -111,7 +100,7 @@ class MeasureFst(GraphFst):
             + unit_singular_graph
         )
 
-        subgraph_fraction = fraction.fst + insert_space + pynini.closure(delete_space, 0, 1) + unit_plural
+        subgraph_fraction = fraction.fst + insert_space + pynini.closure(delete_space, 0, 1) + unit_singular_graph
 
         decimal_times = (
             pynutil.insert("decimal { ")
@@ -170,10 +159,10 @@ class MeasureFst(GraphFst):
         final_graph = (
             subgraph_decimal
             | subgraph_cardinal
-            | subgraph_fraction
             | cardinal_dash_alpha
             | alpha_dash_cardinal
             | decimal_dash_alpha
+            | subgraph_fraction
             | decimal_times
             | cardinal_times
             | alpha_dash_decimal

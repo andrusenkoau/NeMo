@@ -17,7 +17,7 @@ import os
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import wrapt
 
@@ -59,7 +59,7 @@ class ArtifactItem:
     hashed_path: Optional[str] = None
 
 
-def resolve_dataset_name_from_cfg(cfg: 'DictConfig') -> str:
+def resolve_dataset_name_from_cfg(cfg: 'DictConfig') -> Optional[str]:
     """
     Parses items of the provided sub-config to find the first potential key that
     resolves to an existing file or directory.
@@ -174,6 +174,15 @@ def parse_dataset_as_name(name: str) -> str:
 
     if 'dataset' in name:
         name = name.replace('dataset', '')
+
+    # Test if the manifes/dataset name was simply `manifest.yaml` or `dataset.yaml`: Invalid names.
+    if name == '':
+        raise ValueError(
+            "Provided dataset / manifest filename was `manifest.json` or `dataset.json`.\n"
+            "Such a name is invalid, since multiple datasets/manifests can share the same name,\n"
+            "thereby overriding their results during logging. Please pick a more discriptive filename \n"
+            "for the provided dataset / manifest file."
+        )
 
     if '_' != name[-1]:
         name = name + '_'
@@ -503,7 +512,7 @@ def resolve_subclass_pretrained_model_info(base_class) -> List['PretrainedModelI
     return list_of_models
 
 
-def check_lib_version(lib_name: str, checked_version: str, operator) -> (Optional[bool], str):
+def check_lib_version(lib_name: str, checked_version: str, operator) -> Tuple[Optional[bool], str]:
     """
     Checks if a library is installed, and if it is, checks the operator(lib.__version__, checked_version) as a result.
     This bool result along with a string analysis of result is returned.
@@ -575,11 +584,25 @@ def resolve_cache_dir() -> Path:
     return path
 
 
+def uninject_model_parallel_rank(filepath):
+    filepath = str(filepath)
+    if 'mp_rank' in filepath or 'tp_rank' in filepath:
+        dirname = os.path.dirname(os.path.dirname(filepath))
+        basename = os.path.basename(filepath)
+        filepath = os.path.join(dirname, basename)
+        return filepath
+    else:
+        return filepath
+
+
 def inject_model_parallel_rank(filepath):
     """
     Injects tensor/pipeline model parallel ranks into the filepath.
     Does nothing if not using model parallelism.
     """
+    # first make sure filepath does not have rank
+    filepath = uninject_model_parallel_rank(filepath)
+
     app_state = AppState()
     if app_state.model_parallel_size is not None and app_state.model_parallel_size > 1:
         # filepath needs to be updated to include mp_rank
@@ -589,16 +612,6 @@ def inject_model_parallel_rank(filepath):
             filepath = f'{dirname}/mp_rank_{app_state.tensor_model_parallel_rank:02d}/{basename}'
         else:
             filepath = f'{dirname}/tp_rank_{app_state.tensor_model_parallel_rank:02d}_pp_rank_{app_state.pipeline_model_parallel_rank:03d}/{basename}'
-        return filepath
-    else:
-        return filepath
-
-
-def uninject_model_parallel_rank(filepath):
-    if 'mp_rank' or 'tp_rank' in filepath:
-        dirname = os.path.dirname(os.path.dirname(filepath))
-        basename = os.path.basename(filepath)
-        filepath = os.path.join(dirname, basename)
         return filepath
     else:
         return filepath

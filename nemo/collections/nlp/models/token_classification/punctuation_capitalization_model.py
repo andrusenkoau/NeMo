@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import warnings
 from math import ceil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -46,7 +47,6 @@ from nemo.collections.nlp.models.token_classification.punctuation_capitalization
     legacy_model_config_to_new_model_config,
 )
 from nemo.collections.nlp.modules.common import TokenClassifier
-from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.neural_types import LogitsType, NeuralType
@@ -73,18 +73,13 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
     :class:`~nemo.collections.nlp.data.token_classification.punctuation_capitalization_tarred_dataset.BertPunctuationCapitalizationTarredDataset`.
 
     Args:
-        cfg (:obj:`DictConfig`): a model configuration. It should follow dataclass
+        cfg: a model configuration. It should follow dataclass
             :class:`~nemo.collections.nlp.models.token_classification.punctuation_capitalization_config.PunctuationCapitalizationModelConfig`
             See an example of full config in
             `nemo/examples/nlp/token_classification/conf/punctuation_capitalization_config.yaml
             <https://github.com/NVIDIA/NeMo/blob/main/examples/nlp/token_classification/conf/punctuation_capitalization_config.yaml>`_
-        trainer (:obj:`pytorch_lightning.Trainer`): an instance of a PyTorch Lightning trainer
+        trainer: an instance of a PyTorch Lightning trainer
     """
-
-    @property
-    def input_types(self) -> Optional[Dict[str, NeuralType]]:
-        """Neural types of a :meth:`forward` method input."""
-        return self.bert_model.input_types
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -98,10 +93,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
         """Initializes BERT Punctuation and Capitalization model."""
         if is_legacy_model_config(cfg):
             cfg = legacy_model_config_to_new_model_config(cfg)
-        self.setup_tokenizer(cfg.tokenizer)
-        self.world_size = 1
-        if trainer is not None:
-            self.world_size = trainer.num_nodes * trainer.num_gpus
+
         # For structure of `self.metrics` attribute see `self._setup_metrics_dictionary` method.
         self.metrics: Optional[torch.nn.ModuleDict] = None
         self.label_ids_are_set: bool = False
@@ -110,16 +102,9 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
         super().__init__(cfg=cfg, trainer=trainer)
         if not self.label_ids_are_set:
             self._set_label_ids()
-        self.bert_model = get_lm_model(
-            pretrained_model_name=cfg.language_model.pretrained_model_name,
-            config_file=self.register_artifact('language_model.config_file', cfg.language_model.config_file),
-            config_dict=OmegaConf.to_container(cfg.language_model.config) if cfg.language_model.config else None,
-            checkpoint_file=cfg.language_model.lm_checkpoint,
-            vocab_file=self.register_artifact('tokenizer.vocab_file', cfg.tokenizer.vocab_file),
-        )
 
         self.punct_classifier = TokenClassifier(
-            hidden_size=self.bert_model.config.hidden_size,
+            hidden_size=self.hidden_size,
             num_classes=len(self.punct_label_ids),
             activation=cfg.punct_head.activation,
             log_softmax=False,
@@ -129,7 +114,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
         )
 
         self.capit_classifier = TokenClassifier(
-            hidden_size=self.bert_model.config.hidden_size,
+            hidden_size=self.hidden_size,
             num_classes=len(self.capit_label_ids),
             activation=cfg.capit_head.activation,
             log_softmax=False,
@@ -169,9 +154,12 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
         hidden_states = self.bert_model(
             input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
         punct_logits = self.punct_classifier(hidden_states=hidden_states)
         capit_logits = self.capit_classifier(hidden_states=hidden_states)
-        return punct_logits, capit_logits
+        return punct_logits.float(), capit_logits.float()
 
     def _make_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         punct_logits, capit_logits = self(
@@ -311,7 +299,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
 
         Args:
             outputs (:obj:`pytorch_lightning.utilities.types.EPOCH_OUTPUT`): an output of all training steps. It is a
-                mandatory PyTorch Lightning parameter and it is not used in this method
+                mandatory PyTorch Lightning parameter, and it is not used in this method
         """
         shuffle = self._cfg.train_ds.get('shuffle')
         if shuffle is None:  # Encountered legacy config
@@ -360,7 +348,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
 
     def update_config_after_restoring_from_checkpoint(self, **kwargs) -> None:
         """
-        Set new values for some sections of config. Useful after restoring from checkpoint for fine tuning
+        Set new values for some sections of config. Useful after restoring from checkpoint for fine-tuning
         and testing if config parameters of a restored checkpoint are not suitable.
 
         For ``class_labels``, ``common_dataset_parameters``, ``train_ds``, ``validation_ds``, ``test_ds``, there is
@@ -392,7 +380,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
 
         Keyword Args:
             class_labels (:obj:`Union[DictConfig, Dict[str, str]]`): names of label id files used as label
-                id dictionaries. See more in :ref:`class labels config<class-labels-config-label>`.
+                id dictionaries. See more in :ref:`class labels' config<class-labels-config-label>`.
             common_dataset_parameters (:obj:`Union[DictConfig, Dict[str, Any]]`, `optional`): see more in
                 :ref:`common dataset parameters config<common-dataset-parameters-config-label>`.
             train_ds (:obj:`Union[DictConfig, Dict[str, Any]]`, `optional`): configuration of training dataset. See
@@ -480,6 +468,24 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
             train_data_config = self._cfg.train_ds
 
         self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config, train=True)
+
+        # Need to set this because if using an IterableDataset, the length of the dataloader is the total number
+        # of samples rather than the number of batches, and this messes up the tqdm progress bar.
+        # So we set the number of steps manually (to the correct number) to fix this.
+        if 'use_tarred_dataset' in train_data_config and train_data_config['use_tarred_dataset']:
+            # We also need to check if limit_train_batches is already set.
+            # If it's an int, we assume that the user has set it to something sane, i.e. <= # training batches,
+            # and don't change it. Otherwise, adjust batches accordingly if it's a float (including 1.0).
+            if self._trainer is not None and isinstance(self._trainer.limit_train_batches, float):
+                self._trainer.limit_train_batches = int(
+                    self._trainer.limit_train_batches * ceil(len(self._train_dl.dataset) / self.world_size)
+                )
+            elif self._trainer is None:
+                logging.warning(
+                    "Model Trainer was not set before constructing the dataset, incorrect number of "
+                    "training batches will be used. Please set the trainer and rebuild the dataset."
+                )
+
         self.punct_label_ids = self._train_dl.dataset.punct_label_ids.copy()
         self.capit_label_ids = self._train_dl.dataset.capit_label_ids.copy()
         self.label_ids_are_set = True
@@ -552,6 +558,24 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
             val_data_config = self._cfg.validation_ds
 
         self._validation_dl = self._setup_dataloader_from_config(cfg=val_data_config, train=False)
+
+        # Need to set this because if using an IterableDataset, the length of the dataloader is the total number
+        # of samples rather than the number of batches, and this messes up the tqdm progress bar.
+        # So we set the number of steps manually (to the correct number) to fix this.
+        if 'use_tarred_dataset' in val_data_config and val_data_config['use_tarred_dataset']:
+            # We also need to check if limit_val_batches is already set.
+            # If it's an int, we assume that the user has set it to something sane, i.e. <= # validation batches,
+            # and don't change it. Otherwise, adjust batches accordingly if it's a float (including 1.0).
+            if self._trainer is not None and isinstance(self._trainer.limit_val_batches, float):
+                self._trainer.limit_val_batches = int(
+                    self._trainer.limit_val_batches * ceil(len(self._validation_dl.dataset) / self.world_size)
+                )
+            elif self._trainer is None:
+                logging.warning(
+                    "Model Trainer was not set before constructing the dataset, incorrect number of "
+                    "validation batches will be used. Please set the trainer and rebuild the dataset."
+                )
+
         loss_kw, punct_kw, capit_kw = self._get_eval_metrics_kwargs()
         self.metrics['val']['loss'].append(GlobalAverageLossMetric(**loss_kw))
         self.metrics['val']['punct_class_report'].append(ClassificationReport(**punct_kw))
@@ -651,16 +675,16 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 )
 
     def _extract_label_vocab_files_from_config(self) -> Tuple[Optional[Path], Optional[Path]]:
-        if self._cfg.common_dataset_parameters.label_vocab_dir is None:
-            if self._is_model_being_restored():
-                punct_label_vocab_file = self._cfg.class_labels.punct_labels_file
-                capit_label_vocab_file = self._cfg.class_labels.capit_labels_file
-            else:
-                punct_label_vocab_file, capit_label_vocab_file = None, None
+        if self._is_model_being_restored():
+            punct_label_vocab_file = self._cfg.class_labels.punct_labels_file
+            capit_label_vocab_file = self._cfg.class_labels.capit_labels_file
         else:
-            label_vocab_dir = Path(self._cfg.common_dataset_parameters.label_vocab_dir).expanduser()
-            punct_label_vocab_file = label_vocab_dir / self._cfg.class_labels.punct_labels_file
-            capit_label_vocab_file = label_vocab_dir / self._cfg.class_labels.capit_labels_file
+            if self._cfg.common_dataset_parameters.label_vocab_dir is None:
+                punct_label_vocab_file, capit_label_vocab_file = None, None
+            else:
+                label_vocab_dir = Path(self._cfg.common_dataset_parameters.label_vocab_dir).expanduser()
+                punct_label_vocab_file = label_vocab_dir / self._cfg.class_labels.punct_labels_file
+                capit_label_vocab_file = label_vocab_dir / self._cfg.class_labels.capit_labels_file
         return punct_label_vocab_file, capit_label_vocab_file
 
     def _set_label_ids(self) -> None:
@@ -670,7 +694,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
 
         This method also registers artifacts ``class_labels.punct_labels_file`` and ``class_labels.capit_labels_file``.
 
-        This method is called if do not plan to infer label ids from training file with labels. If training file
+        This method is called if you do not plan to infer label ids from training file with labels. If training file
         with labels is going to be used, then calling :meth:`~setup_training_data` is enough to set
         ``punct_label_ids`` and ``capit_label_ids`` and register label artifacts.
         """
@@ -753,7 +777,9 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 world_size=self.world_size,
                 global_rank=self.global_rank,
                 shuffle_n=cfg.tar_shuffle_n,
+                shard_strategy=cfg.shard_strategy,
                 label_info_save_dir=cfg.label_info_save_dir,
+                use_audio=cfg.use_audio,
             )
             dataset.check_for_label_consistency_with_model_config(
                 self.punct_label_ids,
@@ -768,11 +794,13 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                     f"dataset config must not be `None`. Whereas `text_file={cfg.text_file}` and "
                     f"`label_file={cfg.labels_file}`."
                 )
-            if cfg.tokens_in_batch is None:
+            if cfg.tokens_in_batch is None and cfg.use_bucketing:
                 raise ValueError(
                     f"If `use_tarred_dataset` is `False`, then you need to provide `tokens_in_batch` parameter."
                 )
-            text_file, labels_file = Path(cfg.ds_item) / cfg.text_file, Path(cfg.ds_item) / cfg.labels_file
+            text_file, labels_file, = Path(cfg.ds_item) / cfg.text_file, Path(cfg.ds_item) / cfg.labels_file
+            if cfg.audio_file:
+                audio_file = Path(cfg.ds_item) / cfg.audio_file
             if self.label_ids_are_set:
                 label_kwargs = {'punct_label_ids': self.punct_label_ids, 'capit_label_ids': self.capit_label_ids}
             else:
@@ -783,6 +811,46 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                     'punct_label_vocab_file': punct_label_vocab_file,
                     'capit_label_vocab_file': capit_label_vocab_file,
                 }
+            if train:
+                number_of_batches_is_multiple_of = 1
+                if self._trainer is None:
+                    warnings.warn(
+                        'A model attribute `trainer` is not set before training dataset setting. If training is '
+                        'resumed from checkpoint, then current epoch data loading can be distorted: some batches '
+                        'may be processed several times and some can be not processed at all. `trainer.current_epoch`'
+                        ' is used as random seed for shuffling batches. Now 0 will be used. If the '
+                        'checkpoint was created not during initial epoch a shuffling of the dataset will '
+                        'be different. You may try use `exp_manager()` function and '
+                        '`PunctuationCapitalizationModel.set_trainer()` method before '
+                        '`PunctuationCapitalizationModel.setup_training_data()` method.'
+                    )
+                    batch_shuffling_random_seed = 0
+                else:
+                    batch_shuffling_random_seed = self._trainer.current_epoch
+            else:
+                batch_shuffling_random_seed = 0
+                if self._trainer is None:
+                    warnings.warn(
+                        'A model attribute `trainer` is not set before test or validation dataset setting. If more '
+                        'than 1 GPU is used for testing, then some examples may be tested several times because '
+                        'number of batches may be not evenly divisible by number of processes. This leads to '
+                        'distortion of metrics. See more in description of `number_of_batches_is_multiple_of` '
+                        'parameter of class `BertPunctuationCapitalizationDataset` initializer and '
+                        'https://pytorch.org/docs/stable/data.html#multi-process-data-loading. You may try to use '
+                        '`PunctuationCapitalizationModel.set_trainer()` method before '
+                        '`PunctuationCapitalizationModel.setup_validation_data()` and '
+                        '`PunctuationCapitalizationModel.setup_test_data()` methods.'
+                    )
+                    number_of_batches_is_multiple_of = 1
+                else:
+                    number_of_batches_is_multiple_of = self._trainer.num_nodes * self._trainer.num_devices
+            if cfg.cache_dir is None:
+                cache_dir = cfg.cache_dir
+            else:
+                # If pickled features are saved `cache_dir` not in the same directory with original data files, then
+                # a full path to data directory have to be appended to `cache_dir`. This is done to avoid collisions
+                # cache for different datasets is saved to same `cache_dir`.
+                cache_dir = Path(cfg.cache_dir).joinpath('fsroot', *text_file.expanduser().resolve().parts[1:-1])
             dataset = BertPunctuationCapitalizationDataset(
                 tokenizer=self.tokenizer,
                 text_file=text_file,
@@ -796,10 +864,17 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 num_samples=cfg.num_samples,
                 tokens_in_batch=cfg.tokens_in_batch,
                 n_jobs=cfg.n_jobs,
+                number_of_batches_is_multiple_of=number_of_batches_is_multiple_of,
+                batch_shuffling_random_seed=batch_shuffling_random_seed,
                 verbose=cfg.verbose,
                 get_label_frequencies=cfg.get_label_frequences,
-                cache_dir=cfg.cache_dir,
+                cache_dir=cache_dir,
                 label_info_save_dir=cfg.label_info_save_dir,
+                audio_file=audio_file if cfg.audio_file else None,
+                sample_rate=cfg.sample_rate,
+                use_audio=cfg.use_audio,
+                use_bucketing=cfg.use_bucketing,
+                preload_audios=cfg.preload_audios,
             )
         if cfg.shuffle and cfg.use_tarred_dataset:
             logging.warning(f"Shuffling in dataloader is not supported for tarred dataset.")
@@ -809,12 +884,12 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
         return torch.utils.data.DataLoader(
             dataset=dataset,
             collate_fn=dataset.collate_fn,
-            batch_size=1,
+            batch_size=1 if cfg.use_bucketing else cfg.batch_size,
             shuffle=shuffle,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             drop_last=cfg.drop_last,
-            persistent_workers=cfg.persistent_workers,
+            persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
         )
 
     def _setup_infer_dataloader(
@@ -825,9 +900,11 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
         step: int,
         margin: int,
         dataloader_kwargs: Optional[Dict[str, Any]],
+        audio_queries: Optional[List[str]] = None,
+        target_sr: Optional[int] = None,
     ) -> torch.utils.data.DataLoader:
         """
-        Setup function for a infer data loader.
+        Setup function for an infer data loader.
 
         Args:
             queries (:obj:`List[str]`): lower cased text without punctuation
@@ -839,13 +916,21 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 cannot be greater than ``max_seq_length-2``.
             margin (:obj:`int`): number of tokens near the edge of a segment which label probabilities are not used in
                 final prediction computation.
+            audio_queries (:obj:`List[str]`, `optional`): paths to audio files.
+            target_sr (:obj:`int`, `optional`): target sample rate for audios.
         Returns:
             :obj:`torch.utils.data.DataLoader`: inference data loader
         """
         if dataloader_kwargs is None:
             dataloader_kwargs = {}
         dataset = BertPunctuationCapitalizationInferDataset(
-            tokenizer=self.tokenizer, queries=queries, max_seq_length=max_seq_length, step=step, margin=margin
+            tokenizer=self.tokenizer,
+            queries=queries,
+            max_seq_length=max_seq_length,
+            step=step,
+            margin=margin,
+            audio_queries=audio_queries,
+            target_sr=target_sr,
         )
         return torch.utils.data.DataLoader(
             dataset=dataset,
@@ -1052,7 +1137,7 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 predictions computation are marked with asterisk: ``[['[CLS]'*, 'h', 'e', 'l'*, '[SEP]'*],
                 ['[CLS]'*, 'e'*, 'l', 'l'*, '[SEP]'*], ['[CLS]'*, 'l'*, 'l', 'o', '[SEP]'*]]``.
             return_labels (:obj:`bool`, `optional`, defaults to :obj:`False`): whether to return labels in NeMo format
-                (see :ref:`nlp/punctuation_and_capitalization/NeMo Data Format`) instead of queries with restored
+                (see :ref:`nemo-data-format-label`) instead of queries with restored
                 punctuation and capitalization.
             dataloader_kwargs (:obj:`Dict[str, Any]`, `optional`): an optional dictionary with parameters of PyTorch
                 data loader. May include keys: ``'num_workers'``, ``'pin_memory'``, ``'worker_init_fn'``,
@@ -1091,9 +1176,11 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 enumerate(infer_datalayer), total=ceil(len(infer_datalayer.dataset) / batch_size), unit="batch"
             ):
                 inp_ids, inp_type_ids, inp_mask, subtokens_mask, start_word_ids, query_ids, is_first, is_last = batch
+                print("inp_ids:\n", inp_ids, "inp_type_ids:\n", inp_type_ids, "inp_mask:\n", inp_mask)
                 punct_logits, capit_logits = self.forward(
                     input_ids=inp_ids.to(d), token_type_ids=inp_type_ids.to(d), attention_mask=inp_mask.to(d),
                 )
+                print("punct_logits:\n", punct_logits, "capit_logits:\n", capit_logits)
                 _res = self._transform_logit_to_prob_and_remove_margins_and_extract_word_probs(
                     punct_logits, capit_logits, subtokens_mask, start_word_ids, margin, is_first, is_last
                 )
@@ -1147,16 +1234,12 @@ class PunctuationCapitalizationModel(NLPModel, Exportable):
                 pretrained_model_name="punctuation_en_distilbert",
                 location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/punctuation_en_distilbert/versions/"
                 "1.0.0rc1/files/punctuation_en_distilbert.nemo",
-                description="The model was trained with DiltilBERT base uncased checkpoint from HuggingFace on a "
+                description="The model was trained with DistilBERT base uncased checkpoint from HuggingFace on a "
                 "subset of data from the following sources: Tatoeba sentences, books from Project Gutenberg, "
                 "Fisher transcripts.",
             ),
         ]
         return result
-
-    @property
-    def input_module(self) -> Any:
-        return self.bert_model
 
     @property
     def output_module(self):

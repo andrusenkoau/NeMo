@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pynini
 from nemo_text_processing.text_normalization.en.graph_utils import (
     NEMO_NOT_QUOTE,
     NEMO_SIGMA,
@@ -18,36 +19,18 @@ from nemo_text_processing.text_normalization.en.graph_utils import (
     GraphFst,
     delete_preserve_order,
 )
-from nemo_text_processing.text_normalization.es.graph_utils import (
-    shift_cardinal_gender,
-    shift_number_gender,
-    strip_cardinal_apocope,
-)
+from nemo_text_processing.text_normalization.es.graph_utils import shift_cardinal_gender, strip_cardinal_apocope
 from nemo_text_processing.text_normalization.es.utils import get_abs_path
+from pynini.lib import pynutil
 
-try:
-    import pynini
-    from pynini.lib import pynutil
+fem = pynini.string_file((get_abs_path("data/money/currency_plural_fem.tsv")))
+masc = pynini.string_file((get_abs_path("data/money/currency_plural_masc.tsv")))
 
-    fem = pynini.string_file((get_abs_path("data/money/currency_plural_fem.tsv")))
-    masc = pynini.string_file((get_abs_path("data/money/currency_plural_masc.tsv")))
+fem_singular = pynini.project(fem, "input")
+masc_singular = pynini.project(masc, "input")
 
-    fem_singular = pynini.project(fem, "input")
-    masc_singular = pynini.project(masc, "input")
-
-    fem_plural = pynini.project(fem, "output")
-    masc_plural = pynini.project(masc, "output")
-
-    PYNINI_AVAILABLE = True
-
-except (ModuleNotFoundError, ImportError):
-    fem_plural = None
-    masc_plural = None
-
-    fem_singular = None
-    masc_singular = None
-
-    PYNINI_AVAILABLE = False
+fem_plural = pynini.project(fem, "output")
+masc_plural = pynini.project(masc, "output")
 
 
 class MoneyFst(GraphFst):
@@ -128,13 +111,12 @@ class MoneyFst(GraphFst):
         #  *** currency_maj
         graph_integer_masc = integer_part + NEMO_SPACE + maj_masc
         graph_integer_fem = shift_cardinal_gender(integer_part) + NEMO_SPACE + maj_fem
+
         graph_integer = graph_integer_fem | graph_integer_masc
 
         #  *** currency_maj + (***) | ((con) *** current_min)
         graph_integer_with_minor_masc = (
-            integer_part
-            + NEMO_SPACE
-            + maj_masc
+            graph_integer_masc
             + NEMO_SPACE
             + pynini.union(
                 optional_add_and + strip_cardinal_apocope(fractional_part),
@@ -145,9 +127,7 @@ class MoneyFst(GraphFst):
         )
 
         graph_integer_with_minor_fem = (
-            shift_cardinal_gender(integer_part)
-            + NEMO_SPACE
-            + maj_fem
+            graph_integer_fem
             + NEMO_SPACE
             + pynini.union(
                 optional_add_and + shift_cardinal_gender(fractional_part),
@@ -159,21 +139,11 @@ class MoneyFst(GraphFst):
 
         graph_integer_with_minor = graph_integer_with_minor_fem | graph_integer_with_minor_masc
 
-        # *** coma *** currency_maj
-        graph_decimal_masc = decimal.numbers + NEMO_SPACE + maj_masc
+        ## *** coma *** currency_maj
+        graph_decimal_masc = decimal.graph_masc + NEMO_SPACE + maj_masc
 
-        # Need to fix some of the inner parts, so don't use decimal here (note: quantities covered by masc)
-        graph_decimal_fem = (
-            pynini.accep("integer_part: \"")
-            + shift_cardinal_gender(pynini.closure(NEMO_NOT_QUOTE, 1))
-            + pynini.accep("\"")
-            + NEMO_SPACE
-            + pynini.accep("fractional_part: \"")
-            + shift_number_gender(pynini.closure(NEMO_NOT_QUOTE, 1))
-            + pynini.accep("\"")
-            + NEMO_SIGMA
-        )
-        graph_decimal_fem @= decimal.numbers_no_quantity
+        graph_decimal_fem = decimal.graph_fem
+        graph_decimal_fem |= decimal.numbers_only_quantity  # can still have "x billions" with fem currency
         graph_decimal_fem += NEMO_SPACE + maj_fem
 
         graph_decimal = graph_decimal_fem | graph_decimal_masc
@@ -187,6 +157,7 @@ class MoneyFst(GraphFst):
         # *** current_min
         graph_minor_masc = fractional_part + NEMO_SPACE + min_masc + delete_preserve_order
         graph_minor_fem = shift_cardinal_gender(fractional_part) + NEMO_SPACE + min_fem + delete_preserve_order
+
         graph_minor = graph_minor_fem | graph_minor_masc
 
         graph = graph_integer | graph_integer_with_minor | graph_decimal | graph_minor

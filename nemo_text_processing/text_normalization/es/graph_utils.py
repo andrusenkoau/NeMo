@@ -11,54 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pynini
 from nemo_text_processing.text_normalization.en.graph_utils import NEMO_SIGMA, NEMO_SPACE
 from nemo_text_processing.text_normalization.es import LOCALIZATION
 from nemo_text_processing.text_normalization.es.utils import get_abs_path, load_labels
+from pynini.lib import pynutil
 
-try:
-    import pynini
-    from pynini.lib import pynutil
+digits = pynini.project(pynini.string_file(get_abs_path("data/numbers/digit.tsv")), "input")
+tens = pynini.project(pynini.string_file(get_abs_path("data/numbers/ties.tsv")), "input")
+teens = pynini.project(pynini.string_file(get_abs_path("data/numbers/teen.tsv")), "input")
+twenties = pynini.project(pynini.string_file(get_abs_path("data/numbers/twenties.tsv")), "input")
+hundreds = pynini.project(pynini.string_file(get_abs_path("data/numbers/hundreds.tsv")), "input")
 
-    digits = pynini.project(pynini.string_file(get_abs_path("data/numbers/digit.tsv")), "input")
-    tens = pynini.project(pynini.string_file(get_abs_path("data/numbers/ties.tsv")), "input")
-    teens = pynini.project(pynini.string_file(get_abs_path("data/numbers/teen.tsv")), "input")
-    twenties = pynini.project(pynini.string_file(get_abs_path("data/numbers/twenties.tsv")), "input")
-    hundreds = pynini.project(pynini.string_file(get_abs_path("data/numbers/hundreds.tsv")), "input")
+accents = pynini.string_map([("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")])
 
-    accents = pynini.string_map([("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")])
+if LOCALIZATION == "am":  # Setting localization for central and northern america formatting
+    cardinal_separator = pynini.string_map([",", NEMO_SPACE])
+    decimal_separator = pynini.accep(".")
+else:
+    cardinal_separator = pynini.string_map([".", NEMO_SPACE])
+    decimal_separator = pynini.accep(",")
 
-    if LOCALIZATION == "am":  # Setting localization for central and northern america formatting
-        cardinal_separator = pynini.string_map([",", NEMO_SPACE])
-        decimal_separator = pynini.accep(".")
-    else:
-        cardinal_separator = pynini.string_map([".", NEMO_SPACE])
-        decimal_separator = pynini.accep(",")
-
-    ones = pynini.union("un", "ún")
-    fem_ones = pynini.union(pynini.cross("un", "una"), pynini.cross("ún", "una"), pynini.cross("uno", "una"))
-    one_to_one_hundred = pynini.union(digits, tens, teens, twenties, tens + pynini.accep(" y ") + digits)
-    fem_hundreds = hundreds @ pynini.cdrewrite(pynini.cross("ientos", "ientas"), "", "", NEMO_SIGMA)
-
-    PYNINI_AVAILABLE = True
-
-except (ModuleNotFoundError, ImportError):
-    digits = None
-    tens = None
-    teens = None
-    twenties = None
-    hundreds = None
-
-    accents = None
-
-    cardinal_separator = None
-    decimal_separator = None
-
-    ones = None
-    fem_ones = None
-    one_to_one_hundred = None
-    fem_hundreds = None
-
-    PYNINI_AVAILABLE = False
+ones = pynini.union("un", "ún")
+fem_ones = pynini.union(pynini.cross("un", "una"), pynini.cross("ún", "una"), pynini.cross("uno", "una"))
+one_to_one_hundred = pynini.union(digits, "uno", tens, teens, twenties, tens + pynini.accep(" y ") + digits)
+fem_hundreds = hundreds @ pynini.cdrewrite(pynini.cross("ientos", "ientas"), "", "", NEMO_SIGMA)
 
 
 def strip_accent(fst: 'pynini.FstLike') -> 'pynini.FstLike':
@@ -74,7 +51,7 @@ def strip_accent(fst: 'pynini.FstLike') -> 'pynini.FstLike':
 def shift_cardinal_gender(fst: 'pynini.FstLike') -> 'pynini.FstLike':
     """
     Applies gender conversion rules to a cardinal string. These include: rendering all masculine forms of "uno" (including apocopated forms) as "una" and
-    Converting all gendered numbers in the hundreds series (200,300,400...) to feminine equivalent (e.g. "doscientos" -> "doscientas"). Converssion only applies
+    Converting all gendered numbers in the hundreds series (200,300,400...) to feminine equivalent (e.g. "doscientos" -> "doscientas"). Conversion only applies
     to value place for <1000 and multiple of 1000. (e.g. "doscientos mil doscientos" -> "doscientas mil doscientas".) For place values greater than the thousands, there
     is no gender shift as the higher powers of ten ("millones", "billones") are masculine nouns and any conversion would be formally
     ungrammatical.
@@ -101,6 +78,7 @@ def shift_cardinal_gender(fst: 'pynini.FstLike') -> 'pynini.FstLike':
 
     fem_allign = pynini.cdrewrite(fem_hundreds, "", before_mil, NEMO_SIGMA)  # doscientas mil dosciento
     fem_allign @= pynini.cdrewrite(fem_hundreds, "", before_double_digits, NEMO_SIGMA)  # doscientas mil doscienta
+
     fem_allign @= pynini.cdrewrite(
         fem_ones, "", pynini.union("[EOS]", "\"", decimal_separator), NEMO_SIGMA
     )  # If before a quote or EOS, we know it's the end of a string
@@ -142,6 +120,23 @@ def strip_cardinal_apocope(fst: 'pynini.FstLike') -> 'pynini.FstLike':
     """
     # Since cardinals use apocope by default for large values (e.g. "millón"), this only needs to act on the last instance of one
     strip = pynini.cross("un", "uno") | pynini.cross("ún", "uno")
+    strip = pynini.cdrewrite(strip, "", pynini.union("[EOS]", "\""), NEMO_SIGMA)
+    return fst @ strip
+
+
+def add_cardinal_apocope_fem(fst: 'pynini.FstLike') -> 'pynini.FstLike':
+    """
+    Adds apocope on cardinal strings in line with stressing rules. e.g. "una" -> "un". This only occurs when "una" precedes a stressed "a" sound in formal speech. This is not predictable
+    with text string, so is included for non-deterministic cases.
+    e.g.
+        "una" -> "un"
+        "veintiuna" -> "veintiun"
+
+    Args:
+        fst: Any fst. Composes conversion onto fst's output strings
+    """
+    # Since the stress trigger follows the cardinal string and only affects the preceding sound, this only needs to act on the last instance of one
+    strip = pynini.cross("una", "un") | pynini.cross("veintiuna", "veintiún")
     strip = pynini.cdrewrite(strip, "", pynini.union("[EOS]", "\""), NEMO_SIGMA)
     return fst @ strip
 

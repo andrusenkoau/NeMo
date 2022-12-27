@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -30,10 +30,8 @@ from nemo.collections.nlp.data.token_classification.token_classification_utils i
 from nemo.collections.nlp.metrics.classification_report import ClassificationReport
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common import TokenClassifier
-from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
 from nemo.collections.nlp.parts.utils_funcs import get_classification_report, plot_confusion_matrix, tensor2list
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
-from nemo.core.neural_types import NeuralType
 from nemo.utils import logging
 
 __all__ = ['TokenClassificationModel']
@@ -41,14 +39,6 @@ __all__ = ['TokenClassificationModel']
 
 class TokenClassificationModel(NLPModel):
     """Token Classification Model with BERT, applicable for tasks such as Named Entity Recognition"""
-
-    @property
-    def input_types(self) -> Optional[Dict[str, NeuralType]]:
-        return self.bert_model.input_types
-
-    @property
-    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        return self.classifier.output_types
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         """Initializes Token Classification Model."""
@@ -62,27 +52,11 @@ class TokenClassificationModel(NLPModel):
             else:
                 raise ValueError(f'{cfg.label_ids} not found.')
 
-        self.setup_tokenizer(cfg.tokenizer)
         self.class_weights = None
         super().__init__(cfg=cfg, trainer=trainer)
 
-        self.bert_model = get_lm_model(
-            pretrained_model_name=cfg.language_model.pretrained_model_name,
-            config_file=self.register_artifact('language_model.config_file', cfg.language_model.config_file),
-            config_dict=OmegaConf.to_container(cfg.language_model.config) if cfg.language_model.config else None,
-            checkpoint_file=cfg.language_model.lm_checkpoint,
-            nemo_file=self.register_artifact('language_model.nemo_file', cfg.language_model.get('nemo_file', None)),
-            vocab_file=self.register_artifact('tokenizer.vocab_file', cfg.tokenizer.vocab_file),
-            trainer=trainer,
-        )
-
-        if cfg.language_model.get('nemo_file', None) is not None:
-            hidden_size = self.bert_model.cfg.hidden_size
-        else:
-            hidden_size = self.bert_model.config.hidden_size
-
         self.classifier = TokenClassifier(
-            hidden_size=hidden_size,
+            hidden_size=self.hidden_size,
             num_classes=len(self._cfg.label_ids),
             num_layers=self._cfg.head.num_fc_layers,
             activation=self._cfg.head.activation,
@@ -128,14 +102,12 @@ class TokenClassificationModel(NLPModel):
         return loss
 
     @typecheck()
-    def forward(self, input_ids, token_type_ids, attention_mask):
-        if self._cfg.language_model.get('nemo_file', None) is not None:
-            hidden_states, _ = self.bert_model(input_ids, attention_mask, tokentype_ids=token_type_ids, lm_labels=None)
-        else:
-            hidden_states = self.bert_model(
-                input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask
-            )
-
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        hidden_states = self.bert_model(
+            input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         logits = self.classifier(hidden_states=hidden_states)
         return logits
 
@@ -324,7 +296,7 @@ class TokenClassificationModel(NLPModel):
 
     def _setup_infer_dataloader(self, queries: List[str], batch_size: int) -> 'torch.utils.data.DataLoader':
         """
-        Setup function for a infer data loader.
+        Setup function for an infer data loader.
 
         Args:
             queries: text
@@ -515,7 +487,7 @@ class TokenClassificationModel(NLPModel):
             raise
 
     @classmethod
-    def list_available_models(cls) -> Optional[PretrainedModelInfo]:
+    def list_available_models(cls) -> List[PretrainedModelInfo]:
         """
         This method returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
 
@@ -525,7 +497,7 @@ class TokenClassificationModel(NLPModel):
         result = []
         model = PretrainedModelInfo(
             pretrained_model_name="ner_en_bert",
-            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/ner_en_bert/versions/1.0.0rc1/files/ner_en_bert.nemo",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/ner_en_bert/versions/1.10/files/ner_en_bert.nemo",
             description="The model was trained on GMB (Groningen Meaning Bank) corpus for entity recognition and achieves 74.61 F1 Macro score.",
         )
         result.append(model)

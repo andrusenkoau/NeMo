@@ -15,6 +15,7 @@
 import json
 import os
 from collections import defaultdict
+from math import ceil
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -39,7 +40,7 @@ try:
     from nemo_text_processing.text_normalization.normalize_with_audio import NormalizerWithAudio
 
     PYNINI_AVAILABLE = True
-except (ModuleNotFoundError, ImportError):
+except (ImportError, ModuleNotFoundError):
     PYNINI_AVAILABLE = False
 
 
@@ -69,13 +70,13 @@ class DuplexDecoderModel(NLPModel):
         # Global_rank and local_rank is set by LightningModule in Lightning 1.2.0
         self.world_size = 1
         if trainer is not None:
-            self.world_size = trainer.num_nodes * trainer.num_gpus
+            self.world_size = trainer.num_nodes * trainer.num_devices
 
-        self._tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
 
-        super().__init__(cfg=cfg, trainer=trainer)
+        super().__init__(cfg=cfg, trainer=trainer, no_lm_init=True)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(cfg.transformer)
-        self.max_sequence_len = cfg.get('max_sequence_len', self._tokenizer.model_max_length)
+        self.max_sequence_len = cfg.get('max_sequence_len', self.tokenizer.model_max_length)
         self.mode = cfg.get('mode', 'joint')
 
         self.transformer_name = cfg.transformer
@@ -103,15 +104,14 @@ class DuplexDecoderModel(NLPModel):
         self.neural_confidence_threshold = cfg.get('neural_confidence_threshold', 0.99)
         self.n_tagged = cfg.get('n_tagged', 1)
         input_case = 'cased'  # input_case is cased by default
-        if hasattr(self._tokenizer, 'do_lower_case') and self._tokenizer.do_lower_case:
+        if hasattr(self.tokenizer, 'do_lower_case') and self.tokenizer.do_lower_case:
             input_case = 'lower_cased'
-        if not PYNINI_AVAILABLE:
-            raise Exception(
-                "`pynini` is not installed ! \n"
-                "Please run the `nemo_text_processing/setup.sh` script"
-                "prior to usage of this toolkit."
-            )
-        self.cg_normalizer = NormalizerWithAudio(input_case=input_case, lang=self.lang)
+
+        if PYNINI_AVAILABLE:
+            self.cg_normalizer = NormalizerWithAudio(input_case=input_case, lang=self.lang)
+        else:
+            self.cg_normalizer = None
+            logging.warning("`pynini` not installed, please install via nemo_text_processing/pynini_install.sh")
 
     @typecheck()
     def forward(self, input_ids, decoder_input_ids, attention_mask, labels):
@@ -158,7 +158,7 @@ class DuplexDecoderModel(NLPModel):
             labels=batch['labels'],
         )
 
-        labels_str = self._tokenizer.batch_decode(
+        labels_str = self.tokenizer.batch_decode(
             torch.ones_like(batch['labels']) * ((batch['labels'] == -100) * 100) + batch['labels'],
             skip_special_tokens=True,
         )
@@ -291,7 +291,7 @@ class DuplexDecoderModel(NLPModel):
         )
 
         generated_ids, sequence_toks_scores = outputs['sequences'], outputs['scores']
-        generated_texts = self._tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
         return generated_texts, generated_ids, sequence_toks_scores
 
@@ -319,7 +319,7 @@ class DuplexDecoderModel(NLPModel):
 
         if sum(nb_spans) == 0:
             return [[]] * len(sents)
-        model, tokenizer = self.model, self._tokenizer
+        model, tokenizer = self.model, self.tokenizer
         ctx_size = constants.DECODE_CTX_SIZE
         extra_id_0 = constants.EXTRA_ID_0
         extra_id_1 = constants.EXTRA_ID_1
@@ -370,7 +370,7 @@ class DuplexDecoderModel(NLPModel):
                 # Compute selected_toks_probs
                 selected_toks_probs = []
                 for jx, _id in enumerate(cur_generated_ids):
-                    if _id != self._tokenizer.pad_token_id:
+                    if _id != self.tokenizer.pad_token_id:
                         selected_toks_probs.append(cur_toks_probs[jx, _id])
                     else:
                         selected_toks_probs.append(1)
@@ -410,6 +410,23 @@ class DuplexDecoderModel(NLPModel):
             cfg=train_data_config, data_split="train"
         )
 
+        # Need to set this because if using an IterableDataset, the length of the dataloader is the total number
+        # of samples rather than the number of batches, and this messes up the tqdm progress bar.
+        # So we set the number of steps manually (to the correct number) to fix this.
+        if 'use_tarred_dataset' in train_data_config and train_data_config['use_tarred_dataset']:
+            # We also need to check if limit_train_batches is already set.
+            # If it's an int, we assume that the user has set it to something sane, i.e. <= # training batches,
+            # and don't change it. Otherwise, adjust batches accordingly if it's a float (including 1.0).
+            if self._trainer is not None and isinstance(self._trainer.limit_train_batches, float):
+                self._trainer.limit_train_batches = int(
+                    self._trainer.limit_train_batches * ceil(len(self._train_dl.dataset) / self.world_size)
+                )
+            elif self._trainer is None:
+                logging.warning(
+                    "Model Trainer was not set before constructing the dataset, incorrect number of "
+                    "training batches will be used. Please set the trainer and rebuild the dataset."
+                )
+
     def setup_validation_data(self, val_data_config: Optional[DictConfig]):
         if not val_data_config or not val_data_config.data_path:
             logging.info(
@@ -420,6 +437,23 @@ class DuplexDecoderModel(NLPModel):
         self.validation_dataset, self._validation_dl = self._setup_dataloader_from_config(
             cfg=val_data_config, data_split="val"
         )
+
+        # Need to set this because if using an IterableDataset, the length of the dataloader is the total number
+        # of samples rather than the number of batches, and this messes up the tqdm progress bar.
+        # So we set the number of steps manually (to the correct number) to fix this.
+        if 'use_tarred_dataset' in val_data_config and val_data_config['use_tarred_dataset']:
+            # We also need to check if limit_val_batches is already set.
+            # If it's an int, we assume that the user has set it to something sane, i.e. <= # validation batches,
+            # and don't change it. Otherwise, adjust batches accordingly if it's a float (including 1.0).
+            if self._trainer is not None and isinstance(self._trainer.limit_val_batches, float):
+                self._trainer.limit_val_batches = int(
+                    self._trainer.limit_val_batches * ceil(len(self._validation_dl.dataset) / self.world_size)
+                )
+            elif self._trainer is None:
+                logging.warning(
+                    "Model Trainer was not set before constructing the dataset, incorrect number of "
+                    "validation batches will be used. Please set the trainer and rebuild the dataset."
+                )
 
     def setup_multiple_validation_data(self, val_data_config: Union[DictConfig, Dict] = None):
         if val_data_config is None:
@@ -481,7 +515,7 @@ class DuplexDecoderModel(NLPModel):
 
             dataset = TextNormalizationDecoderDataset(
                 input_file=input_file,
-                tokenizer=self._tokenizer,
+                tokenizer=self.tokenizer,
                 tokenizer_name=self.transformer_name,
                 mode=self.mode,
                 max_len=self.max_sequence_len,
@@ -504,7 +538,7 @@ class DuplexDecoderModel(NLPModel):
                 self._val_id_to_class.append({v: k for k, v in dataset.label_ids_semiotic.items()})
 
             data_collator = DataCollatorForSeq2Seq(
-                self._tokenizer, model=self.model, label_pad_token_id=constants.LABEL_PAD_TOKEN_ID, padding=True
+                self.tokenizer, model=self.model, label_pad_token_id=constants.LABEL_PAD_TOKEN_ID, padding=True
             )
             dl = torch.utils.data.DataLoader(
                 dataset=dataset,
@@ -531,6 +565,13 @@ class DuplexDecoderModel(NLPModel):
                 pretrained_model_name="neural_text_normalization_t5",
                 location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/neural_text_normalization_t5/versions/1.5.0/files/neural_text_normalization_t5_decoder.nemo",
                 description="Text Normalization model's decoder model.",
+            )
+        )
+        result.append(
+            PretrainedModelInfo(
+                pretrained_model_name="itn_en_t5",
+                location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/itn_en_t5/versions/1.11.0/files/itn_en_t5_decoder.nemo",
+                description="English Inverse Text Normalization model's decoder model.",
             )
         )
         return result

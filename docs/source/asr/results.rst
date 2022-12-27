@@ -52,7 +52,7 @@ For example, to load the base English QuartzNet model for speech recognition, ru
 You can also call :code:`from_pretrained()` from the specific model class (such as :code:`EncDecCTCModel`
 for QuartzNet) if you need to access a specific model functionality.
 
-If you would like to programatically list the models available for a particular base class, you can use the
+If you would like to programmatically list the models available for a particular base class, you can use the
 :code:`list_available_models()` method.
 
 .. code-block:: python
@@ -68,14 +68,18 @@ To perform inference and transcribe a sample of speech after loading the model, 
 
     model.transcribe(paths2audio_files=[list of audio files], batch_size=BATCH_SIZE, logprobs=False)
 
-Setting the argument ``logprobs`` to ``True`` returns the log probabilities instead of transcriptions. For more information, see :doc:`./api.html#modules`.
-The audio files should be 16KHz monochannel wav files.
+Setting the argument ``logprobs`` to ``True`` returns the log probabilities instead of transcriptions. For more information, see `nemo.collections.asr.modules <./api.html#modules>`__.
+The audio files should be 16KHz mono-channel wav files.
 
 Fine-tuning on Different Datasets
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 There are multiple ASR tutorials provided in the :ref:`Tutorials <tutorials>` section. Most of these tutorials explain how to instantiate a pre-trained model, prepare the model for fine-tuning on some dataset (in the same language) as a demonstration.
 
+Inference Execution Flow Diagram
+--------------------------------
+
+When preparing your own inference scripts, please follow the execution flow diagram order for correct inference, found at the `examples directory for ASR collection <https://github.com/NVIDIA/NeMo/blob/stable/examples/asr/README.md>`_.
 
 Automatic Speech Recognition Models
 -----------------------------------
@@ -124,6 +128,16 @@ German
    :widths: 40, 10, 50
    :header-rows: 1
 
+-----------------------------
+
+French
+^^^^^^
+.. csv-table::
+   :file: data/benchmark_fr.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
+   
 -----------------------------
 
 Polish
@@ -175,4 +189,33 @@ Catalan
    :widths: 40, 10, 50
    :header-rows: 1
 
+-----------------------------
+
+Hindi
+^^^^^^^
+.. csv-table::
+   :file: data/benchmark_hi.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
+
+-----------------------------
+
+Marathi
+^^^^^^^
+.. csv-table::
+   :file: data/benchmark_mr.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
+
+-----------------------------
+
+Kinyarwanda
+^^^^^^^^^^^
+.. csv-table::
+   :file: data/benchmark_rw.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
 

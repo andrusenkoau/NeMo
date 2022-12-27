@@ -14,6 +14,8 @@
 
 """Transformer based language model."""
 
+from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
+from nemo.collections.nlp.modules.common.megatron.megatron_decoder_module import MegatronDecoderModule
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.transformer import ParallelTransformer
 from nemo.collections.nlp.modules.common.megatron.utils import (
@@ -21,9 +23,10 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     attn_mask_postprocess,
     build_attention_mask_3d,
 )
+from nemo.core.classes.exportable import Exportable
 
 try:
-    from apex.transformer.enums import AttnMaskType, LayerType
+    from apex.transformer.enums import AttnMaskType, ModelType
 
     HAVE_APEX = True
 except (ImportError, ModuleNotFoundError):
@@ -31,12 +34,13 @@ except (ImportError, ModuleNotFoundError):
     # fake missing classes with None attributes
     AttnMaskType = ApexGuardDefaults()
     LayerType = ApexGuardDefaults()
+    ModelType = ApexGuardDefaults()
 
 
 __all__ = ["MegatronTransformerDecoderModule"]
 
 
-class MegatronTransformerDecoderModule(MegatronModule):
+class MegatronTransformerDecoderModule(MegatronModule, Exportable, MegatronDecoderModule):
     """Transformer decoder model.
     """
 
@@ -56,17 +60,30 @@ class MegatronTransformerDecoderModule(MegatronModule):
         decoder_attn_mask_type=AttnMaskType.causal,
         hidden_dropout=0.1,
         attention_dropout=0.1,
+        ffn_dropout=0.0,
         precision=16,
         fp32_residual_connection=False,
         activations_checkpoint_method=None,
         activations_checkpoint_num_layers=1,
+        activations_checkpoint_granularity=None,
         layernorm_epsilon=1e-5,
-        bias_gelu_fusion=True,
+        bias_activation_fusion=True,
+        bias_dropout_add_fusion=True,
         masked_softmax_fusion=True,
         persist_layer_norm=False,
         openai_gelu=False,
         onnx_safe=False,
         activation='gelu',
+        bias=True,
+        normalization='layernorm',
+        transformer_block_type='pre_ln',
+        headscale=False,
+        parent_model_type=ModelType.encoder_or_decoder,
+        megatron_legacy=False,
+        normalize_attention_scores=True,
+        num_moe_experts=1,
+        moe_frequency=1,
+        moe_dropout=0.0,
     ):
         super(MegatronTransformerDecoderModule, self).__init__()
 
@@ -78,6 +95,8 @@ class MegatronTransformerDecoderModule(MegatronModule):
         self.model_attn_mask_type = decoder_attn_mask_type
         self.hidden_dropout = hidden_dropout
         self.output_layer_init_method = output_layer_init_method
+        self.parent_model_type = parent_model_type
+        self.normalization = normalization
 
         if kv_channels is None:
 
@@ -104,16 +123,30 @@ class MegatronTransformerDecoderModule(MegatronModule):
             fp32_residual_connection=fp32_residual_connection,
             activations_checkpoint_method=activations_checkpoint_method,
             activations_checkpoint_num_layers=activations_checkpoint_num_layers,
+            activations_checkpoint_granularity=activations_checkpoint_granularity,
             layernorm_epsilon=layernorm_epsilon,
             hidden_dropout=hidden_dropout,
             attention_dropout=attention_dropout,
+            ffn_dropout=ffn_dropout,
             use_cpu_initialization=use_cpu_initialization,
-            bias_gelu_fusion=bias_gelu_fusion,
+            bias_activation_fusion=bias_activation_fusion,
+            bias_dropout_add_fusion=bias_dropout_add_fusion,
             masked_softmax_fusion=masked_softmax_fusion,
             persist_layer_norm=persist_layer_norm,
             openai_gelu=openai_gelu,
             onnx_safe=onnx_safe,
             activation=activation,
+            bias=bias,
+            normalization=normalization,
+            model_type=parent_model_type,
+            transformer_block_type=transformer_block_type,
+            headscale=headscale,
+            gradient_accumulation_fusion=False,  # TODO: This has to be False for enc-dec models for now.
+            megatron_legacy=megatron_legacy,
+            normalize_attention_scores=normalize_attention_scores,
+            num_moe_experts=num_moe_experts,
+            moe_frequency=moe_frequency,
+            moe_dropout=moe_dropout,
         )
         self._model_key = 'model'
 
@@ -122,14 +155,22 @@ class MegatronTransformerDecoderModule(MegatronModule):
         self.model.set_input_tensor(input_tensor)
 
     def forward(
-        self, dec_input, dec_attn_mask, enc_output, enc_output_mask, layer_past=None, get_key_value=False,
+        self,
+        dec_input,
+        dec_attn_mask,
+        enc_output,
+        enc_attn_mask,
+        layer_past=None,
+        get_key_value=False,
+        dec_self_attention_relative_position_bias=None,
+        dec_cross_attention_relative_position_bias=None,
     ):
         # convert to Megatron mask
         dec_attn_mask_3d = build_attention_mask_3d(
             source_mask=dec_attn_mask, target_mask=dec_attn_mask, attn_mask_type=self.model_attn_mask_type,
         )
         enc_dec_attn_mask_3d = build_attention_mask_3d(
-            source_mask=dec_attn_mask, target_mask=enc_output_mask, attn_mask_type=AttnMaskType.padding,
+            source_mask=dec_attn_mask, target_mask=enc_attn_mask, attn_mask_type=AttnMaskType.padding,
         )
 
         # transformer decoder
@@ -140,6 +181,8 @@ class MegatronTransformerDecoderModule(MegatronModule):
             get_key_value=get_key_value,
             encoder_output=enc_output,
             enc_dec_attn_mask=attn_mask_postprocess(enc_dec_attn_mask_3d),
+            self_attention_relative_position_bias=dec_self_attention_relative_position_bias,
+            cross_attention_relative_position_bias=dec_cross_attention_relative_position_bias,
         )
 
         return dec_output
