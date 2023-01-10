@@ -133,7 +133,7 @@ def main():
     )
     parser.add_argument(
         "--decoding_mode",
-        choices=["greedy", "beam", "tsd", "alsd"],
+        choices=["greedy", "beam", "tsd", "alsd", "maes"],
         default="beam",
         type=str,
         help="The decoding scheme to be used for evaluation.",
@@ -149,6 +149,9 @@ def main():
     )
     parser.add_argument(
         "--beam_batch_size", default=128, type=int, help="The batch size to be used for beam search decoding"
+    )
+    parser.add_argument(
+        "--maes_prefix_alpha", default=1, type=int, help="Maximum prefix length in prefix search"
     )
 
     args = parser.parse_args()
@@ -196,6 +199,7 @@ def main():
         rnnt_cfg.beam.ngram_lm_bos = True
         rnnt_cfg.compute_hypothesis_token_set = False
         rnnt_cfg.beam.return_best_hypothesis = False
+        rnnt_cfg.beam.maes_prefix_alpha = args.maes_prefix_alpha
         asr_model.change_decoding_strategy(OmegaConf.structured(rnnt_cfg))
 
         if args.use_amp:
