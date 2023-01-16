@@ -35,6 +35,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.losses.rnnt_pytorch import RNNTLossPytorch
+from nemo.collections.asr.losses.rnnt_speechbrain import RNNTLossSpeechBrain
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils.numba_utils import NUMBA_INSTALLATION_MESSAGE
@@ -53,6 +54,13 @@ try:
     NUMBA_RNNT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     NUMBA_RNNT_AVAILABLE = False
+
+try:
+    from nemo.collections.asr.parts.speechbrain.transducer_loss import TransducerLoss
+    
+    SPEECHBRAIN_RNNT_AVAILABLE = True
+except(ImportError, ModuleNotFoundError):
+    SPEECHBRAIN_RNNT_AVAILABLE = False
 
 
 WARP_RNNT_INSTALLATION_MESSAGE = (
@@ -95,6 +103,11 @@ RNNT_LOSS_RESOLVER = {
         is_available=True,
         installation_msg="Pure Pytorch implementation of RNN-T loss. Slow and for debugging purposes only.",
     ),
+    "speechbrain_rnnt": RNNTLossConfig(
+        loss_name="speechbrain_rnnt",
+        lib_name="sb",
+        is_available=SPEECHBRAIN_RNNT_AVAILABLE,
+    ),   
 }
 
 RNNT_LOSS_RESOLVER['default'] = RNNT_LOSS_RESOLVER['warprnnt_numba']
@@ -177,6 +190,10 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         loss_func = RNNTLossPytorch(blank=blank_idx, reduction='none')
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
+    elif loss_name == 'speechbrain_rnnt':
+        loss_func = RNNTLossSpeechBrain(blank=blank_idx, reduction='none')
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
     else:
         raise ValueError(
             f"Invalid value of `loss_name`: {loss_name}. Allowed loss names are :" f"{loss_function_names}"
@@ -188,7 +205,7 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
 class RNNTLoss(Loss):
     @property
     def input_types(self):
-        """Input types definitions for CTCLoss.
+        """Input types definitions for RNNTLoss.
         """
         return {
             "log_probs": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
@@ -311,7 +328,7 @@ class RNNTLoss(Loss):
         # Reduce transcript length to correct alignment if additional padding was applied.
         # Transcript: [B, L] -> [B, L']; If L' < L
         if targets.shape[1] != max_targets_len:
-            targets = targets.narrow(dim=1, start=0, length=max_targets_len)
+            targets = targets.narrow(dim=1, start=0, length=max_targets_len).contiguous()
 
         # Temporarily override loss reduction
         loss_reduction = self._loss.reduction
