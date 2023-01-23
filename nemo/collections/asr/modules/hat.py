@@ -51,6 +51,20 @@ from nemo.core.neural_types import (
 )
 from nemo.utils import logging
 
+####################################################################
+import math
+
+def log1mexp(x):
+    """Numerically accurate evaluation of log(1 - exp(x)) for x < 0.
+    See [Maechler2012accurate]_ for details.
+    """
+    mask = -math.log(2) < x  # x < 0
+    return torch.where(
+        mask,
+        (-x.expm1()).log(),
+        (-x.exp()).log1p(),
+    )
+####################################################################
 
 class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
     """A Stateless Neural Network Transducer Decoder / Prediction Network.
@@ -1222,7 +1236,7 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
         dropout = jointnet.get('dropout', 0.0)
 
         self.pred, self.enc, self.joint_net, self.blank_pred = self._joint_net_modules(
-            num_classes=self._vocab_size,  # add 1 for blank symbol
+            num_classes=self._vocab_size,  # no add 1 for blank symbol
             pred_n_hidden=self.pred_hidden,
             enc_n_hidden=self.encoder_hidden,
             joint_n_hidden=self.joint_hidden,
@@ -1418,18 +1432,32 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
 
-        blank_prob = self.blank_pred(inp)  # [B, T, U, 1]
-        label_output = self.joint_net(inp)  # [B, T, U, V]
+        blank_logprob = self.blank_pred(inp)  # [B, T, U, 1]
+        # logging.warning(blank_prob.shape)
+        # logging.warning(f" blank_prob[0,0]: {blank_prob[0,0]}")
+        label_logit = self.joint_net(inp)  # [B, T, U, V]
         
         del inp
+
+        label_logprob = label_logit.log_softmax(dim=-1)
+        # logging.warning(label_logprob.shape)
+        # logging.warning(f" label_logprob[0,0,0,-3:]: {label_logprob[0,0,0,-3:]}")
         
-        label_logprob = torch.log(1 - blank_prob) + label_output.log_softmax(dim=-1)  # [B, T, U, V]
-        blank_logprob = torch.log(blank_prob)  # [B, T, U, 1]
+        #label_logprob_scaled = torch.log1p(- torch.exp(blank_logprob)) + label_logprob  # [B, T, U, V]
+        label_logprob_scaled = log1mexp(blank_logprob) + label_logprob
         
-        del blank_prob, label_output
+        # logging.warning(label_logprob_scaled.shape)
+        # logging.warning(f" label_logprob_scaled[0,0,0,-3:]: {label_logprob_scaled[0,0,0,-3:]}")
+        # blank_logprob = torch.log(blank_prob)  # [B, T, U, 1]
+        # logging.warning(blank_logprob.shape)
+        # logging.warning(f" blank_logprob[0,0]: {blank_logprob[0,0]}")
+
+        del label_logit, label_logprob
         
-        res = torch.cat((label_logprob, blank_logprob), dim=-1) # [B, T, U, V+1]
-        
+        res = torch.cat((label_logprob_scaled, blank_logprob), dim=-1) # [B, T, U, V+1]
+        # logging.warning(res.shape)
+        # logging.warning(f" res[0,0,0,-3:]: {res[0,0,0,-3:]}")
+
         if self.preserve_memory:
             torch.cuda.empty_cache()
 
@@ -1450,9 +1478,10 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
         pred = torch.nn.Linear(pred_n_hidden, joint_n_hidden)
         enc = torch.nn.Linear(enc_n_hidden, joint_n_hidden)
         blank_pred = torch.nn.Sequential(
-            torch.nn.ReLU(inplace=True),  # replace with Tanh
+            torch.nn.Tanh(),  # [ReLU or Tanh]
+            torch.nn.Dropout(p=0.2),
             torch.nn.Linear(joint_n_hidden, 1),
-            torch.nn.Sigmoid()
+            torch.nn.LogSigmoid()
         )
 
         if activation not in ['relu', 'sigmoid', 'tanh']:
