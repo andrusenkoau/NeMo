@@ -103,7 +103,7 @@ def cu_kernel_forward(log_probs, labels, alpha, log_p, T, U, blank, lock):
             # normalize the loss over time
             log_p[b] = (
                 alpha[b, T[b] - 1, U[b]] + log_probs[b, T[b] - 1, U[b], blank]
-            ) / T[b]
+            ) # / T[b] [aandrusenko] to make the same value, as in PytorchRNNT and NumbaRNNT
 
 
 @cuda.jit(
@@ -177,7 +177,8 @@ def cu_kernel_backward(log_probs, labels, beta, log_p, T, U, blank, lock):
     if u == 0:
         # for each thread b (utterance)
         # normalize the loss over time
-        log_p[b] = beta[b, 0, 0] / T[b]
+        pass
+        # log_p[b] = beta[b, 0, 0] / T[b] # [aandrusenko] to make the same value, as in PytorchRNNT and NumbaRNNT
 
 
 @cuda.jit(
@@ -337,16 +338,16 @@ class TransducerLoss(Module):
             err_msg += "conda install numba cudatoolkit=XX (XX is your cuda toolkit version)"
             raise ImportError(err_msg)
 
-    def forward(self, logits, labels, T, U):
+    def forward(self, log_probs, labels, T, U):
         """Computes the transducer loss."""
         # Transducer.apply function take log_probs tensor.
-        if logits.device.type == labels.device.type == T.device.type == U.device.type == "cuda":
+        if log_probs.device.type == labels.device.type == T.device.type == U.device.type == "cuda":
             #log_probs = logits.log_softmax(-1)
-            print("[INFO]: skip log_softmax calculation...")
+            #print("[INFO]: skip log_softmax calculation...")
             return self.loss(
-                logits, labels, T, U, self.blank, self.reduction
+                log_probs, labels, T, U, self.blank, self.reduction
             )
         else:
             raise ValueError(
-                f"Found inputs tensors to be on {[logits.device, labels.device, T.device, U.device]} while needed to be on a 'cuda' device to use the transducer loss."
+                f"Found inputs tensors to be on {[log_probs.device, labels.device, T.device, U.device]} while needed to be on a 'cuda' device to use the transducer loss."
             )
