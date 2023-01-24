@@ -1440,7 +1440,9 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
 
         label_logprob = label_logit.log_softmax(dim=-1)
 
-        label_logprob_scaled = torch.log(1-torch.exp(blank_logprob)+1e-6) + label_logprob  # [B, T, U, V]
+        scale_prob = torch.clamp(1-torch.exp(blank_logprob), min=1e-7)
+        label_logprob_scaled = torch.log(scale_prob) + label_logprob  # [B, T, U, V]
+        #label_logprob_scaled = torch.log(1-torch.exp(blank_logprob)+1e-6) + label_logprob  # [B, T, U, V]
         
         # blank_logprob = torch.log(blank_prob)  # [B, T, U, 1]
 
