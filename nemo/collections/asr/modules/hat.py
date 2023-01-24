@@ -1433,30 +1433,20 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
             inp = self.forward_enabled_adapters(inp)
 
         blank_logprob = self.blank_pred(inp)  # [B, T, U, 1]
-        # logging.warning(blank_prob.shape)
-        # logging.warning(f" blank_prob[0,0]: {blank_prob[0,0]}")
+
         label_logit = self.joint_net(inp)  # [B, T, U, V]
         
         del inp
 
         label_logprob = label_logit.log_softmax(dim=-1)
-        # logging.warning(label_logprob.shape)
-        # logging.warning(f" label_logprob[0,0,0,-3:]: {label_logprob[0,0,0,-3:]}")
+
+        label_logprob_scaled = torch.log(1-torch.exp(blank_logprob)+1e-6) + label_logprob  # [B, T, U, V]
         
-        #label_logprob_scaled = torch.log1p(- torch.exp(blank_logprob)) + label_logprob  # [B, T, U, V]
-        label_logprob_scaled = log1mexp(blank_logprob) + label_logprob
-        
-        # logging.warning(label_logprob_scaled.shape)
-        # logging.warning(f" label_logprob_scaled[0,0,0,-3:]: {label_logprob_scaled[0,0,0,-3:]}")
         # blank_logprob = torch.log(blank_prob)  # [B, T, U, 1]
-        # logging.warning(blank_logprob.shape)
-        # logging.warning(f" blank_logprob[0,0]: {blank_logprob[0,0]}")
 
         del label_logit, label_logprob
         
         res = torch.cat((label_logprob_scaled, blank_logprob), dim=-1) # [B, T, U, V+1]
-        # logging.warning(res.shape)
-        # logging.warning(f" res[0,0,0,-3:]: {res[0,0,0,-3:]}")
 
         if self.preserve_memory:
             torch.cuda.empty_cache()
