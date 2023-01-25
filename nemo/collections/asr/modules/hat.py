@@ -1386,7 +1386,7 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
 
             return losses, wer, wer_num, wer_denom
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def joint(self, f: torch.Tensor, g: torch.Tensor, scale_output=False, lmd1=2, lmd2=0.95) -> torch.Tensor:
         """
         Compute the joint step of the network.
 
@@ -1426,8 +1426,6 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
 
         inp = f + g  # [B, T, U, H]
 
-        del f, g
-
         # Forward adapter modules on joint hidden
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
@@ -1444,9 +1442,15 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
         label_logprob_scaled = torch.log(scale_prob) + label_logprob  # [B, T, U, V]
         #label_logprob_scaled = torch.log(1-torch.exp(blank_logprob)+1e-6) + label_logprob  # [B, T, U, V]
         
-        # blank_logprob = torch.log(blank_prob)  # [B, T, U, 1]
+        if scale_output:
+            lmd1 = torch.tensor(lmd1).to(label_logprob_scaled.device)
+            lmd2 = torch.tensor(lmd2).to(label_logprob_scaled.device)
+            ilm_logit = self.joint_net(g)
+            ilm_logprob = ilm_logit.log_softmax(dim=-1)
+            label_logprob_scaled = torch.log(scale_prob) + (torch.log(lmd1) + label_logprob_scaled) - (torch.log(lmd2) + ilm_logprob)
+        
 
-        del label_logit, label_logprob
+        del label_logit, label_logprob, f, g
         
         res = torch.cat((label_logprob_scaled, blank_logprob), dim=-1) # [B, T, U, V+1]
 
