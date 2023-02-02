@@ -282,6 +282,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
                 ngram_lm_beta=self.cfg.beam.get('ngram_lm_beta', 0.0),
                 ngram_lm_bos=self.cfg.beam.get('ngram_lm_bos', True),
+                hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', 0.0),
+                hat_lmd2=self.cfg.beam.get('hat_lmd2', 0.3),
             )
 
         elif self.cfg.strategy == 'tsd':
@@ -327,6 +329,12 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 maes_expansion_beta=self.cfg.beam.get('maes_expansion_beta', 2.0),
                 softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
                 preserve_alignments=self.preserve_alignments,
+                ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
+                ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
+                ngram_lm_beta=self.cfg.beam.get('ngram_lm_beta', 0.0),
+                ngram_lm_bos=self.cfg.beam.get('ngram_lm_bos', True),
+                hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', 0.0),
+                hat_lmd2=self.cfg.beam.get('hat_lmd2', 0.3),
             )
 
         else:
