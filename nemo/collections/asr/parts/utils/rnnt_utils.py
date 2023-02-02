@@ -99,6 +99,7 @@ class Hypothesis:
     y: List[torch.tensor] = None
     lm_state: Optional[Union[Dict[str, Any], List[Any]]] = None
     lm_scores: Optional[torch.Tensor] = None
+    ngram_lm_state: Optional[Union[Dict[str, Any], List[Any]]] = None
     tokens: Optional[Union[List[int], torch.Tensor]] = None
     last_token: Optional[torch.Tensor] = None
 
