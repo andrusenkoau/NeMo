@@ -1443,11 +1443,10 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
         #label_logprob_scaled = torch.log(1-torch.exp(blank_logprob)+1e-6) + label_logprob  # [B, T, U, V]
         
         if scale_output:
-            lmd1 = torch.tensor(lmd1).to(label_logprob_scaled.device)
-            lmd2 = torch.tensor(lmd2).to(label_logprob_scaled.device)
             ilm_logit = self.joint_net(g)
             ilm_logprob = ilm_logit.log_softmax(dim=-1)
-            label_logprob_scaled = torch.log(scale_prob) + (torch.log(lmd1) + label_logprob_scaled) - (torch.log(lmd2) + ilm_logprob)
+            #label_logprob_scaled = torch.log(scale_prob) + (torch.log(lmd1) + label_logprob_scaled) - (torch.log(lmd2) + ilm_logprob)
+            label_logprob_scaled = lmd1*label_logprob_scaled - lmd2*ilm_logprob
         
 
         del label_logit, label_logprob, f, g
