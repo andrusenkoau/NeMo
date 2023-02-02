@@ -31,7 +31,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
-# import kenlm
+import kenlm
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -222,6 +222,8 @@ class BeamRNNTInfer(Typing):
         ngram_lm_alpha: float = 0.0,
         ngram_lm_beta: float = 0.0,
         ngram_lm_bos: bool = True,
+        hat_subtract_ilm: int = 0,
+        hat_lmd2: float = 0.3,
     ):
         self.decoder = decoder_model
         self.joint = joint_model
@@ -311,6 +313,8 @@ class BeamRNNTInfer(Typing):
         self.ngram_lm_alpha = ngram_lm_alpha
         self.ngram_lm_beta = ngram_lm_beta
         self.ngram_lm_bos = ngram_lm_bos
+        self.hat_subtract_ilm = hat_subtract_ilm
+        self.hat_lmd2 = hat_lmd2
 
     @typecheck()
     def __call__(
@@ -565,8 +569,26 @@ class BeamRNNTInfer(Typing):
                 y, state, lm_tokens = self.decoder.score_hypothesis(max_hyp, cache)  # [1, 1, D]
 
                 # get next token
-                ytu = torch.log_softmax(self.joint.joint(hi, y) / self.softmax_temperature, dim=-1)  # [1, 1, 1, V + 1]
+                if self.joint.__class__.__name__ == "HATJoint":
+                    ytu = torch.log_softmax(self.joint.joint(hi, y, scale_output=(self.hat_subtract_ilm==1), lmd1=1.0, lmd2=0.3) / self.softmax_temperature, dim=-1)  # [1, 1, 1, V + 1]
+                else:
+                    ytu = torch.log_softmax(self.joint.joint(hi, y) / self.softmax_temperature, dim=-1)  # [1, 1, 1, V + 1]
                 ytu = ytu[0, 0, 0, :]  # [V + 1]
+
+                # # skip blank:
+                # if ytu[-1] > torch.log(torch.tensor(0.95)):
+                #     new_hyp = Hypothesis(
+                #         score=(max_hyp.score + float(ytu[-1])),
+                #         y_sequence=max_hyp.y_sequence[:],
+                #         dec_state=max_hyp.dec_state,
+                #         lm_state=max_hyp.lm_state.__deepcopy__(),
+                #         timestep=max_hyp.timestep[:],
+                #         length=encoded_lengths,
+                #     )
+                #     kept_hyps.append(new_hyp)
+                #     if not hyps:
+                #         break
+                # else:
 
                 # preserve alignments
                 if self.preserve_alignments:
@@ -589,10 +611,12 @@ class BeamRNNTInfer(Typing):
                         score=(max_hyp.score + float(logp)),
                         y_sequence=max_hyp.y_sequence[:],
                         dec_state=max_hyp.dec_state,
-                        lm_state=max_hyp.lm_state.__deepcopy__(),
                         timestep=max_hyp.timestep[:],
                         length=encoded_lengths,
                     )
+                    if self.ngram_lm:
+                        new_hyp.lm_state = max_hyp.lm_state.__deepcopy__()
+
 
                     if self.preserve_alignments:
                         new_hyp.alignments = copy.deepcopy(max_hyp.alignments)
@@ -1005,6 +1029,16 @@ class BeamRNNTInfer(Typing):
         beam_dec_out, beam_state, beam_lm_tokens = self.decoder.batch_score_hypothesis(init_tokens, cache, beam_state)
         state = self.decoder.batch_select_state(beam_state, 0)
 
+        # Setup Ngram LM:
+        if self.ngram_lm is not None:
+
+            init_lm_state = kenlm.State()
+            ngram_lm_state = init_lm_state
+            self.ngram_lm.BeginSentenceWrite(init_lm_state)
+        else:
+            ngram_lm_state = None
+
+
         # TODO: Setup LM
         if self.language_model is not None:
             # beam_lm_states, beam_lm_scores = self.lm.buff_predict(
@@ -1019,6 +1053,7 @@ class BeamRNNTInfer(Typing):
             lm_state = None
             lm_scores = None
 
+
         # Initialize first hypothesis for the beam (blank) for kept hypotheses
         kept_hyps = [
             Hypothesis(
@@ -1028,6 +1063,7 @@ class BeamRNNTInfer(Typing):
                 dec_out=[beam_dec_out[0]],
                 lm_state=lm_state,
                 lm_scores=lm_scores,
+                ngram_lm_state=ngram_lm_state,
             )
         ]
 
@@ -1055,9 +1091,16 @@ class BeamRNNTInfer(Typing):
                 beam_dec_out = torch.stack([h.dec_out[-1] for h in hyps])  # [H, 1, D]
 
                 # Extract the log probabilities
-                beam_logp, beam_idx = torch.log_softmax(
-                    self.joint.joint(beam_enc_out, beam_dec_out) / self.softmax_temperature, dim=-1,
-                ).topk(self.max_candidates, dim=-1)
+                if self.joint.__class__.__name__ == "HATJoint":
+                    beam_logp, beam_idx = torch.log_softmax(
+                        self.joint.joint(beam_enc_out, beam_dec_out, 
+                                         scale_output=(self.hat_subtract_ilm==1),
+                                         lmd1=1.0, lmd2=self.hat_lmd2) / self.softmax_temperature, dim=-1,
+                    ).topk(self.max_candidates, dim=-1)
+                else:
+                    beam_logp, beam_idx = torch.log_softmax(
+                        self.joint.joint(beam_enc_out, beam_dec_out) / self.softmax_temperature, dim=-1,
+                    ).topk(self.max_candidates, dim=-1)
 
                 beam_logp = beam_logp[:, 0, 0, :]  # [B, V + 1]
                 beam_idx = beam_idx[:, 0, 0, :]  # [B, max_candidates]
@@ -1079,6 +1122,8 @@ class BeamRNNTInfer(Typing):
                             lm_state=hyp.lm_state,
                             lm_scores=hyp.lm_scores,
                         )
+                        if self.ngram_lm:
+                            new_hyp.ngram_lm_state = hyp.ngram_lm_state.__deepcopy__()
 
                         # If the expansion was for blank
                         if k == self.blank:
@@ -1088,6 +1133,14 @@ class BeamRNNTInfer(Typing):
                             # new_hyp.y_sequence.append(int(k))
                             if (new_hyp.y_sequence + [int(k)]) not in duplication_check:
                                 new_hyp.y_sequence.append(int(k))
+
+                                # Setup Ngram LM:
+                                if self.ngram_lm is not None:
+                                    next_state = kenlm.State()
+                                    lm_score = self.ngram_lm.BaseScore(hyp.ngram_lm_state, str(int(k)), next_state)
+                                    lm_score *= 1.0 / math.log10(math.e)
+                                    new_hyp.ngram_lm_state = next_state
+                                    new_hyp.score += self.ngram_lm_alpha * lm_score
 
                                 # TODO: Setup LM
                                 if self.language_model is not None:
@@ -1153,9 +1206,16 @@ class BeamRNNTInfer(Typing):
                         hyps = list_exp[:]
                     else:
                         # Extract the log probabilities
-                        beam_logp = torch.log_softmax(
-                            self.joint.joint(beam_enc_out, beam_dec_out) / self.softmax_temperature, dim=-1,
-                        )
+                        if self.joint.__class__.__name__ == "HATJoint":
+                            beam_logp = torch.log_softmax(
+                                self.joint.joint(beam_enc_out, beam_dec_out,
+                                                 scale_output=(self.hat_subtract_ilm==1),
+                                                 lmd1=1.0, lmd2=self.hat_lmd2) / self.softmax_temperature, dim=-1,
+                            )
+                        else:
+                            beam_logp = torch.log_softmax(
+                                self.joint.joint(beam_enc_out, beam_dec_out) / self.softmax_temperature, dim=-1,
+                            )
                         beam_logp = beam_logp[:, 0, 0, :]
 
                         # For all expansions, add the score for the blank label
@@ -1179,6 +1239,10 @@ class BeamRNNTInfer(Typing):
 
         # Sort the hypothesis with best scores
         return self.sort_nbest(kept_hyps)
+
+    # def ngram_lm_batch_predict(self, )
+
+
 
     def recombine_hypotheses(self, hypotheses: List[Hypothesis]) -> List[Hypothesis]:
         """Recombine hypotheses with equivalent output sequence.
@@ -1217,20 +1281,51 @@ class BeamRNNTInfer(Typing):
                 pref_id = len(hyp_i.y_sequence)
 
                 if is_prefix(hyp_j.y_sequence, hyp_i.y_sequence) and (curr_id - pref_id) <= prefix_alpha:
-                    logp = torch.log_softmax(
-                        self.joint.joint(enc_out, hyp_i.dec_out[-1]) / self.softmax_temperature, dim=-1,
-                    )
+                    if self.joint.__class__.__name__ == "HATJoint":
+                        logp = torch.log_softmax(
+                            self.joint.joint(
+                                enc_out, hyp_i.dec_out[-1],
+                                scale_output=(self.hat_subtract_ilm==1),
+                                lmd1=1.0, lmd2=self.hat_lmd2) / self.softmax_temperature, dim=-1,
+                        )
+                    else:
+                        logp = torch.log_softmax(
+                            self.joint.joint(enc_out, hyp_i.dec_out[-1]) / self.softmax_temperature, dim=-1,
+                        )
                     logp = logp[0, 0, 0, :]
 
-                    curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]])
+                    # Setup Ngram LM:
+                    if self.ngram_lm is not None:
+                        next_state = kenlm.State()
+                        lm_score = self.ngram_lm.BaseScore(hyp_i.ngram_lm_state, str(int(hyp_j.y_sequence[pref_id])), next_state)
+                        lm_score *= 1.0 / math.log10(math.e)
+                        curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]]) + self.ngram_lm_alpha * lm_score
+                    else:
+                        curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]])
 
                     for k in range(pref_id, (curr_id - 1)):
-                        logp = torch.log_softmax(
-                            self.joint.joint(enc_out, hyp_j.dec_out[k]) / self.softmax_temperature, dim=-1,
-                        )
+                        if self.joint.__class__.__name__ == "HATJoint":
+                            logp = torch.log_softmax(
+                                self.joint.joint(
+                                    enc_out, hyp_j.dec_out[k],
+                                    scale_output=(self.hat_subtract_ilm==1),
+                                    lmd1=1.0, lmd2=self.hat_lmd2) / self.softmax_temperature, dim=-1,
+                            )
+                        else:
+                            logp = torch.log_softmax(
+                                self.joint.joint(enc_out, hyp_j.dec_out[k]) / self.softmax_temperature, dim=-1,
+                            )
                         logp = logp[0, 0, 0, :]
 
-                        curr_score += float(logp[hyp_j.y_sequence[k + 1]])
+                        # Setup Ngram LM:
+                        if self.ngram_lm is not None:
+                            ngram_lm_state = next_state.__deepcopy__()
+                            next_state = kenlm.State()
+                            lm_score = self.ngram_lm.BaseScore(ngram_lm_state, str(int(hyp_j.y_sequence[k + 1])), next_state)
+                            lm_score *= 1.0 / math.log10(math.e)
+                            curr_score += (float(logp[hyp_j.y_sequence[k + 1]]) + self.ngram_lm_alpha * lm_score)
+                        else:
+                            curr_score += float(logp[hyp_j.y_sequence[k + 1]])
 
                     hyp_j.score = np.logaddexp(hyp_j.score, curr_score)
 
@@ -1258,3 +1353,5 @@ class BeamRNNTInferConfig:
     ngram_lm_alpha: Optional[float] = 0.0
     ngram_lm_beta: Optional[float] = 0.0
     ngram_lm_bos: Optional[bool] = True
+    hat_subtract_ilm: int = 0
+    hat_lmd2: float = 0.3
