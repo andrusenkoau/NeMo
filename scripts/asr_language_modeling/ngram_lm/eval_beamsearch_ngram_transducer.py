@@ -151,7 +151,16 @@ def main():
         "--beam_batch_size", default=128, type=int, help="The batch size to be used for beam search decoding"
     )
     parser.add_argument(
-        "--maes_prefix_alpha", default=1, type=int, help="Maximum prefix length in prefix search"
+        "--maes_prefix_alpha", default=1, type=int, help="Float pruning threshold used in the prune-by-value step when computing the expansions."
+    )
+    parser.add_argument(
+        "--maes_expansion_gamma", default=2.3, type=float, help="Maximum prefix length in prefix search"
+    )
+    parser.add_argument(
+        "--hat_subtract_ilm", default=0, type=int, help="Subtract internal LM from final HAT logprobs [0 or 1]"
+    )
+    parser.add_argument(
+        "--hat_lmd2", default=0.3, type=float, help="lamda2 weight for HAT ILM subsrtact"
     )
 
     args = parser.parse_args()
@@ -197,9 +206,12 @@ def main():
         rnnt_cfg.beam.ngram_lm_alpha = args.beam_alpha  # 0.2
         rnnt_cfg.beam.ngram_lm_beta = args.beam_beta
         rnnt_cfg.beam.ngram_lm_bos = True
+        rnnt_cfg.beam.hat_subtract_ilm = args.hat_subtract_ilm
+        rnnt_cfg.beam.hat_lmd2 = args.hat_lmd2
         rnnt_cfg.compute_hypothesis_token_set = False
         rnnt_cfg.beam.return_best_hypothesis = False
         rnnt_cfg.beam.maes_prefix_alpha = args.maes_prefix_alpha
+        rnnt_cfg.beam.maes_expansion_gamma = args.maes_expansion_gamma
         asr_model.change_decoding_strategy(OmegaConf.structured(rnnt_cfg))
 
         if args.use_amp:
