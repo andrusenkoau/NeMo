@@ -178,10 +178,12 @@ def main():
     target_transcripts = []
     with open(args.input_manifest, 'r') as manifest_file:
         audio_file_paths = []
+        durations = []
         for line in tqdm(manifest_file, desc=f"Reading Manifest {args.input_manifest} ...", ncols=120):
             data = json.loads(line)
             target_transcripts.append(data['text'])
             audio_file_paths.append(data['audio_filepath'])
+            durations.append(data['duration'])
             # i += 1
             # if i > 100:
             #     break
@@ -248,11 +250,25 @@ def main():
             args.preds_output_folder,
             f"preds_out_width{args.beam_width}_alpha{args.beam_alpha}_beta{args.beam_beta}.tsv",
         )
+        preds_output_manifest = os.path.join(
+            args.preds_output_folder,
+            f"preds_manifest.json",
+        )
+        with open(preds_output_manifest, 'w') as fn:
+            for i, file_name in enumerate(audio_file_paths):
+                item = {'audio_filepath': file_name,
+                        'duration': durations[i],
+                        'text': target_transcripts[i],
+                        'pred_text': hypotheses[i].text}
+                fn.write(json.dumps(item) + "\n")
+
     else:
         preds_output_file = None
 
     beam_search_eval(
-        all_hypotheses=all_hypotheses, target_transcripts=target_transcripts, preds_output_file=preds_output_file,
+        all_hypotheses=all_hypotheses,
+        target_transcripts=target_transcripts,
+        preds_output_file=preds_output_file,
     )
 
 
