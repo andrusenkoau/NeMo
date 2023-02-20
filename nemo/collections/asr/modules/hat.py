@@ -1431,7 +1431,6 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
             inp = self.forward_enabled_adapters(inp)
 
         blank_logprob = self.blank_pred(inp)  # [B, T, U, 1]
-
         label_logit = self.joint_net(inp)  # [B, T, U, V]
         
         del inp
@@ -1442,21 +1441,26 @@ class HATJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
         label_logprob_scaled = torch.log(scale_prob) + label_logprob  # [B, T, U, V]
         #label_logprob_scaled = torch.log(1-torch.exp(blank_logprob)+1e-6) + label_logprob  # [B, T, U, V]
         
+        ilm_logprob_scaled = 0.0
         if scale_output:
             ilm_logit = self.joint_net(g)
             ilm_logprob = ilm_logit.log_softmax(dim=-1)
             #label_logprob_scaled = torch.log(scale_prob) + (torch.log(lmd1) + label_logprob_scaled) - (torch.log(lmd2) + ilm_logprob)
-            label_logprob_scaled = lmd1*label_logprob_scaled - lmd2*ilm_logprob
+            #label_logprob_scaled = lmd1*label_logprob_scaled - lmd2*ilm_logprob
+            ilm_logprob_scaled = lmd2*ilm_logprob
+            #mask = ~(label_logprob_scaled > 0)
+            #label_logprob_scaled *= mask
         
 
         del label_logit, label_logprob, f, g
         
         res = torch.cat((label_logprob_scaled, blank_logprob), dim=-1) # [B, T, U, V+1]
+        #res[:, :, :, -1] = res[:, :, :, -1] - 1.0
 
         if self.preserve_memory:
             torch.cuda.empty_cache()
 
-        return res
+        return res, ilm_logprob_scaled
 
     def _joint_net_modules(self, num_classes, pred_n_hidden, enc_n_hidden, joint_n_hidden, activation, dropout):
         """
