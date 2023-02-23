@@ -686,6 +686,7 @@ class BeamRNNTInfer(Typing):
                                 )
 
                 # keep those hypothesis that have scores greater than next search generation
+
                 hyps_max = float(max(hyps, key=lambda x: x.score).score)
                 kept_most_prob = sorted([hyp for hyp in kept_hyps if hyp.score > hyps_max], key=lambda x: x.score,)
 
@@ -699,6 +700,10 @@ class BeamRNNTInfer(Typing):
 
                     kept_hyps = kept_most_prob
                     break
+        
+        # # Length normalization:
+        # for h in kept_hyps:
+        #     h.score = h.score / len(h.y_sequence)
 
         # Remove trailing empty list of alignments
         if self.preserve_alignments:
@@ -1132,8 +1137,9 @@ class BeamRNNTInfer(Typing):
                     ytu, ytu_ilm = self.joint.joint(beam_enc_out, beam_dec_out, 
                                                     scale_output=(self.hat_subtract_ilm==1),
                                                     lmd1=self.hat_lmd1, lmd2=self.hat_lmd2)
-                    #blank_scale = -1.0
-                    #ytu[:, :, :, -1] = ytu[:, :, :, -1] - blank_scale
+                    #blank_scale = 2.0
+                    #ytu[:, :, :, -1] = ytu[:, :, :, -1] * blank_scale
+                    
                     beam_logp, beam_idx = ytu.topk(self.max_candidates, dim=-1)
                 else:
                     beam_logp, beam_idx = torch.log_softmax(
@@ -1184,9 +1190,19 @@ class BeamRNNTInfer(Typing):
                                     lm_score = self.ngram_lm.BaseScore(hyp.ngram_lm_state, str(int(k)), next_state)
                                     lm_score *= 1.0 / math.log10(math.e)
                                     new_hyp.ngram_lm_state = next_state
-                                    new_hyp.score += self.ngram_lm_alpha * lm_score
+                                    #new_hyp.score += self.ngram_lm_alpha * lm_score
+                                    lm_score_weighted = self.ngram_lm_alpha * lm_score
                                     if self.hat_subtract_ilm:
-                                        new_hyp.score -= float(ytu_ilm[i, 0, 0, int(k)])
+                                        #new_hyp.score -= float(ytu_ilm[i, 0, 0, int(k)])
+                                        new_hyp.score -= float(ytu[i, 0, 0, int(k)])
+                                        overall_logp = float(ytu[i, 0, 0, int(k)]) + lm_score_weighted - float(ytu_ilm[i, 0, 0, int(k)])
+                                        if overall_logp < 0:
+                                            new_hyp.score += overall_logp
+                                        else:
+                                            new_hyp.score += math.log(0.95)
+                                    else:
+                                        new_hyp.score += lm_score_weighted
+                                        #logging.warning(f"********[DEBUG]: overall_logp is: {overall_logp}")
 
                                 # TODO: Setup LM
                                 if self.language_model is not None:
@@ -1280,10 +1296,12 @@ class BeamRNNTInfer(Typing):
                         # Finally, update the kept hypothesis of sorted top Beam candidates
                         kept_hyps = sorted(list_b + list_exp, key=lambda x: x.score, reverse=True)[:beam]
 
+        # # normalize length:
+        # for h in kept_hyps:
+        #     h.score /= len(h.y_sequence)
+
         # Sort the hypothesis with best scores
         return self.sort_nbest(kept_hyps)
-
-    # def ngram_lm_batch_predict(self, )
 
 
 
@@ -1339,10 +1357,16 @@ class BeamRNNTInfer(Typing):
                         next_state = kenlm.State()
                         lm_score = self.ngram_lm.BaseScore(hyp_i.ngram_lm_state, str(int(hyp_j.y_sequence[pref_id])), next_state)
                         lm_score *= 1.0 / math.log10(math.e)
-                        curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]]) + self.ngram_lm_alpha * lm_score
+                        lm_score_weighted = self.ngram_lm_alpha * lm_score
+                        #curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]]) + self.ngram_lm_alpha * lm_score
                         if self.hat_subtract_ilm:
-                            #logging.warning(f"******[DEBUGGIN]: logp_ilm.shape is: {logp_ilm.shape}")
-                            curr_score -= float(logp_ilm[0,0,hyp_j.y_sequence[pref_id]])
+                            overall_score = float(logp[hyp_j.y_sequence[pref_id]]) - float(logp_ilm[0,0,hyp_j.y_sequence[pref_id]]) + lm_score_weighted
+                            if overall_score >= 0:
+                                overall_score = math.log(0.95)
+                            curr_score = hyp_i.score + overall_score
+                        else:
+                            #curr_score -= float(logp_ilm[0,0,hyp_j.y_sequence[pref_id]])
+                            curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]]) + lm_score_weighted
                     else:
                         curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]])
 
@@ -1364,9 +1388,16 @@ class BeamRNNTInfer(Typing):
                             next_state = kenlm.State()
                             lm_score = self.ngram_lm.BaseScore(ngram_lm_state, str(int(hyp_j.y_sequence[k + 1])), next_state)
                             lm_score *= 1.0 / math.log10(math.e)
-                            curr_score += (float(logp[hyp_j.y_sequence[k + 1]]) + self.ngram_lm_alpha * lm_score)
+                            #curr_score += (float(logp[hyp_j.y_sequence[k + 1]]) + self.ngram_lm_alpha * lm_score)
+                            lm_score_weighted = self.ngram_lm_alpha * lm_score
                             if self.hat_subtract_ilm:
-                                curr_score -= float(logp_ilm[0,0,hyp_j.y_sequence[k + 1]])
+                                #curr_score -= float(logp_ilm[0,0,hyp_j.y_sequence[k + 1]])
+                                overall_score = float(logp[hyp_j.y_sequence[k + 1]]) - float(logp_ilm[0,0,hyp_j.y_sequence[k + 1]]) + lm_score_weighted
+                                if overall_score >= 0:
+                                    overall_score = math.log(0.95)
+                                curr_score += overall_score
+                            else:
+                                curr_score += (float(logp[hyp_j.y_sequence[k + 1]]) + lm_score_weighted)
                         else:
                             curr_score += float(logp[hyp_j.y_sequence[k + 1]])
 
