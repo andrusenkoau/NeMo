@@ -133,7 +133,7 @@ def main():
     )
     parser.add_argument(
         "--decoding_mode",
-        choices=["greedy", "beam", "tsd", "alsd", "maes"],
+        choices=["greedy", "greedy_batch", "beam", "tsd", "alsd", "maes"],
         default="beam",
         type=str,
         help="The decoding scheme to be used for evaluation.",
