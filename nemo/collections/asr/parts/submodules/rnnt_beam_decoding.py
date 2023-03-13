@@ -50,6 +50,10 @@ def pack_hypotheses(hypotheses: List[Hypothesis]) -> List[Hypothesis]:
         if hyp.dec_state is not None:
             hyp.dec_state = _states_to_device(hyp.dec_state)
 
+        # Remove -1 from timestep
+        if hyp.timestep is not None and len(hyp.timestep) > 0 and hyp.timestep[0] == -1:
+            hyp.timestep = hyp.timestep[1:]
+
     return hypotheses
 
 
@@ -285,10 +289,10 @@ class BeamRNNTInfer(Typing):
         self.maes_expansion_gamma = float(maes_expansion_gamma)
         self.maes_expansion_beta = int(maes_expansion_beta)
 
-        if self.maes_prefix_alpha < 0:
+        if self.search_type == 'maes' and self.maes_prefix_alpha < 0:
             raise ValueError("`maes_prefix_alpha` must be a positive integer.")
 
-        if self.vocab_size < beam_size + maes_expansion_beta:
+        if self.search_type == 'maes' and self.vocab_size < beam_size + maes_expansion_beta:
             raise ValueError(
                 f"beam_size ({beam_size}) + expansion_beta ({maes_expansion_beta}) "
                 f"should be smaller or equal to vocabulary size ({self.vocab_size})."
@@ -297,7 +301,7 @@ class BeamRNNTInfer(Typing):
         if search_type == 'maes':
             self.max_candidates += maes_expansion_beta
 
-        if self.maes_num_steps < 2:
+        if self.search_type == 'maes' and self.maes_num_steps < 2:
             raise ValueError("`maes_num_steps` must be greater than 1.")
 
         if softmax_temperature != 1.0 and language_model is not None:
@@ -327,7 +331,7 @@ class BeamRNNTInfer(Typing):
         """Perform general beam search.
 
         Args:
-            encoder_output: Encoded speech features (B, T_max, D_enc)
+            encoder_output: Encoded speech features (B, D_enc, T_max)
             encoded_lengths: Lengths of the encoder outputs
 
         Returns:
@@ -731,9 +735,6 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
-        if self.preserve_alignments:
-            raise NotImplementedError("`preseve_alignments` is not implemented for Time-Synchronous Decoding.")
-
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
 
@@ -765,6 +766,11 @@ class BeamRNNTInfer(Typing):
         ]
         cache = {}
 
+        # Initialize alignments
+        if self.preserve_alignments:
+            for hyp in B:
+                hyp.alignments = [[]]
+
         for i in range(int(encoded_lengths)):
             hi = h[:, i : i + 1, :]
 
@@ -795,16 +801,23 @@ class BeamRNNTInfer(Typing):
                     if hyp.y_sequence not in seq_A:
                         # If the sequence is not in seq_A, add it as the blank token
                         # In this step, we dont add a token but simply update score
-                        A.append(
-                            Hypothesis(
-                                score=(hyp.score + float(beam_logp[j, self.blank])),
-                                y_sequence=hyp.y_sequence[:],
-                                dec_state=hyp.dec_state,
-                                lm_state=hyp.lm_state,
-                                timestep=hyp.timestep[:],
-                                length=encoded_lengths,
-                            )
+                        _temp_hyp = Hypothesis(
+                            score=(hyp.score + float(beam_logp[j, self.blank])),
+                            y_sequence=hyp.y_sequence[:],
+                            dec_state=hyp.dec_state,
+                            lm_state=hyp.lm_state,
+                            timestep=hyp.timestep[:],
+                            length=encoded_lengths,
                         )
+
+                        # Preserve the blank token alignment
+                        if self.preserve_alignments:
+                            _temp_hyp.alignments = copy.deepcopy(hyp.alignments)
+                            _temp_hyp.alignments[-1].append(
+                                (beam_logp[j].clone(), torch.tensor(self.blank, dtype=torch.int32)),
+                            )
+
+                        A.append(_temp_hyp)
                     else:
                         # merge the existing blank hypothesis score with current score.
                         dict_pos = seq_A.index(hyp.y_sequence)
@@ -829,13 +842,44 @@ class BeamRNNTInfer(Typing):
                                 length=encoded_lengths,
                             )
 
+                            # Preserve token alignment
+                            if self.preserve_alignments:
+                                new_hyp.alignments = copy.deepcopy(hyp.alignments)
+                                new_hyp.alignments[-1].append(
+                                    (beam_topk[0].clone().cpu(), torch.tensor(k, dtype=torch.int32)),
+                                )
+
                             D.append(new_hyp)
 
                 # Prune beam
                 C = sorted(D, key=lambda x: x.score, reverse=True)[:beam]
 
+                if self.preserve_alignments:
+                    # convert Ti-th logits into a torch array
+                    for C_i in C:
+                        # Check if the last token emitted at last timestep was a blank
+                        # If so, move to next timestep
+                        logp, label = C_i.alignments[-1][-1]  # The last alignment of this step
+                        if int(label) == self.blank:
+                            C_i.alignments.append([])  # blank buffer for next timestep
+
             # Prune beam
             B = sorted(A, key=lambda x: x.score, reverse=True)[:beam]
+
+            if self.preserve_alignments:
+                # convert Ti-th logits into a torch array
+                for B_i in B:
+                    # Check if the last token emitted at last timestep was a blank
+                    # If so, move to next timestep
+                    logp, label = B_i.alignments[-1][-1]  # The last alignment of this step
+                    if int(label) == self.blank:
+                        B_i.alignments.append([])  # blank buffer for next timestep
+
+        # Remove trailing empty list of alignments
+        if self.preserve_alignments:
+            for h in B:
+                if len(h.alignments[-1]) == 0:
+                    del h.alignments[-1]
 
         return self.sort_nbest(B)
 
@@ -851,11 +895,6 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
-        if self.preserve_alignments:
-            raise NotImplementedError(
-                "`preseve_alignments` is not implemented for Alignment-length Synchronous Decoding."
-            )
-
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
 
@@ -895,6 +934,10 @@ class BeamRNNTInfer(Typing):
                 length=0,
             )
         ]
+
+        # Initialize alignments
+        if self.preserve_alignments:
+            B[0].alignments = [[]]
 
         final = []
         cache = {}
@@ -977,6 +1020,14 @@ class BeamRNNTInfer(Typing):
                         length=i,
                     )
 
+                    if self.preserve_alignments:
+                        new_hyp.alignments = copy.deepcopy(hyp.alignments)
+
+                        # Add the alignment of blank at this step
+                        new_hyp.alignments[-1].append(
+                            (beam_logp[j].clone().cpu(), torch.tensor(self.blank, dtype=torch.int32))
+                        )
+
                     # Add blank prediction to A
                     A.append(new_hyp)
 
@@ -1006,6 +1057,14 @@ class BeamRNNTInfer(Typing):
                             length=i,
                         )
 
+                        if self.preserve_alignments:
+                            new_hyp.alignments = copy.deepcopy(hyp.alignments)
+
+                            # Add the alignment of Uj for this beam candidate at this step
+                            new_hyp.alignments[-1].append(
+                                (beam_logp[j].clone().cpu(), torch.tensor(new_hyp.y_sequence[-1], dtype=torch.int32))
+                            )
+
                         A.append(new_hyp)
 
                 # Prune and recombine same hypothesis
@@ -1014,13 +1073,35 @@ class BeamRNNTInfer(Typing):
                 B = sorted(A, key=lambda x: x.score, reverse=True)[:beam]
                 B = self.recombine_hypotheses(B)
 
+                if self.preserve_alignments:
+                    # convert Ti-th logits into a torch array
+                    for B_i in B:
+                        # Check if the last token emitted at last timestep was a blank
+                        # If so, move to next timestep
+                        logp, label = B_i.alignments[-1][-1]  # The last alignment of this step
+                        if int(label) == self.blank:
+                            B_i.alignments.append([])  # blank buffer for next timestep
+
             # If B_ is empty list, then we may be able to early exit
             elif len(batch_ids) == len(batch_removal_ids):
+                # break early
                 break
 
         if final:
+            # Remove trailing empty list of alignments
+            if self.preserve_alignments:
+                for h in final:
+                    if len(h.alignments[-1]) == 0:
+                        del h.alignments[-1]
+
             return self.sort_nbest(final)
         else:
+            # Remove trailing empty list of alignments
+            if self.preserve_alignments:
+                for h in B:
+                    if len(h.alignments[-1]) == 0:
+                        del h.alignments[-1]
+
             return B
 
     def modified_adaptive_expansion_search(
@@ -1035,11 +1116,6 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
-        if self.preserve_alignments:
-            raise NotImplementedError(
-                "`preseve_alignments` is not implemented for Alignment-length Synchronous Decoding."
-            )
-
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
 
@@ -1063,6 +1139,11 @@ class BeamRNNTInfer(Typing):
         ]
 
         cache = {}
+
+        # Initialize alignment buffer
+        if self.preserve_alignments:
+            for hyp in init_tokens:
+                hyp.alignments = [[]]
 
         # Decode a batch of beam states and scores
         beam_dec_out, beam_state, beam_lm_tokens = self.decoder.batch_score_hypothesis(init_tokens, cache, beam_state)
@@ -1103,6 +1184,11 @@ class BeamRNNTInfer(Typing):
                 ngram_lm_state=ngram_lm_state,
             )
         ]
+
+        # Initialize alignment buffer
+        if self.preserve_alignments:
+            for hyp in kept_hyps:
+                hyp.alignments = [[]]
 
         for t in range(encoded_lengths):
             enc_out_t = h[t : t + 1].unsqueeze(0)  # [1, 1, D]
@@ -1171,6 +1257,8 @@ class BeamRNNTInfer(Typing):
                             dec_state=hyp.dec_state,
                             lm_state=hyp.lm_state,
                             lm_scores=hyp.lm_scores,
+                            timestep=hyp.timestep[:],
+                            length=t,
                         )
                         if self.ngram_lm:
                             new_hyp.ngram_lm_state = hyp.ngram_lm_state.__deepcopy__()
@@ -1183,6 +1271,7 @@ class BeamRNNTInfer(Typing):
                             # new_hyp.y_sequence.append(int(k))
                             if (new_hyp.y_sequence + [int(k)]) not in duplication_check:
                                 new_hyp.y_sequence.append(int(k))
+                                new_hyp.timestep.append(t)
 
                                 # Setup Ngram LM:
                                 if self.ngram_lm is not None:
@@ -1213,11 +1302,38 @@ class BeamRNNTInfer(Typing):
 
                                 list_exp.append(new_hyp)
 
+                        # Preserve alignments
+                        if self.preserve_alignments:
+                            new_hyp.alignments = copy.deepcopy(hyp.alignments)
+
+                            if k == self.blank:
+                                new_hyp.alignments[-1].append(
+                                    (beam_logp[i].clone().cpu(), torch.tensor(self.blank, dtype=torch.int32)),
+                                )
+                            else:
+                                new_hyp.alignments[-1].append(
+                                    (
+                                        beam_logp[i].clone().cpu(),
+                                        torch.tensor(new_hyp.y_sequence[-1], dtype=torch.int32),
+                                    ),
+                                )
+
                 # If there were no token expansions in any of the hypotheses,
                 # Early exit
                 if not list_exp:
                     kept_hyps = sorted(list_b, key=lambda x: x.score, reverse=True)[:beam]
 
+                    # Update aligments with next step
+                    if self.preserve_alignments:
+                        # convert Ti-th logits into a torch array
+                        for h_i in kept_hyps:
+                            # Check if the last token emitted at last timestep was a blank
+                            # If so, move to next timestep
+                            logp, label = h_i.alignments[-1][-1]  # The last alignment of this step
+                            if int(label) == self.blank:
+                                h_i.alignments.append([])  # blank buffer for next timestep
+
+                    # Early exit
                     break
 
                 else:
@@ -1266,6 +1382,17 @@ class BeamRNNTInfer(Typing):
 
                         # Copy the expanded hypothesis
                         hyps = list_exp[:]
+
+                        # Update aligments with next step
+                        if self.preserve_alignments:
+                            # convert Ti-th logits into a torch array
+                            for h_i in hyps:
+                                # Check if the last token emitted at last timestep was a blank
+                                # If so, move to next timestep
+                                logp, label = h_i.alignments[-1][-1]  # The last alignment of this step
+                                if int(label) == self.blank:
+                                    h_i.alignments.append([])  # blank buffer for next timestep
+
                     else:
                         # Extract the log probabilities
                         if self.joint.__class__.__name__ == "HATJoint":

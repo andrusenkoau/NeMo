@@ -34,8 +34,9 @@ from typing import List, Optional
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.asr.losses.rnnt_pytorch import RNNTLossPytorch
 from nemo.collections.asr.losses.rnnt_speechbrain import RNNTLossSpeechBrain
+from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch
+
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils.numba_utils import NUMBA_INSTALLATION_MESSAGE
@@ -49,7 +50,7 @@ except (ImportError, ModuleNotFoundError):
     WARP_RNNT_AVAILABLE = False
 
 try:
-    from nemo.collections.asr.parts.numba.rnnt_loss import RNNTLossNumba
+    from nemo.collections.asr.parts.numba.rnnt_loss import MultiblankRNNTLossNumba, RNNTLossNumba
 
     NUMBA_RNNT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -108,6 +109,20 @@ RNNT_LOSS_RESOLVER = {
         lib_name="sb",
         is_available=SPEECHBRAIN_RNNT_AVAILABLE,
     ),   
+    "multiblank_rnnt": RNNTLossConfig(
+        loss_name="multiblank_rnnt",
+        lib_name="numba",
+        min_version='0.53.0',
+        is_available=NUMBA_RNNT_AVAILABLE,
+        installation_msg=NUMBA_INSTALLATION_MESSAGE,
+    ),
+    "multiblank_rnnt_pytorch": RNNTLossConfig(
+        loss_name="pytorch",
+        lib_name="torch",
+        min_version='0.0',
+        is_available=True,
+        installation_msg="Pure Pytorch implementation of Multiblank RNN-T loss. Slow and for debugging purposes only.",
+    ),
 }
 
 RNNT_LOSS_RESOLVER['default'] = RNNT_LOSS_RESOLVER['warprnnt_numba']
@@ -192,6 +207,27 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
 
     elif loss_name == 'speechbrain_rnnt':
         loss_func = RNNTLossSpeechBrain(blank=blank_idx, reduction='none')
+    elif loss_name == 'multiblank_rnnt':
+        fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
+        clamp = loss_kwargs.pop('clamp', -1.0)
+        big_blank_durations = loss_kwargs.pop('big_blank_durations', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        loss_func = MultiblankRNNTLossNumba(
+            blank=blank_idx,
+            big_blank_durations=big_blank_durations,
+            reduction='none',
+            fastemit_lambda=fastemit_lambda,
+            clamp=clamp,
+            sigma=sigma,
+        )
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'multiblank_rnnt_pytorch':
+        big_blank_durations = loss_kwargs.pop('big_blank_durations', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        loss_func = MultiblankRNNTLossPytorch(
+            blank=blank_idx, big_blank_durations=big_blank_durations, reduction='none', sigma=sigma
+        )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     else:
@@ -302,10 +338,10 @@ class RNNTLoss(Loss):
 
     @typecheck()
     def forward(self, log_probs, targets, input_lengths, target_lengths):
-        # Cast to int 32
-        targets = targets.int()
-        input_lengths = input_lengths.int()
-        target_lengths = target_lengths.int()
+        # Cast to int 64
+        targets = targets.long()
+        input_lengths = input_lengths.long()
+        target_lengths = target_lengths.long()
 
         max_logit_len = input_lengths.max()
         max_targets_len = target_lengths.max()

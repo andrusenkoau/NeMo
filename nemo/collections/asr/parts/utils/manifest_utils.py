@@ -16,7 +16,8 @@ import json
 import os
 from collections import Counter
 from collections import OrderedDict as od
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Union
 
 import librosa
 import numpy as np
@@ -29,6 +30,7 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     segments_manifest_to_subsegments_manifest,
     write_rttm2manifest,
 )
+from nemo.utils.data_utils import DataStoreObject
 
 
 def rreplace(s: str, old: str, new: str) -> str:
@@ -174,7 +176,8 @@ def read_file(pathlist: str) -> List[str]:
     Returns:
         sorted(pathlist) (list): List of lines
     """
-    pathlist = open(pathlist, 'r').readlines()
+    with open(pathlist, 'r') as f:
+        pathlist = f.readlines()
     return sorted(pathlist)
 
 
@@ -330,7 +333,8 @@ def create_manifest(
             uem = uem.strip()
 
         if text is not None:
-            text = open(text.strip()).readlines()[0].strip()
+            with open(text.strip()) as f:
+                text = f.readlines()[0].strip()
         else:
             text = "-"
 
@@ -359,18 +363,20 @@ def create_manifest(
     write_file(manifest_filepath, lines, range(len(lines)))
 
 
-def read_manifest(manifest: str) -> List[dict]:
+def read_manifest(manifest: Union[Path, str]) -> List[dict]:
     """
     Read manifest file
 
     Args:
-        manifest (str): Path to manifest file
+        manifest (str or Path): Path to manifest file
     Returns:
         data (list): List of JSON items
     """
+    manifest = DataStoreObject(str(manifest))
+
     data = []
     try:
-        f = open(manifest, 'r', encoding='utf-8')
+        f = open(manifest.get(), 'r', encoding='utf-8')
     except:
         raise Exception(f"Manifest file could not be opened: {manifest}")
     for line in f:
@@ -380,17 +386,18 @@ def read_manifest(manifest: str) -> List[dict]:
     return data
 
 
-def write_manifest(output_path: str, target_manifest: List[dict]):
+def write_manifest(output_path: Union[Path, str], target_manifest: List[dict], ensure_ascii: bool = True):
     """
     Write to manifest file
 
     Args:
-        output_path (str): Path to output manifest file
+        output_path (str or Path): Path to output manifest file
         target_manifest (list): List of manifest file entries
+        ensure_ascii (bool): default is True, meaning the output is guaranteed to have all incoming non-ASCII characters escaped. If ensure_ascii is false, these characters will be output as-is.
     """
-    with open(output_path, "w") as outfile:
+    with open(output_path, "w", encoding="utf-8") as outfile:
         for tgt in target_manifest:
-            json.dump(tgt, outfile)
+            json.dump(tgt, outfile, ensure_ascii=ensure_ascii)
             outfile.write('\n')
 
 

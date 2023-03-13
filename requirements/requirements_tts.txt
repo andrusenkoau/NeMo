@@ -1,8 +1,15 @@
 attrdict
 einops
 inflect
+jieba
+kornia
 librosa
 matplotlib
+nemo_text_processing
 nltk
 pandas
 pypinyin
+<<<<<<< HEAD
+=======
+pypinyin-dict
+>>>>>>> beb5fbd371f66ebe0e47ee4d347bfca087110268
