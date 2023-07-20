@@ -174,8 +174,9 @@ def read_train_file(
 def tokenize_str(texts, tokenizer):
     tokenized_text = []
     for text in texts:
-        tok_text = tokenizer.text_to_ids(*text)
-        tok_text = [chr(token + DEFAULT_TOKEN_OFFSET) for token in tok_text]
+        # tok_text = tokenizer.text_to_ids(*text)
+        # tok_text = [chr(token + DEFAULT_TOKEN_OFFSET) for token in tok_text]
+        tok_text = tokenizer.text_to_tokens(*text)
         tokenized_text.append(tok_text)
     return tokenized_text
 

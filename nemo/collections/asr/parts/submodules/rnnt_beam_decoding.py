@@ -46,6 +46,8 @@ from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
 
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
+
 try:
     import kenlm
 
@@ -237,9 +239,15 @@ class BeamRNNTInfer(Typing):
         ngram_lm_alpha: float = 0.0,
         hat_subtract_ilm: bool = False,
         hat_ilm_weight: float = 0.0,
+        tokenizer: TokenizerSpec = None,
     ):
         self.decoder = decoder_model
         self.joint = joint_model
+        self.tokenizer = tokenizer
+        # logging.warning(f"**************************************")
+        # logging.warning(f"***[DEBUG]: labels_map is {tokenizer}")
+        # logging.warning(f"**************************************")
+        # raise KeyError
 
         self.blank = decoder_model.blank_idx
         self.vocab_size = decoder_model.vocab_size
@@ -1461,12 +1469,14 @@ class BeamRNNTInfer(Typing):
         Score computation for kenlm ngram language model.
         """
 
-        if self.token_offset:
-            label = chr(label + self.token_offset)
-        else:
-            label = str(label)
+        label = self.tokenizer.ids_to_tokens([label])
+
+        # if self.token_offset:
+        #     label = chr(label + self.token_offset)
+        # else:
+        #     label = str(label)
         next_state = kenlm.State()
-        lm_score = self.ngram_lm.BaseScore(current_lm_state, label, next_state)
+        lm_score = self.ngram_lm.BaseScore(current_lm_state, label[0], next_state)
         lm_score *= 1.0 / np.log10(np.e)
 
         return lm_score, next_state

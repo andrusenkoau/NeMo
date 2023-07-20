@@ -193,7 +193,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         blank_id: The id of the RNNT blank token.
     """
 
-    def __init__(self, decoding_cfg, decoder, joint, blank_id: int):
+    def __init__(self, decoding_cfg, decoder, joint, blank_id: int, tokenizer=None):
         super(AbstractRNNTDecoding, self).__init__()
 
         # Convert dataclass to config object
@@ -366,6 +366,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
                 hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', False),
                 hat_ilm_weight=self.cfg.beam.get('hat_ilm_weight', 0.0),
+                tokenizer=tokenizer,
             )
 
         else:
