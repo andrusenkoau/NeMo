@@ -362,6 +362,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 score_norm=self.cfg.beam.get('score_norm', True),
                 softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
                 preserve_alignments=self.preserve_alignments,
+                cb_score=self.cfg.beam.get('cb_score', None),
+                cb_words=self.cfg.beam.get('cb_words', None),
             )
 
         elif self.cfg.strategy == 'tsd':
@@ -411,6 +413,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
                 hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', False),
                 hat_ilm_weight=self.cfg.beam.get('hat_ilm_weight', 0.0),
+                cb_score=self.cfg.beam.get('cb_score', None),
+                cb_words=self.cfg.beam.get('cb_words', None),
             )
 
         else:
