@@ -75,6 +75,7 @@ from nemo.utils import logging
 class EvaluationConfig(transcribe_speech.TranscriptionConfig):
     dataset_manifest: str = MISSING
     output_filename: Optional[str] = "evaluation_transcripts.json"
+    decoder_type: Optional[str] = None
 
     use_cer: bool = False
     tolerance: Optional[float] = None
