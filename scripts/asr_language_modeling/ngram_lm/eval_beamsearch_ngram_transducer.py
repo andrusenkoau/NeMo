@@ -76,6 +76,7 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+from nemo.collections.asr.parts.k2.context_graph import ContextGraph
 
 # fmt: off
 
@@ -100,6 +101,9 @@ class EvalBeamSearchNGramConfig:
     device: str = "cuda"  # The device to load the model onto to calculate log probabilities
     use_amp: bool = False  # Whether to use AMP if available to calculate log probabilities
     num_workers: int = 1  # Number of workers for DataLoader
+    
+    # for hybrid model
+    decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
 
     # The decoding scheme to be used for evaluation
     decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes"]
@@ -115,6 +119,11 @@ class EvalBeamSearchNGramConfig:
     hat_subtract_ilm: bool = False
     hat_ilm_weight: List[float] = field(default_factory=lambda: [0.0])
 
+    # Context Biasing:
+    context_score: float = 1.0  # per token weight for context biasing words
+    context_str: Optional[str] = None  # string with context biasing words (words splitted by space) 
+
+
     decoding: rnnt_beam_decoding.BeamRNNTInferConfig = rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=128)
 
 
@@ -126,7 +135,10 @@ def decoding_step(
     cfg: EvalBeamSearchNGramConfig,
     all_probs: List[torch.Tensor],
     target_transcripts: List[str],
+    audio_file_paths: List[str],
+    durations: List[str],
     preds_output_file: str = None,
+    preds_output_manifest: str = None,
     beam_batch_size: int = 128,
     progress_bar: bool = True,
 ):
@@ -154,8 +166,12 @@ def decoding_step(
     words_count = 0
     chars_count = 0
     sample_idx = 0
+
     if preds_output_file:
         out_file = open(preds_output_file, 'w', encoding='utf_8', newline='\n')
+
+    if preds_output_manifest:
+        out_manifest = open(preds_output_manifest, 'w', encoding='utf_8', newline='\n')
 
     if progress_bar:
         if cfg.decoding_strategy == "greedy_batch":
@@ -189,6 +205,7 @@ def decoding_step(
             words_count += len(target_split_w)
             chars_count += len(target_split_c)
             wer_dist_min = cer_dist_min = 10000
+            audio_id = os.path.basename(audio_file_paths[sample_idx + beams_idx])
             for candidate_idx, candidate in enumerate(beams):  # type: (int, rnnt_beam_decoding.rnnt_utils.Hypothesis)
                 pred_text = candidate.text
                 pred_split_w = pred_text.split()
@@ -206,9 +223,22 @@ def decoding_step(
 
                 score = candidate.score
                 if preds_output_file:
-                    out_file.write('{}\t{}\n'.format(pred_text, score))
+                    
+                    out_file.write('{}\t{}\t{}\n'.format(audio_id, pred_text, score))
+
+                    #out_file.write('{}\t{}\n'.format(pred_text, score))
             wer_dist_best += wer_dist_min
             cer_dist_best += cer_dist_min
+
+            # write manifest with prediction results
+            if preds_output_manifest:
+                item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
+                        'duration': durations[sample_idx + beams_idx],
+                        'text': target_transcripts[sample_idx + beams_idx],
+                        'pred_text': beams[0].text,
+                        'wer': f"{wer_dist_first/len(target_split_w):.3f}"}
+                out_manifest.write(json.dumps(item) + "\n")
+        
         sample_idx += len(probs_batch)
 
     if cfg.decoding_strategy == "greedy_batch":
@@ -272,6 +302,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         cfg.maes_prefix_alpha, cfg.maes_expansion_gamma, cfg.hat_ilm_weight = [0], [0], [0]
 
     target_transcripts = []
+    durations = []
     manifest_dir = Path(cfg.input_manifest).parent
     with open(cfg.input_manifest, 'r', encoding='utf_8') as manifest_file:
         audio_file_paths = []
@@ -281,6 +312,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
             if not audio_file.is_file() and not audio_file.is_absolute():
                 audio_file = manifest_dir / audio_file
             target_transcripts.append(data['text'])
+            durations.append(data['duration'])
             audio_file_paths.append(str(audio_file.absolute()))
 
     if cfg.probs_cache_file and os.path.exists(cfg.probs_cache_file):
@@ -348,13 +380,17 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
     if cfg.decoding_strategy == "greedy_batch":
         asr_model = asr_model.to('cpu')
+        preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
         candidate_wer, candidate_cer = decoding_step(
             asr_model,
             cfg,
             all_probs=all_probs,
             target_transcripts=target_transcripts,
+            audio_file_paths=audio_file_paths,
+            durations=durations,
             beam_batch_size=cfg.beam_batch_size,
             progress_bar=True,
+            preds_output_file=preds_output_file,
         )
         logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
 
@@ -385,6 +421,22 @@ def main(cfg: EvalBeamSearchNGramConfig):
         logging.info(f"It may take some time...")
         logging.info(f"==============================================================================================")
 
+        # context biasing:
+        if cfg.context_str:
+            context_transcripts = []
+            for word in cfg.context_str.split():
+                context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+            cfg.decoding.cb_score = cfg.context_score
+            cfg.decoding.cb_words = context_transcripts
+            # logging.warning(context_transcripts)
+            # context_graph = ContextGraph(cfg.context_score)
+            # context_graph.build(context_transcripts)
+            # cfg.decoding.context_graph = context_graph
+            # logging.warning(f"|||||||||||||||||||||| context_graph.root.next is: {context_graph.root.next}")
+            # raise Exception
+
+        
+        
         if cfg.preds_output_folder and not os.path.exists(cfg.preds_output_folder):
             os.mkdir(cfg.preds_output_folder)
         for hp in hp_grid:
@@ -397,6 +449,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
                         if cfg.hat_subtract_ilm:
                             results_file = f"{results_file}_hat_ilmw{hp['hat_ilm_weight']}"
                 preds_output_file = os.path.join(cfg.preds_output_folder, f"{results_file}.tsv")
+                preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
             else:
                 preds_output_file = None
 
@@ -411,7 +464,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 cfg,
                 all_probs=all_probs,
                 target_transcripts=target_transcripts,
+                audio_file_paths=audio_file_paths,
+                durations=durations,
                 preds_output_file=preds_output_file,
+                preds_output_manifest=preds_output_manifest,
                 beam_batch_size=cfg.beam_batch_size,
                 progress_bar=True,
             )

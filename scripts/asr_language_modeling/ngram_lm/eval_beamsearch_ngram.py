@@ -101,6 +101,9 @@ class EvalBeamSearchNGramConfig:
     device: str = "cuda"  # The device to load the model onto to calculate log probabilities
     use_amp: bool = False  # Whether to use AMP if available to calculate log probabilities
 
+    # for hybrid model
+    decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
+
     # Beam Search hyperparameters
 
     # The decoding scheme to be used for evaluation.
@@ -111,9 +114,12 @@ class EvalBeamSearchNGramConfig:
     beam_alpha: List[float] = field(default_factory=lambda: [1.0])  # The alpha parameter or list of the alphas for the beam search decoding
     beam_beta: List[float] = field(default_factory=lambda: [0.0])  # The beta parameter or list of the betas for the beam search decoding
 
-    decoding_strategy: str = "beam"
+    decoding_strategy: str = "pyctcdecode"  # ["beam", "pyctcdecode"]
     decoding: ctc_beam_decoding.BeamCTCInferConfig = ctc_beam_decoding.BeamCTCInferConfig(beam_size=128)
     
+    hotword_weight: float = 10.0  # per token weight for context biasing words
+    hotwords_str: Optional[str] = None  # string with context biasing words (words splitted by space) 
+
     text_processing: Optional[TextProcessingConfig] = TextProcessingConfig(
         punctuation_marks = ".,?",
         separate_punctuation = False,
@@ -128,7 +134,10 @@ def beam_search_eval(
     cfg: EvalBeamSearchNGramConfig,
     all_probs: List[torch.Tensor],
     target_transcripts: List[str],
+    audio_file_paths: List[str],
+    durations: List[str],
     preds_output_file: str = None,
+    preds_output_manifest: str = None,
     lm_path: str = None,
     beam_alpha: float = 1.0,
     beam_beta: float = 0.0,
@@ -169,6 +178,8 @@ def beam_search_eval(
     sample_idx = 0
     if preds_output_file:
         out_file = open(preds_output_file, 'w', encoding='utf_8', newline='\n')
+    if preds_output_manifest:
+        out_manifest = open(preds_output_manifest, 'w', encoding='utf_8', newline='\n')
 
     if progress_bar:
         it = tqdm(
@@ -189,7 +200,6 @@ def beam_search_eval(
                 packed_batch[prob_index, : probs_lens[prob_index], :] = torch.tensor(
                     probs_batch[prob_index], device=packed_batch.device, dtype=packed_batch.dtype
                 )
-
             _, beams_batch = decoding.ctc_decoder_predictions_tensor(
                 packed_batch, decoder_lengths=probs_lens, return_hypotheses=True,
             )
@@ -225,8 +235,18 @@ def beam_search_eval(
                 score = candidate.score
                 if preds_output_file:
                     out_file.write('{}\t{}\n'.format(pred_text, score))
+
             wer_dist_best += wer_dist_min
             cer_dist_best += cer_dist_min
+
+            if preds_output_manifest:
+                item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
+                        'duration': durations[sample_idx + beams_idx],
+                        'text': target_transcripts[sample_idx + beams_idx],
+                        'pred_text': beams[0].text,
+                        'wer': f"{wer_dist_first/len(target_split_w):.4f}"}
+                out_manifest.write(json.dumps(item) + "\n")
+
         sample_idx += len(probs_batch)
 
     if preds_output_file:
@@ -278,6 +298,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         )
 
     target_transcripts = []
+    durations = []
     manifest_dir = Path(cfg.input_manifest).parent
     with open(cfg.input_manifest, 'r', encoding='utf_8') as manifest_file:
         audio_file_paths = []
@@ -287,6 +308,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
             if not audio_file.is_file() and not audio_file.is_absolute():
                 audio_file = manifest_dir / audio_file
             target_transcripts.append(data['text'])
+            durations.append(data['duration'])
             audio_file_paths.append(str(audio_file.absolute()))
 
     punctuation_capitalization = PunctuationCapitalization(cfg.text_processing.punctuation_marks)
@@ -379,6 +401,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         lm_path = cfg.kenlm_model_file
     else:
         lm_path = None
+        cfg.beam_alpha = [0.0]
 
     # 'greedy' decoding_mode would skip the beam search decoding
     if cfg.decoding_mode in ["beamsearch_ngram", "beamsearch"]:
@@ -398,6 +421,14 @@ def main(cfg: EvalBeamSearchNGramConfig):
         logging.info(f"It may take some time...")
         logging.info(f"==============================================================================================")
 
+        # context biasing:
+        if cfg.hotwords_str:
+            hotwords_list = []
+            for word in cfg.hotwords_str.split():
+                hotwords_list.append(word)
+            cfg.decoding.pyctcdecode_cfg.hotwords = hotwords_list
+            cfg.decoding.pyctcdecode_cfg.hotword_weight = cfg.hotword_weight
+
         if cfg.preds_output_folder and not os.path.exists(cfg.preds_output_folder):
             os.mkdir(cfg.preds_output_folder)
         for hp in hp_grid:
@@ -406,6 +437,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
                     cfg.preds_output_folder,
                     f"preds_out_width{hp['beam_width']}_alpha{hp['beam_alpha']}_beta{hp['beam_beta']}.tsv",
                 )
+                preds_output_manifest = os.path.join(cfg.preds_output_folder, "recognition_results.json")
             else:
                 preds_output_file = None
 
@@ -414,7 +446,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 cfg,
                 all_probs=all_probs,
                 target_transcripts=target_transcripts,
+                audio_file_paths=audio_file_paths,
+                durations=durations,
                 preds_output_file=preds_output_file,
+                preds_output_manifest=preds_output_manifest,
                 lm_path=lm_path,
                 beam_width=hp["beam_width"],
                 beam_alpha=hp["beam_alpha"],

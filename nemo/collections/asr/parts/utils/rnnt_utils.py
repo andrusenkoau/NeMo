@@ -28,9 +28,13 @@
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
+from nemo.utils import logging
 
 import torch
 
+import numpy as np
+
+from nemo.collections.asr.parts.k2.context_graph import ContextState
 
 @dataclass
 class Hypothesis:
@@ -104,6 +108,7 @@ class Hypothesis:
     ngram_lm_state: Optional[Union[Dict[str, Any], List[Any]]] = None
     tokens: Optional[Union[List[int], torch.Tensor]] = None
     last_token: Optional[torch.Tensor] = None
+    context_state: Optional[ContextState] = None
 
     @property
     def non_blank_frame_confidence(self) -> List[float]:
@@ -184,7 +189,7 @@ def is_prefix(x: List[int], pref: List[int]) -> bool:
 
 
 def select_k_expansions(
-    hyps: List[Hypothesis], topk_idxs: torch.Tensor, topk_logps: torch.Tensor, gamma: float, beta: int,
+    hyps: List[Hypothesis], topk_idxs: torch.Tensor, topk_logps: torch.Tensor, gamma: float, beta: int, ytm: torch.Tensor, blank_id: int
 ) -> List[Tuple[int, Hypothesis]]:
     """
     Obtained from https://github.com/espnet/espnet
@@ -206,6 +211,7 @@ def select_k_expansions(
     k_expansions = []
 
     for i, hyp in enumerate(hyps):
+
         hyp_i = [(int(k), hyp.score + float(v)) for k, v in zip(topk_idxs[i], topk_logps[i])]
         k_best_exp_val = max(hyp_i, key=lambda x: x[1])
 
@@ -213,6 +219,21 @@ def select_k_expansions(
         k_best_exp = k_best_exp_val[1]
 
         expansions = sorted(filter(lambda x: (k_best_exp - gamma) <= x[1], hyp_i), key=lambda x: x[1],)
+
+        # context biasing:
+        # if k_best_exp < np.log(0.95):
+        if not (k_best_exp_idx == blank_id and k_best_exp >= np.log(0.95)):
+            if hyp.context_state.id != 0:
+                expansions_tokens = set()
+                for pair in expansions:
+                    expansions_tokens.add(pair[0])
+
+                next_tokens = list(hyp.context_state.next.keys())
+                for token_id in next_tokens:
+                    if token_id not in expansions_tokens:
+                        token_score = float(ytm[i, 0, 0, token_id])
+                        if token_score >= k_best_exp - gamma*2:
+                            expansions.append((token_id, hyp.score + token_score))
 
         if len(expansions) > 0:
             k_expansions.append(expansions)

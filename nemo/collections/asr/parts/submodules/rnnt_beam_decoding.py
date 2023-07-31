@@ -45,6 +45,7 @@ from nemo.collections.asr.parts.utils.rnnt_utils import (
 from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
+from nemo.collections.asr.parts.k2.context_graph import ContextGraph
 
 try:
     import kenlm
@@ -237,6 +238,8 @@ class BeamRNNTInfer(Typing):
         ngram_lm_alpha: float = 0.0,
         hat_subtract_ilm: bool = False,
         hat_ilm_weight: float = 0.0,
+        cb_score: Optional[float] = 1.0,
+        cb_words: Optional[List] = None,
     ):
         self.decoder = decoder_model
         self.joint = joint_model
@@ -338,6 +341,12 @@ class BeamRNNTInfer(Typing):
             assert search_type == "maes"
         self.hat_subtract_ilm = hat_subtract_ilm
         self.hat_ilm_weight = hat_ilm_weight
+
+        if cb_words:
+            self.context_graph = ContextGraph(cb_score)
+            self.context_graph.build(cb_words)
+        else:
+            self.context_graph = None
 
     @typecheck()
     def __call__(
@@ -558,7 +567,12 @@ class BeamRNNTInfer(Typing):
         dec_state = self.decoder.initialize_state(h)
 
         # Initialize first hypothesis for the beam (blank)
-        kept_hyps = [Hypothesis(score=0.0, y_sequence=[self.blank], dec_state=dec_state, timestep=[-1], length=0)]
+        kept_hyps = [Hypothesis(score=0.0,
+                                y_sequence=[self.blank],
+                                dec_state=dec_state,
+                                timestep=[-1],
+                                length=0,
+                                context_state=None if self.context_graph is None else self.context_graph.root,)]
         cache = {}
 
         if partial_hypotheses is not None:
@@ -609,6 +623,7 @@ class BeamRNNTInfer(Typing):
                         lm_state=max_hyp.lm_state,
                         timestep=max_hyp.timestep[:],
                         length=encoded_lengths,
+                        context_state=None if not self.context_graph else max_hyp.context_state
                     )
 
                     if self.preserve_alignments:
@@ -622,6 +637,11 @@ class BeamRNNTInfer(Typing):
                         new_hyp.dec_state = state
                         new_hyp.y_sequence.append(int(k))
                         new_hyp.timestep.append(i)
+
+                        if self.context_graph:
+                            context_score, new_context_state = self.context_graph.forward_one_step(new_hyp.context_state, int(k))
+                            new_hyp.score += context_score
+                            new_hyp.context_state = new_context_state
 
                         hyps.append(new_hyp)
 
@@ -650,6 +670,14 @@ class BeamRNNTInfer(Typing):
 
                     kept_hyps = kept_most_prob
                     break
+        
+        if self.context_graph:
+            # finalize context_state, if the matched contexts do not reach final state
+            # we need to add the score on the corresponding backoff arc
+            for h in kept_hyps:
+                context_score, new_context_state = self.context_graph.finalize(h.context_state)
+                h.score += context_score
+                h.context_score = new_context_state
 
         # Remove trailing empty list of alignments
         if self.preserve_alignments:
@@ -1078,6 +1106,7 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
+
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
 
@@ -1141,6 +1170,7 @@ class BeamRNNTInfer(Typing):
                 lm_scores=lm_scores,
                 timestep=[-1],
                 length=0,
+                context_state=None if self.context_graph is None else self.context_graph.root,
             )
         ]
         if self.ngram_lm:
@@ -1183,7 +1213,7 @@ class BeamRNNTInfer(Typing):
 
                 # Compute k expansions for all the current hypotheses
                 k_expansions = select_k_expansions(
-                    hyps, beam_idx, beam_logp, self.maes_expansion_gamma, self.maes_expansion_beta
+                    hyps, beam_idx, beam_logp, self.maes_expansion_gamma, self.maes_expansion_beta, ytm, self.blank
                 )
 
                 # List that contains the hypothesis after prefix expansion
@@ -1199,6 +1229,7 @@ class BeamRNNTInfer(Typing):
                             lm_scores=hyp.lm_scores,
                             timestep=hyp.timestep[:],
                             length=t,
+                            context_state=None if not self.context_graph else hyp.context_state
                         )
                         if self.ngram_lm:
                             new_hyp.ngram_lm_state = hyp.ngram_lm_state
@@ -1206,6 +1237,7 @@ class BeamRNNTInfer(Typing):
                         # If the expansion was for blank
                         if k == self.blank:
                             list_b.append(new_hyp)
+
                         else:
                             # If the expansion was a token
                             # new_hyp.y_sequence.append(int(k))
@@ -1232,6 +1264,13 @@ class BeamRNNTInfer(Typing):
                                     # )
                                     pass
 
+                                # applay context biasing
+                                if self.context_graph:
+                                    context_score, new_context_state = self.context_graph.forward_one_step(hyp.context_state, int(k))
+                                    new_hyp.score += context_score
+                                    new_hyp.context_state = new_context_state
+                                
+                                
                                 list_exp.append(new_hyp)
 
                         # Preserve alignments
@@ -1358,6 +1397,15 @@ class BeamRNNTInfer(Typing):
                                 logp, label = h_i.alignments[-1][-1]  # The last alignment of this step
                                 if int(label) == self.blank:
                                     h_i.alignments.append([])  # blank buffer for next timestep
+        
+        if self.context_graph:
+            # finalize context_state, if the matched contexts do not reach final state
+            # we need to add the score on the corresponding backoff arc
+            for h in kept_hyps:
+                context_score, new_context_state = self.context_graph.finalize(h.context_state)
+                h.score += context_score
+                h.context_score = new_context_state
+
 
         # Remove trailing empty list of alignments
         if self.preserve_alignments:
@@ -1502,3 +1550,5 @@ class BeamRNNTInferConfig:
     ngram_lm_alpha: Optional[float] = 0.0
     hat_subtract_ilm: bool = False
     hat_ilm_weight: float = 0.0
+    cb_score: Optional[float] = 0.0
+    cb_words: Optional[List] = None
