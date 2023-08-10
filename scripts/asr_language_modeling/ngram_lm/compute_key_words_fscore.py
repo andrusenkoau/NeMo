@@ -30,13 +30,22 @@ def print_alignment(audio_filepath, ali, key_words):
     print(f"HYP: {' '.join(hyp)}")
     
 
-def compute_fscore(recognition_results_manifest, key_words_list):
+def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True):
 
     data = load_data(recognition_results_manifest)
     key_words_set = set(key_words_list)
+    
+    key_words_dict = {}
+    for item in key_words_list:
+        item = item.split()
+        if len(item) == 1:
+            key_words_dict[item[0]] = None
+        else:
+            key_words_dict[item[0]] = item[1:]
+    
     key_words_stat = {}
-    for word in key_words_set:
-        key_words_stat[word] = [0, 0]
+    for word in key_words_list:
+        key_words_stat[word] = [0, 0, 0] # [tp, totall, fp]
 
     gt, fn, fp, tn, tp = 0, 0, 0, 0, 0
     eps = '***'
@@ -47,18 +56,55 @@ def compute_fscore(recognition_results_manifest, key_words_list):
         hyp = item['pred_text'].split()
         ali = align(ref, hyp, eps)
         recognized_words = []
-        for pair in ali:
-            if pair[0] in key_words_set:
-                gt += 1
-                key_words_stat[pair[0]][-1] += 1
-                if pair[0] == pair[1]:
-                    tp += 1
-                    recognized_words.append(pair[0])
-                    key_words_stat[pair[0]][0] += 1
-            if pair[1] in key_words_set:
-                if pair[0] != pair[1]:
+        for idx, pair in enumerate(ali):
+            phrase_match = True
+            if pair[0] in key_words_dict:
+                if not key_words_dict[pair[0]]:
+                    gt += 1
+                    key_words_stat[pair[0]][1] += 1
+                    if pair[0] == pair[1]:
+                        tp += 1
+                        recognized_words.append(pair[0])
+                        key_words_stat[pair[0]][0] += 1
+                else:
+                    phrase_ref = pair[0]
+                    phrase_hyp = pair[1]
+                    i = idx
+                    for next_word in key_words_dict[pair[0]]:
+                        if (i+1) >= len(ali) or next_word != ali[i+1][0]:
+                            phrase_match = False
+                            break
+                        phrase_ref += f" {next_word}"
+                        phrase_hyp += f" {ali[i+1][1]}"
+                        i += 1
+                    if phrase_match:
+                        gt += 1
+                        key_words_stat[phrase_ref][1] += 1
+                        if phrase_ref == phrase_hyp:
+                            tp += 1
+                            recognized_words.append(phrase_ref)
+                            key_words_stat[phrase_ref][0] += 1
+                    
+                    
+            # processing of false positive recognition: 
+            if pair[1] in key_words_dict and pair[0] != pair[1]:
+                if not key_words_dict[pair[1]]:
                     fp += 1
-        if recognized_words:
+                    key_words_stat[pair[1]][2] += 1
+                else:
+                    i = idx
+                    phrase_hyp = pair[1]
+                    for next_word in key_words_dict[pair[1]]:
+                        if (i+1) >= len(ali) or next_word != ali[i+1][1]:
+                            phrase_match = False
+                            break
+                        phrase_hyp += f" {next_word}"
+                        i += 1
+                    if phrase_match:
+                        fp += 1
+                        key_words_stat[phrase_hyp][2] += 1
+                    
+        if recognized_words and print_ali:
             print_alignment(audio_filepath, ali, recognized_words)
 
     precision = tp / (tp + fp + 1e-8)
@@ -66,10 +112,13 @@ def compute_fscore(recognition_results_manifest, key_words_list):
     fscore = 2*(precision*recall)/(precision+recall + 1e-8)
 
     print("\n"+"***"*15)
-    print("Per words statistic (word: correct/totall):\n")
+    print("Per words statistic (word: correct/totall (false positive)):\n")
     max_len = max([len(x) for x in key_words_stat])
-    for word in key_words_stat:
-        print(f"{word:{max_len}}: {key_words_stat[word][0]}/{key_words_stat[word][-1]}")
+    for word in key_words_list:
+        false_positive = ""
+        if key_words_stat[word][2] > 0:
+            false_positive = key_words_stat[word][2]
+        print(f"{word:{max_len}}: {key_words_stat[word][0]}/{key_words_stat[word][1]} {false_positive}")
     print("***"*15)
 
     print(" ")
@@ -91,7 +140,7 @@ def main():
     )
 
     args = parser.parse_args()
-    key_words_list = [x for x in args.key_words_list.split(' ')]
+    key_words_list = [x for x in args.key_words_list.split('_')]
     compute_fscore(args.input_manifest, key_words_list)
 
 
