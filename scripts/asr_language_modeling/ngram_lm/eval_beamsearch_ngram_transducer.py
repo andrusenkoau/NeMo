@@ -121,7 +121,9 @@ class EvalBeamSearchNGramConfig:
 
     # Context Biasing:
     context_score: float = 1.0  # per token weight for context biasing words
-    context_str: Optional[str] = None  # string with context biasing words (words splitted by space) 
+    context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
+
+    softmax_temperature: float = 1.00
 
 
     decoding: rnnt_beam_decoding.BeamRNNTInferConfig = rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=128)
@@ -218,6 +220,7 @@ def decoding_step(
 
                 if candidate_idx == 0:
                     # first candidate
+                    wer_dist_tosave = wer_dist
                     wer_dist_first += wer_dist
                     cer_dist_first += cer_dist
 
@@ -236,7 +239,7 @@ def decoding_step(
                         'duration': durations[sample_idx + beams_idx],
                         'text': target_transcripts[sample_idx + beams_idx],
                         'pred_text': beams[0].text,
-                        'wer': f"{wer_dist_first/len(target_split_w):.3f}"}
+                        'wer': f"{wer_dist_tosave/len(target_split_w):.3f}"}
                 out_manifest.write(json.dumps(item) + "\n")
         
         sample_idx += len(probs_batch)
@@ -278,6 +281,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
     if cfg.nemo_model_file.endswith('.nemo'):
         asr_model = nemo_asr.models.ASRModel.restore_from(cfg.nemo_model_file, map_location=torch.device(cfg.device))
+        # asr_model.change_attention_model(self_attention_model="rel_pos_local_attn", att_context_size=[128, 128])
     else:
         logging.warning(
             "nemo_model_file does not end with .nemo, therefore trying to load a pretrained model with this name."
@@ -380,7 +384,8 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
     if cfg.decoding_strategy == "greedy_batch":
         asr_model = asr_model.to('cpu')
-        preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
+        preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")
+        preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
         candidate_wer, candidate_cer = decoding_step(
             asr_model,
             cfg,
@@ -391,6 +396,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
             beam_batch_size=cfg.beam_batch_size,
             progress_bar=True,
             preds_output_file=preds_output_file,
+            preds_output_manifest=preds_output_manifest,
         )
         logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
 
@@ -422,18 +428,43 @@ def main(cfg: EvalBeamSearchNGramConfig):
         logging.info(f"==============================================================================================")
 
         # context biasing:
-        if cfg.context_str:
+        if cfg.context_file:
             context_transcripts = []
-            for word in cfg.context_str.split():
+            for line in open(cfg.context_file).readlines():
+                word = line.strip().lower()
                 context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+            # for word in cfg.context_str.split('_'):
+            #     context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
             cfg.decoding.cb_score = cfg.context_score
             cfg.decoding.cb_words = context_transcripts
-            # logging.warning(context_transcripts)
-            # context_graph = ContextGraph(cfg.context_score)
-            # context_graph.build(context_transcripts)
-            # cfg.decoding.context_graph = context_graph
-            # logging.warning(f"|||||||||||||||||||||| context_graph.root.next is: {context_graph.root.next}")
+
+            cfg.decoding.softmax_temperature = cfg.softmax_temperature
+
+            # logging.warning(f"{context_transcripts}")
             # raise Exception
+
+            # # with bpe dropout:
+            # kwl_set = set()
+            # context_transcripts = []
+
+            # sow_symbol = asr_model.tokenizer.tokens_to_ids(['▁'])[0]
+
+            # for line in open(cfg.context_file).readlines():
+            #     word = line.strip().lower()
+            #     tokenization = asr_model.tokenizer.tokenizer.encode(word) # , out_type=str
+            #     kwl_set.add(str(tokenization))
+            #     context_transcripts.append(tokenization)
+                
+            #     for _ in range(50):
+            #         tokenization = asr_model.tokenizer.tokenizer.encode(word, enable_sampling=True, alpha=0.1, nbest_size=-1)
+            #         if tokenization[0] != sow_symbol:
+            #             tokenization_str = str(tokenization)
+            #             if tokenization_str not in kwl_set:
+            #                 kwl_set.add(tokenization_str)
+            #                 context_transcripts.append(tokenization)
+
+            # cfg.decoding.cb_score = cfg.context_score
+            # cfg.decoding.cb_words = context_transcripts
 
         
         
