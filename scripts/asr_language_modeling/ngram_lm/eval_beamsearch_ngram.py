@@ -118,7 +118,7 @@ class EvalBeamSearchNGramConfig:
     decoding: ctc_beam_decoding.BeamCTCInferConfig = ctc_beam_decoding.BeamCTCInferConfig(beam_size=128)
     
     hotword_weight: float = 10.0  # per token weight for context biasing words
-    hotwords_str: Optional[str] = None  # string with context biasing words (words splitted by space) 
+    hotwords_file: Optional[str] = None  # string with context biasing words (words splitted by space) 
 
     text_processing: Optional[TextProcessingConfig] = TextProcessingConfig(
         punctuation_marks = ".,?",
@@ -211,6 +211,7 @@ def beam_search_eval(
             words_count += len(target_split_w)
             chars_count += len(target_split_c)
             wer_dist_min = cer_dist_min = 10000
+            audio_id = os.path.basename(audio_file_paths[sample_idx + beams_idx])
             for candidate_idx, candidate in enumerate(beams):  # type: (int, ctc_beam_decoding.rnnt_utils.Hypothesis)
                 pred_text = candidate.text
                 if cfg.text_processing.do_lowercase:
@@ -229,12 +230,13 @@ def beam_search_eval(
 
                 if candidate_idx == 0:
                     # first candidate
+                    wer_dist_tosave = wer_dist
                     wer_dist_first += wer_dist
                     cer_dist_first += cer_dist
 
                 score = candidate.score
                 if preds_output_file:
-                    out_file.write('{}\t{}\n'.format(pred_text, score))
+                    out_file.write('{}\t{}\t{}\n'.format(audio_id, pred_text, score))
 
             wer_dist_best += wer_dist_min
             cer_dist_best += cer_dist_min
@@ -244,7 +246,7 @@ def beam_search_eval(
                         'duration': durations[sample_idx + beams_idx],
                         'text': target_transcripts[sample_idx + beams_idx],
                         'pred_text': beams[0].text,
-                        'wer': f"{wer_dist_first/len(target_split_w):.4f}"}
+                        'wer': f"{wer_dist_tosave/len(target_split_w):.4f}"}
                 out_manifest.write(json.dumps(item) + "\n")
 
         sample_idx += len(probs_batch)
@@ -422,9 +424,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
         logging.info(f"==============================================================================================")
 
         # context biasing:
-        if cfg.hotwords_str:
+        if cfg.hotwords_file:
             hotwords_list = []
-            for word in cfg.hotwords_str.split():
+            for line in open(cfg.hotwords_file).readlines():
+                word = line.strip().lower()
                 hotwords_list.append(word)
             cfg.decoding.pyctcdecode_cfg.hotwords = hotwords_list
             cfg.decoding.pyctcdecode_cfg.hotword_weight = cfg.hotword_weight
