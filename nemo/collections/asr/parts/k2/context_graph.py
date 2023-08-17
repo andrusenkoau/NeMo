@@ -162,7 +162,7 @@ class ContextGraph:
                     # new_token_score = self.context_score * (node.current_word_len+1)
                     
                     # if node == self.root:
-                    #     new_token_score = self.context_score * 3
+                    #     new_token_score = self.context_score * 1
                     # else:
                     #     new_token_score = self.context_score 
                     node.next[token] = ContextState(
@@ -180,7 +180,7 @@ class ContextGraph:
         self._fill_fail_output()
 
     def forward_one_step(
-        self, state: ContextState, token: int
+        self, state: ContextState, token: int, begin_token: bool
     ) -> Tuple[float, ContextState]:
         """Search the graph with given state and token.
 
@@ -216,6 +216,8 @@ class ContextGraph:
 
             # The score of the fail path
             score = node.node_score - state.local_node_score
+            if state.is_end and not begin_token:
+                score -= state.node_score
         assert node is not None
         matched_score = 0
         output = node.output
