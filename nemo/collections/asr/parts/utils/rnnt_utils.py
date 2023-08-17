@@ -220,20 +220,38 @@ def select_k_expansions(
 
         expansions = sorted(filter(lambda x: (k_best_exp - gamma) <= x[1], hyp_i), key=lambda x: x[1],)
 
-        # context biasing:
-        # if k_best_exp < np.log(0.95):
-        if not (k_best_exp_idx == blank_id and k_best_exp >= np.log(0.95)):
-            if hyp.context_state.id != 0:
-                expansions_tokens = set()
-                for pair in expansions:
-                    expansions_tokens.add(pair[0])
+        # # context biasing:
+        if hyp.context_state:
+            if not (k_best_exp_idx == blank_id and k_best_exp >= np.log(0.95)):
+                if hyp.context_state.id != 0:
+                    expansions_tokens = set()
+                    for pair in expansions:
+                        expansions_tokens.add(pair[0])
 
-                next_tokens = list(hyp.context_state.next.keys())
-                for token_id in next_tokens:
-                    if token_id not in expansions_tokens:
-                        token_score = float(ytm[i, 0, 0, token_id])
-                        if token_score >= k_best_exp - gamma*2:
-                            expansions.append((token_id, hyp.score + token_score))
+                    next_tokens = list(hyp.context_state.next.keys())
+                    for token_id in next_tokens:
+                        if token_id not in expansions_tokens:
+                            token_score = float(ytm[i, 0, 0, token_id])
+                            if token_score >= k_best_exp - gamma - hyp.context_state.next[token_id].token_score:
+                                expansions.append((token_id, hyp.score + token_score))
+
+
+        # # if k_best_exp < np.log(0.95):
+        # if not (k_best_exp_idx == blank_id and k_best_exp >= np.log(0.95)):
+        # # if not k_best_exp >= np.log(0.95):    
+        #     if hyp.context_state.id != 0:
+        #         expansions_tokens = set()
+        #         for pair in expansions:
+        #             expansions_tokens.add(pair[0])
+
+        #         next_tokens = list(hyp.context_state.next.keys())
+        #         for token_id in next_tokens:
+        #             if token_id not in expansions_tokens:
+        #                 token_score = float(ytm[i, 0, 0, token_id])
+        #                 # token_score = max(k_best_exp - 5, predicted_score)
+        #                 if token_score >= k_best_exp - gamma*2:
+        #                     expansions.append((token_id, hyp.score + token_score))
+        #                 # expansions.append((token_id, hyp.score + token_score))
 
         if len(expansions) > 0:
             k_expansions.append(expansions)
