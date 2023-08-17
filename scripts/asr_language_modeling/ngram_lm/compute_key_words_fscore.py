@@ -47,7 +47,7 @@ def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True)
     for word in key_words_list:
         key_words_stat[word] = [0, 0, 0] # [tp, totall, fp]
 
-    gt, fn, fp, tn, tp = 0, 0, 0, 0, 0
+    gt, fp, tp = 0, 0, 0
     eps = '***'
 
     for item in data:
@@ -113,12 +113,13 @@ def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True)
 
     print("\n"+"***"*15)
     print("Per words statistic (word: correct/totall (false positive)):\n")
-    max_len = max([len(x) for x in key_words_stat])
+    max_len = max([len(x) for x in key_words_stat if key_words_stat[x][1] > 0 or key_words_stat[x][2] > 0])
     for word in key_words_list:
-        false_positive = ""
-        if key_words_stat[word][2] > 0:
-            false_positive = key_words_stat[word][2]
-        print(f"{word:{max_len}}: {key_words_stat[word][0]}/{key_words_stat[word][1]} {false_positive}")
+        if key_words_stat[word][1] > 0 or key_words_stat[word][2] > 0:
+            false_positive = ""
+            if key_words_stat[word][2] > 0:
+                false_positive = key_words_stat[word][2]
+            print(f"{word:>{max_len}}: {key_words_stat[word][0]:3}/{key_words_stat[word][1]:<3} {false_positive:>3}")
     print("***"*15)
 
     print(" ")
@@ -136,11 +137,14 @@ def main():
         "--input_manifest", type=str, required=True, help="manifest with recognition results",
     )
     parser.add_argument(
-        "--key_words_list", type=str, required=True, help="list of key words for fscore calculation"
+        "--key_words_file", type=str, required=True, help="file of key words for fscore calculation"
     )
 
     args = parser.parse_args()
-    key_words_list = [x for x in args.key_words_list.split('_')]
+    #key_words_list = [x for x in args.key_words_list.split('_')]
+    key_words_list = []
+    for line in open(args.key_words_file).readlines():
+        key_words_list.append(line.strip().lower())
     compute_fscore(args.input_manifest, key_words_list)
 
 
