@@ -46,6 +46,7 @@ from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
 from nemo.collections.asr.parts.k2.context_graph import ContextGraph
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 
 try:
     import kenlm
@@ -240,10 +241,12 @@ class BeamRNNTInfer(Typing):
         hat_ilm_weight: float = 0.0,
         cb_score: Optional[float] = 1.0,
         cb_words: Optional[List] = None,
+        tokenizer: TokenizerSpec = None,
     ):
         self.decoder = decoder_model
         self.joint = joint_model
 
+        self.tokenizer = tokenizer
         self.blank = decoder_model.blank_idx
         self.vocab_size = decoder_model.vocab_size
         self.search_type = search_type
@@ -599,6 +602,7 @@ class BeamRNNTInfer(Typing):
                 # get next token
                 ytu = torch.log_softmax(self.joint.joint(hi, y) / self.softmax_temperature, dim=-1)  # [1, 1, 1, V + 1]
                 ytu = ytu[0, 0, 0, :]  # [V + 1]
+                ytu_save = ytu
 
                 # preserve alignments
                 if self.preserve_alignments:
@@ -612,6 +616,13 @@ class BeamRNNTInfer(Typing):
                     torch.cat((top_k[0], ytu[self.blank].unsqueeze(0))),
                     torch.cat((top_k[1] + index_incr, blank_tensor)),
                 )
+                
+                # ## debug:
+                # # logging.warning(f"||||[DEBUG]||||: ytu is: {ytu[1][0]}")
+                # # raise Exception
+                # if ytu[1][0] == 11:
+                #     logging.warning(f"||||[DEBUG]||||: logprob of 11 is: {ytu[0][0]}")
+                #     logging.warning(f"||||[DEBUG]||||: logprob of 286 is: {ytu_save[286]}")
 
                 # for each possible step
                 for logp, k in zip(*ytu):
@@ -639,7 +650,11 @@ class BeamRNNTInfer(Typing):
                         new_hyp.timestep.append(i)
 
                         if self.context_graph:
-                            context_score, new_context_state = self.context_graph.forward_one_step(new_hyp.context_state, int(k))
+                            token = self.tokenizer.ids_to_tokens([int(k)])[0]
+                            begin_token = False
+                            if token.startswith("▁"):
+                                begin_token = True
+                            context_score, new_context_state = self.context_graph.forward_one_step(new_hyp.context_state, int(k), begin_token)
                             new_hyp.score += context_score
                             new_hyp.context_state = new_context_state
 
@@ -1266,7 +1281,11 @@ class BeamRNNTInfer(Typing):
 
                                 # applay context biasing
                                 if self.context_graph:
-                                    context_score, new_context_state = self.context_graph.forward_one_step(hyp.context_state, int(k))
+                                    token = self.tokenizer.ids_to_tokens([int(k)])[0]
+                                    begin_token = False
+                                    if token.startswith("▁") or token == "s" or token == "'s":
+                                        begin_token = True
+                                    context_score, new_context_state = self.context_graph.forward_one_step(hyp.context_state, int(k), begin_token)
                                     new_hyp.score += context_score
                                     new_hyp.context_state = new_context_state
                                 
