@@ -206,7 +206,7 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
         self.tokenizer = tokenizer
 
         super(RNNTBPEDecoding, self).__init__(
-            decoding_cfg=decoding_cfg, decoder=decoder, joint=joint, blank_id=blank_id
+            decoding_cfg=decoding_cfg, decoder=decoder, joint=joint, blank_id=blank_id, tokenizer=tokenizer
         )
 
         if isinstance(self.decoding, rnnt_beam_decoding.BeamRNNTInfer):
