@@ -33,7 +33,7 @@ from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.timer import Interval, Timer
 from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger, WandbLogger
-from pytorch_lightning.loops import _TrainingEpochLoop
+# from pytorch_lightning.loops import _TrainingEpochLoop
 from pytorch_lightning.strategies.ddp import DDPStrategy
 
 from nemo.collections.common.callbacks import EMA
@@ -951,17 +951,17 @@ def configure_no_restart_validation_training_loop(trainer: pytorch_lightning.Tra
     trainer.fit_loop.epoch_loop = loop
 
 
-class SkipResumeTrainingValidationLoop(_TrainingEpochLoop):
-    """
-    Extend the PTL Epoch loop to skip validating when resuming.
-    This happens when resuming a checkpoint that has already run validation, but loading restores
-    the training state before validation has run.
-    """
+# class SkipResumeTrainingValidationLoop(_TrainingEpochLoop):
+#     """
+#     Extend the PTL Epoch loop to skip validating when resuming.
+#     This happens when resuming a checkpoint that has already run validation, but loading restores
+#     the training state before validation has run.
+#     """
 
-    def _should_check_val_fx(self) -> bool:
-        if self.restarting and self.global_step % self.trainer.val_check_batch == 0:
-            return False
-        return super()._should_check_val_fx()
+#     def _should_check_val_fx(self) -> bool:
+#         if self.restarting and self.global_step % self.trainer.val_check_batch == 0:
+#             return False
+#         return super()._should_check_val_fx()
 
 
 def clean_exp_ckpt(exp_log_dir: Union[str, Path], remove_ckpt: bool = True, remove_nemo: bool = False):
