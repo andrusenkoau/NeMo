@@ -101,6 +101,9 @@ class EvalBeamSearchNGramConfig:
     use_amp: bool = False  # Whether to use AMP if available to calculate log probabilities
     num_workers: int = 1  # Number of workers for DataLoader
 
+    # for hybrid model
+    decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
+
     # The decoding scheme to be used for evaluation
     decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes"]
 
