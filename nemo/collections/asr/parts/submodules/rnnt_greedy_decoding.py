@@ -559,7 +559,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         # Depending on availability of `blank_as_pad` support
         # switch between more efficient batch decoding technique
         if self.decoder.blank_as_pad:
-            self._greedy_decode = self._greedy_decode_blank_as_pad
+            self._greedy_decode = self._greedy_decode_blank_as_pad_fast
         else:
             self._greedy_decode = self._greedy_decode_masked
 
@@ -811,6 +811,102 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
             hypotheses[batch_idx].dec_state = self.decoder.batch_select_state(hidden, batch_idx)
 
         return hypotheses
+
+
+    def _greedy_decode_blank_as_pad_fast(
+        self,
+        x: torch.Tensor,
+        out_len: torch.Tensor,
+        device: torch.device,
+        partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None,
+    ):
+        """Batched decoding, decoding only `active` hypotheses"""
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not supported")
+        if self.preserve_frame_confidence:
+            raise NotImplementedError("`preserve_frame_confidence` support is not supported")
+        if self.preserve_alignments:
+            raise NotImplementedError("preserve_alignments` support is not supported")
+
+        with torch.inference_mode():
+            # x: [B, T, D]
+            # out_len: [B]
+            # device: torch.device
+
+            # Initialize list of Hypothesis
+            batch_size, time, emb_size = x.shape
+            hypotheses = [
+                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batch_size)
+            ]
+
+            # Initialize Hidden state matrix (shared by entire batch)
+            hidden = None
+
+            time_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+            last_labels = torch.full([batch_size, 1], fill_value=self._blank_index, dtype=torch.long, device=device)
+            is_start = True
+            is_active = torch.full([batch_size], fill_value=True, dtype=torch.bool, device=device)
+            indices = torch.arange(batch_size, dtype=torch.long, device=device)
+            active_indices = indices
+            while active_indices.shape[0] > 0:
+                embeddings_selected = x[active_indices, time_indices[is_active]].unsqueeze(1)
+                current_batch_size = active_indices.shape[0]
+                if is_start:
+                    g, current_hidden = self._pred_step(self._SOS, hidden, batch_size=current_batch_size)
+                    is_start = False
+                else:
+                    g, current_hidden = self._pred_step(last_labels, hidden, batch_size=current_batch_size)
+                logp = (
+                    self._joint_step(
+                        embeddings_selected, g, log_normalize=True if self.preserve_frame_confidence else None
+                    )
+                    .squeeze(1)
+                    .squeeze(1)
+                )
+                # Get index k, of max prob for batch
+                scores, labels = logp.max(1)
+                del g
+
+                for current_batch_i, source_batch_i in enumerate(active_indices):
+                    label = labels[current_batch_i].item()
+                    if label != self._blank_index:
+                        hypotheses[source_batch_i].y_sequence.append(label)
+                        hypotheses[source_batch_i].timestep.append(time_indices[source_batch_i].item())
+                        hypotheses[source_batch_i].score += float(scores[current_batch_i].item())
+
+                is_active_prev = is_active
+                blank_mask = labels == self._blank_index
+                time_indices[is_active_prev] += blank_mask  # .long()
+                is_active = time_indices < out_len
+                local_mask = is_active[is_active_prev]
+                if hidden is None:
+                    if isinstance(current_hidden, tuple):
+                        hidden = (torch.zeros_like(current_hidden[0]), torch.zeros_like(current_hidden[1]))
+                    else:
+                        hidden = torch.zeros_like(current_hidden)
+                if isinstance(hidden, tuple):
+                    hidden0 = torch.where(blank_mask[None, :, None], hidden[0], current_hidden[0])
+                    hidden1 = torch.where(blank_mask[None, :, None], hidden[1], current_hidden[1])
+                    hidden = (hidden0.contiguous(), hidden1.contiguous())
+                    # hidden = (hidden0, hidden1)
+                else:
+                    hidden = torch.where(blank_mask[None, :, None], hidden, current_hidden)
+                labels = labels.unsqueeze(-1)
+                labels_masked = labels[local_mask]
+                last_labels = torch.where(labels_masked == self._blank_index, last_labels[local_mask], labels_masked)
+                active_indices = indices[is_active]
+                if active_indices.shape[0] < batch_size:
+                    if isinstance(hidden, tuple):
+                        hidden = hidden[0][:, local_mask].contiguous(), hidden[1][:, local_mask].contiguous()
+                    else:
+                        hidden = hidden[:, local_mask]
+        # Preserve states
+        # for batch_idx in range(batch_size):
+        #     hypotheses[batch_idx].dec_state = self.decoder.batch_select_state(hidden, batch_idx)
+
+        return hypotheses
+
 
     def _greedy_decode_masked(
         self,
