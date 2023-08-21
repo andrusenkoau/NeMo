@@ -105,7 +105,7 @@ class EvalBeamSearchNGramConfig:
     decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
 
     # The decoding scheme to be used for evaluation
-    decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes"]
+    decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes", "maes_batch"]
 
     # Beam Search hyperparameters
     beam_width: List[int] = field(default_factory=lambda: [8])  # The width or list of the widths for the beam search decoding
@@ -242,7 +242,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
     if is_dataclass(cfg):
         cfg = OmegaConf.structured(cfg)  # type: EvalBeamSearchNGramConfig
 
-    valid_decoding_strategis = ["greedy_batch", "beam", "tsd", "alsd", "maes"]
+    valid_decoding_strategis = ["greedy_batch", "beam", "tsd", "alsd", "maes", "maes_batch"]
     if cfg.decoding_strategy not in valid_decoding_strategis:
         raise ValueError(
             f"Given decoding_strategy={cfg.decoding_strategy} is invalid. Available options are :\n"
@@ -271,7 +271,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
     if cfg.hat_subtract_ilm:
         assert lm_path, "kenlm must be set for hat internal lm subtraction"
 
-    if cfg.decoding_strategy != "maes":
+    if not cfg.decoding_strategy.startswith("maes"):
         cfg.maes_prefix_alpha, cfg.maes_expansion_gamma, cfg.hat_ilm_weight = [0], [0], [0]
 
     target_transcripts = []
@@ -364,7 +364,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
     asr_model = asr_model.to('cpu')
 
     # 'greedy_batch' decoding_strategy would skip the beam search decoding
-    if cfg.decoding_strategy in ["beam", "tsd", "alsd", "maes"]:
+    if cfg.decoding_strategy in ["beam", "tsd", "alsd", "maes", "maes_batch"]:
         if cfg.beam_width is None or cfg.beam_alpha is None:
             raise ValueError("beam_width and beam_alpha are needed to perform beam search decoding.")
         params = {
@@ -393,7 +393,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         for hp in hp_grid:
             if cfg.preds_output_folder:
                 results_file = f"preds_out_{cfg.decoding_strategy}_bw{hp['beam_width']}"
-                if cfg.decoding_strategy == "maes":
+                if cfg.decoding_strategy.startswith("maes"):
                     results_file = f"{results_file}_ma{hp['maes_prefix_alpha']}_mg{hp['maes_expansion_gamma']}"
                     if cfg.kenlm_model_file:
                         results_file = f"{results_file}_ba{hp['beam_alpha']}"

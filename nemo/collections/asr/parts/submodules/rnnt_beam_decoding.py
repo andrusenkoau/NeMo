@@ -267,6 +267,8 @@ class BeamRNNTInfer(Typing):
             # self.search_algorithm = self.nsc_beam_search
         elif search_type == "maes":
             self.search_algorithm = self.modified_adaptive_expansion_search
+        elif search_type == "maes_batch":
+            self.search_algorithm = self.modified_adaptive_expansion_search_batch
         else:
             raise NotImplementedError(
                 f"The search type ({search_type}) supplied is not supported!\n"
@@ -303,10 +305,10 @@ class BeamRNNTInfer(Typing):
                 f"should be smaller or equal to vocabulary size ({self.vocab_size})."
             )
 
-        if search_type == 'maes':
+        if search_type in ['maes', 'maes_batch']:
             self.max_candidates += maes_expansion_beta
 
-        if self.search_type == 'maes' and self.maes_num_steps < 2:
+        if search_type in ['maes', 'maes_batch'] and self.maes_num_steps < 2:
             raise ValueError("`maes_num_steps` must be greater than 1.")
 
         if softmax_temperature != 1.0 and language_model is not None:
@@ -390,31 +392,38 @@ class BeamRNNTInfer(Typing):
                     _p = next(self.joint.parameters())
                     dtype = _p.dtype
 
-                    # Decode every sample in the batch independently.
-                    for batch_idx in idx_gen:
-                        inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
-                        logitlen = encoded_lengths[batch_idx]
-
-                        if inseq.dtype != dtype:
-                            inseq = inseq.to(dtype=dtype)
-
-                        # Extract partial hypothesis if exists
-                        partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
-
+                    if self.search_type == "maes_batch":
                         # Execute the specific search strategy
                         nbest_hyps = self.search_algorithm(
-                            inseq, logitlen, partial_hypotheses=partial_hypothesis
+                            encoder_output, encoded_lengths, partial_hypotheses=None
                         )  # sorted list of hypothesis
+                    else:
 
-                        # Prepare the list of hypotheses
-                        nbest_hyps = pack_hypotheses(nbest_hyps)
+                        # Decode every sample in the batch independently.
+                        for batch_idx in idx_gen:
+                            inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
+                            logitlen = encoded_lengths[batch_idx]
 
-                        # Pack the result
-                        if self.return_best_hypothesis:
-                            best_hypothesis = nbest_hyps[0]  # type: Hypothesis
-                        else:
-                            best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
-                        hypotheses.append(best_hypothesis)
+                            if inseq.dtype != dtype:
+                                inseq = inseq.to(dtype=dtype)
+
+                            # Extract partial hypothesis if exists
+                            partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
+
+                            # Execute the specific search strategy
+                            nbest_hyps = self.search_algorithm(
+                                inseq, logitlen, partial_hypotheses=partial_hypothesis
+                            )  # sorted list of hypothesis
+
+                            # Prepare the list of hypotheses
+                            nbest_hyps = pack_hypotheses(nbest_hyps)
+
+                            # Pack the result
+                            if self.return_best_hypothesis:
+                                best_hypothesis = nbest_hyps[0]  # type: Hypothesis
+                            else:
+                                best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
+                            hypotheses.append(best_hypothesis)
 
         self.decoder.train(decoder_training_state)
         self.joint.train(joint_training_state)
@@ -1367,6 +1376,318 @@ class BeamRNNTInfer(Typing):
 
         # Sort the hypothesis with best scores
         return self.sort_nbest(kept_hyps)
+
+
+    def modified_adaptive_expansion_search_batch(
+        self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
+    ) -> List[Hypothesis]:
+        """
+        Based on/modified from https://ieeexplore.ieee.org/document/9250505 with batched implementation
+
+        Args:
+            h: Encoded speech features (B, T_max, D_enc)
+
+        Returns:
+            nbest_hyps: (B, N-best decoding results)
+        """
+        
+        # logging.warning("------------------------ I am here!!! ------------------------")
+        # logging.warning(f"h.shape: {h.shape}")
+        # logging.warning(f"encoded_lengths.shape: {encoded_lengths.shape}")
+        # raise KeyError
+        
+        batch_size = h.shape[0]
+
+        # prepare the batched beam states
+        beam = min(self.beam_size, self.vocab_size)
+        beam_state = self.decoder.initialize_state(
+            torch.zeros(beam, device=h.device, dtype=h.dtype)
+        )  # [L, B, H], [L, B, H] for LSTMS
+
+        # Initialize first hypothesis for the beam (blank)
+        init_tokens = [
+            Hypothesis(
+                y_sequence=[self.blank],
+                score=0.0,
+                dec_state=self.decoder.batch_select_state(beam_state, 0),
+                timestep=[-1],
+                length=0,
+            )
+        ]
+
+        logging.warning("------------------------ I am here!!! ------------------------")
+        logging.warning(f"beam_state[0].shape: {beam_state[0].shape}")
+        logging.warning(f"self.decoder.batch_select_state(beam_state, 0)[0].shape: {self.decoder.batch_select_state(beam_state, 0)[0][0].shape}")
+        raise KeyError
+        
+        cache = {}
+
+        # Initialize alignment buffer
+        if self.preserve_alignments:
+            for hyp in init_tokens:
+                hyp.alignments = [[]]
+
+        # Decode a batch of beam states and scores
+        beam_dec_out, beam_state, beam_lm_tokens = self.decoder.batch_score_hypothesis(init_tokens, cache, beam_state)
+        state = self.decoder.batch_select_state(beam_state, 0)
+
+        # Setup ngram LM:
+        if self.ngram_lm:
+            init_lm_state = kenlm.State()
+            self.ngram_lm.BeginSentenceWrite(init_lm_state)
+
+        # TODO: Setup LM
+        if self.language_model is not None:
+            # beam_lm_states, beam_lm_scores = self.lm.buff_predict(
+            #     None, beam_lm_tokens, 1
+            # )
+            # lm_state = select_lm_state(
+            #     beam_lm_states, 0, self.lm_layers, self.is_wordlm
+            # )
+            # lm_scores = beam_lm_scores[0]
+            raise NotImplementedError()
+        else:
+            lm_state = None
+            lm_scores = None
+
+        # Initialize first hypothesis for the beam (blank) for kept hypotheses
+        kept_hyps = [
+            Hypothesis(
+                y_sequence=[self.blank],
+                score=0.0,
+                dec_state=state,
+                dec_out=[beam_dec_out[0]],
+                lm_state=lm_state,
+                lm_scores=lm_scores,
+                timestep=[-1],
+                length=0,
+            )
+        ]
+        if self.ngram_lm:
+            kept_hyps[0].ngram_lm_state = init_lm_state
+
+        # Initialize alignment buffer
+        if self.preserve_alignments:
+            for hyp in kept_hyps:
+                hyp.alignments = [[]]
+
+        for t in range(encoded_lengths):
+            enc_out_t = h[t : t + 1].unsqueeze(0)  # [1, 1, D]
+
+            # Perform prefix search to obtain hypothesis
+            hyps = self.prefix_search(
+                sorted(kept_hyps, key=lambda x: len(x.y_sequence), reverse=True),
+                enc_out_t,
+                prefix_alpha=self.maes_prefix_alpha,
+            )  # type: List[Hypothesis]
+            kept_hyps = []
+
+            # Prepare output tensor
+            beam_enc_out = enc_out_t
+
+            # List that contains the blank token emisions
+            list_b = []
+            duplication_check = [hyp.y_sequence for hyp in hyps]
+
+            # Repeat for number of mAES steps
+            for n in range(self.maes_num_steps):
+                # Pack the decoder logits for all current hypothesis
+                beam_dec_out = torch.stack([h.dec_out[-1] for h in hyps])  # [H, 1, D]
+
+                # Extract the log probabilities
+                ytm, ilm_ytm = self.resolve_joint_output(beam_enc_out, beam_dec_out)
+                beam_logp, beam_idx = ytm.topk(self.max_candidates, dim=-1)
+
+                beam_logp = beam_logp[:, 0, 0, :]  # [B, V + 1]
+                beam_idx = beam_idx[:, 0, 0, :]  # [B, max_candidates]
+
+                # Compute k expansions for all the current hypotheses
+                k_expansions = select_k_expansions(
+                    hyps, beam_idx, beam_logp, self.maes_expansion_gamma, self.maes_expansion_beta
+                )
+
+                # List that contains the hypothesis after prefix expansion
+                list_exp = []
+                for i, hyp in enumerate(hyps):  # For all hypothesis
+                    for k, new_score in k_expansions[i]:  # for all expansion within these hypothesis
+                        new_hyp = Hypothesis(
+                            y_sequence=hyp.y_sequence[:],
+                            score=new_score,
+                            dec_out=hyp.dec_out[:],
+                            dec_state=hyp.dec_state,
+                            lm_state=hyp.lm_state,
+                            lm_scores=hyp.lm_scores,
+                            timestep=hyp.timestep[:],
+                            length=t,
+                        )
+                        if self.ngram_lm:
+                            new_hyp.ngram_lm_state = hyp.ngram_lm_state
+
+                        # If the expansion was for blank
+                        if k == self.blank:
+                            list_b.append(new_hyp)
+                        else:
+                            # If the expansion was a token
+                            # new_hyp.y_sequence.append(int(k))
+                            if (new_hyp.y_sequence + [int(k)]) not in duplication_check:
+                                new_hyp.y_sequence.append(int(k))
+                                new_hyp.timestep.append(t)
+
+                                # Setup ngram LM:
+                                if self.ngram_lm:
+                                    lm_score, new_hyp.ngram_lm_state = self.compute_ngram_score(
+                                        hyp.ngram_lm_state, int(k)
+                                    )
+                                    if self.hat_subtract_ilm:
+                                        new_hyp.score += self.ngram_lm_alpha * lm_score - float(
+                                            self.hat_ilm_weight * ilm_ytm[i, 0, 0, k]
+                                        )
+                                    else:
+                                        new_hyp.score += self.ngram_lm_alpha * lm_score
+
+                                # TODO: Setup LM
+                                if self.language_model is not None:
+                                    # new_hyp.score += self.lm_weight * float(
+                                    #     hyp.lm_scores[k]
+                                    # )
+                                    pass
+
+                                list_exp.append(new_hyp)
+
+                        # Preserve alignments
+                        if self.preserve_alignments:
+                            new_hyp.alignments = copy.deepcopy(hyp.alignments)
+
+                            if k == self.blank:
+                                new_hyp.alignments[-1].append(
+                                    (beam_logp[i].clone().cpu(), torch.tensor(self.blank, dtype=torch.int32)),
+                                )
+                            else:
+                                new_hyp.alignments[-1].append(
+                                    (
+                                        beam_logp[i].clone().cpu(),
+                                        torch.tensor(new_hyp.y_sequence[-1], dtype=torch.int32),
+                                    ),
+                                )
+
+                # If there were no token expansions in any of the hypotheses,
+                # Early exit
+                if not list_exp:
+                    kept_hyps = sorted(list_b, key=lambda x: x.score, reverse=True)[:beam]
+
+                    # Update aligments with next step
+                    if self.preserve_alignments:
+                        # convert Ti-th logits into a torch array
+                        for h_i in kept_hyps:
+                            # Check if the last token emitted at last timestep was a blank
+                            # If so, move to next timestep
+                            logp, label = h_i.alignments[-1][-1]  # The last alignment of this step
+                            if int(label) == self.blank:
+                                h_i.alignments.append([])  # blank buffer for next timestep
+
+                    # Early exit
+                    break
+
+                else:
+                    # Initialize the beam states for the hypotheses in the expannsion list
+                    beam_state = self.decoder.batch_initialize_states(
+                        beam_state,
+                        [hyp.dec_state for hyp in list_exp],
+                        # [hyp.y_sequence for hyp in list_exp],  # <look into when this is necessary>
+                    )
+
+                    # Decode a batch of beam states and scores
+                    beam_dec_out, beam_state, beam_lm_tokens = self.decoder.batch_score_hypothesis(
+                        list_exp,
+                        cache,
+                        beam_state,
+                        # self.language_model is not None,
+                    )
+
+                    # TODO: Setup LM
+                    if self.language_model is not None:
+                        # beam_lm_states = create_lm_batch_states(
+                        #     [hyp.lm_state for hyp in list_exp],
+                        #     self.lm_layers,
+                        #     self.is_wordlm,
+                        # )
+                        # beam_lm_states, beam_lm_scores = self.lm.buff_predict(
+                        #     beam_lm_states, beam_lm_tokens, len(list_exp)
+                        # )
+                        pass
+
+                    # If this isnt the last mAES step
+                    if n < (self.maes_num_steps - 1):
+                        # For all expanded hypothesis
+                        for i, hyp in enumerate(list_exp):
+                            # Preserve the decoder logits for the current beam
+                            hyp.dec_out.append(beam_dec_out[i])
+                            hyp.dec_state = self.decoder.batch_select_state(beam_state, i)
+
+                            # TODO: Setup LM
+                            if self.language_model is not None:
+                                # hyp.lm_state = select_lm_state(
+                                #     beam_lm_states, i, self.lm_layers, self.is_wordlm
+                                # )
+                                # hyp.lm_scores = beam_lm_scores[i]
+                                pass
+
+                        # Copy the expanded hypothesis
+                        hyps = list_exp[:]
+
+                        # Update aligments with next step
+                        if self.preserve_alignments:
+                            # convert Ti-th logits into a torch array
+                            for h_i in hyps:
+                                # Check if the last token emitted at last timestep was a blank
+                                # If so, move to next timestep
+                                logp, label = h_i.alignments[-1][-1]  # The last alignment of this step
+                                if int(label) == self.blank:
+                                    h_i.alignments.append([])  # blank buffer for next timestep
+
+                    else:
+                        # Extract the log probabilities
+                        beam_logp, _ = self.resolve_joint_output(beam_enc_out, beam_dec_out)
+                        beam_logp = beam_logp[:, 0, 0, :]
+
+                        # For all expansions, add the score for the blank label
+                        for i, hyp in enumerate(list_exp):
+                            hyp.score += float(beam_logp[i, self.blank])
+
+                            # Preserve the decoder's output and state
+                            hyp.dec_out.append(beam_dec_out[i])
+                            hyp.dec_state = self.decoder.batch_select_state(beam_state, i)
+
+                            # TODO: Setup LM
+                            if self.language_model is not None:
+                                # hyp.lm_state = select_lm_state(
+                                #     beam_lm_states, i, self.lm_layers, self.is_wordlm
+                                # )
+                                # hyp.lm_scores = beam_lm_scores[i]
+                                pass
+
+                        # Finally, update the kept hypothesis of sorted top Beam candidates
+                        kept_hyps = sorted(list_b + list_exp, key=lambda x: x.score, reverse=True)[:beam]
+
+                        # Update aligments with next step
+                        if self.preserve_alignments:
+                            # convert Ti-th logits into a torch array
+                            for h_i in kept_hyps:
+                                # Check if the last token emitted at last timestep was a blank
+                                # If so, move to next timestep
+                                logp, label = h_i.alignments[-1][-1]  # The last alignment of this step
+                                if int(label) == self.blank:
+                                    h_i.alignments.append([])  # blank buffer for next timestep
+
+        # Remove trailing empty list of alignments
+        if self.preserve_alignments:
+            for h in kept_hyps:
+                if len(h.alignments[-1]) == 0:
+                    del h.alignments[-1]
+
+        # Sort the hypothesis with best scores
+        return self.sort_nbest(kept_hyps)
+
 
     def recombine_hypotheses(self, hypotheses: List[Hypothesis]) -> List[Hypothesis]:
         """Recombine hypotheses with equivalent output sequence.

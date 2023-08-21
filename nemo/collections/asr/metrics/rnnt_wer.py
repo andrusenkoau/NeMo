@@ -229,7 +229,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                     "currently only greedy and greedy_batch inference is supported for multi-blank models"
                 )
 
-        possible_strategies = ['greedy', 'greedy_batch', 'beam', 'tsd', 'alsd', 'maes']
+        possible_strategies = ['greedy', 'greedy_batch', 'beam', 'tsd', 'alsd', 'maes', 'maes_batch']
         if self.cfg.strategy not in possible_strategies:
             raise ValueError(f"Decoding strategy must be one of {possible_strategies}")
 
@@ -238,7 +238,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             if self.cfg.strategy in ['greedy', 'greedy_batch']:
                 self.preserve_alignments = self.cfg.greedy.get('preserve_alignments', False)
 
-            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']:
+            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes', 'maes_batch']:
                 self.preserve_alignments = self.cfg.beam.get('preserve_alignments', False)
 
         # Update compute timestamps
@@ -246,7 +246,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             if self.cfg.strategy in ['greedy', 'greedy_batch']:
                 self.compute_timestamps = self.cfg.greedy.get('compute_timestamps', False)
 
-            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']:
+            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes', 'maes_batch']:
                 self.compute_timestamps = self.cfg.beam.get('compute_timestamps', False)
 
         # Test if alignments are being preserved for RNNT
@@ -259,7 +259,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         # Confidence estimation is not implemented for these strategies
         if (
             not self.preserve_frame_confidence
-            and self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']
+            and self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes', 'maes_batch']
             and self.cfg.beam.get('preserve_frame_confidence', False)
         ):
             raise NotImplementedError(f"Confidence calculation is not supported for strategy `{self.cfg.strategy}`")
@@ -412,6 +412,28 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', False),
                 hat_ilm_weight=self.cfg.beam.get('hat_ilm_weight', 0.0),
             )
+
+        elif self.cfg.strategy == 'maes_batch':
+
+            self.decoding = beam_decode.BeamRNNTInfer(
+                decoder_model=decoder,
+                joint_model=joint,
+                beam_size=self.cfg.beam.beam_size,
+                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
+                search_type='maes_batch',
+                score_norm=self.cfg.beam.get('score_norm', True),
+                maes_num_steps=self.cfg.beam.get('maes_num_steps', 2),
+                maes_prefix_alpha=self.cfg.beam.get('maes_prefix_alpha', 1),
+                maes_expansion_gamma=self.cfg.beam.get('maes_expansion_gamma', 2.3),
+                maes_expansion_beta=self.cfg.beam.get('maes_expansion_beta', 2.0),
+                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                preserve_alignments=self.preserve_alignments,
+                ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
+                ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
+                hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', False),
+                hat_ilm_weight=self.cfg.beam.get('hat_ilm_weight', 0.0),
+            )       
+
 
         else:
 
