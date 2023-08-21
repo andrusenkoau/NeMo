@@ -312,7 +312,7 @@ class BeamRNNTInfer(Typing):
         if search_type == 'maes':
             self.max_candidates += maes_expansion_beta
 
-        if self.search_type == 'maes' and self.maes_num_steps < 2:
+        if self.search_type == 'maes' and self.maes_num_steps < 1:
             raise ValueError("`maes_num_steps` must be greater than 1.")
 
         if softmax_temperature != 1.0 and language_model is not None:
@@ -1205,6 +1205,7 @@ class BeamRNNTInfer(Typing):
                 enc_out_t,
                 prefix_alpha=self.maes_prefix_alpha,
             )  # type: List[Hypothesis]
+            # hyps = kept_hyps
             kept_hyps = []
 
             # Prepare output tensor
