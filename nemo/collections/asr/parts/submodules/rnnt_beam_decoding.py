@@ -308,7 +308,7 @@ class BeamRNNTInfer(Typing):
         if search_type in ['maes', 'maes_batch']:
             self.max_candidates += maes_expansion_beta
 
-        if search_type in ['maes', 'maes_batch'] and self.maes_num_steps < 2:
+        if search_type in ['maes', 'maes_batch'] and self.maes_num_steps < 1:
             raise ValueError("`maes_num_steps` must be greater than 1.")
 
         if softmax_temperature != 1.0 and language_model is not None:
@@ -1493,6 +1493,7 @@ class BeamRNNTInfer(Typing):
                 )  # type: List[Hypothesis]
                 hypotheses_list.extend(hyps)
             hyps = hypotheses_list
+            # hyps = kept_hyps
 
             # logging.warning("------------------------ I am here!!! ------------------------")
             # logging.warning(f"len(hypotheses_list): {len(hypotheses_list)}")
@@ -1513,7 +1514,8 @@ class BeamRNNTInfer(Typing):
 
             # logging.warning("------------------------ I am here!!! ------------------------")
             # logging.warning(f"duplication_check_batch: {duplication_check_batch}")
-            # logging.warning(f"1024 in duplication_check_batch[0][0]: {1024 in duplication_check_batch[0][0]}")            
+            # logging.warning(f"duplication_check_batch[0]: {duplication_check_batch[0]}")
+            # logging.warning(f"duplication_check_batch[0][0]: {duplication_check_batch[0][0]}")                 
 
 
             # Repeat for number of mAES steps

@@ -105,7 +105,7 @@ class EvalBeamSearchNGramConfig:
     decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
 
     # The decoding scheme to be used for evaluation
-    decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes", "maes_batch"]
+    decoding_strategy: str = "greedy_batch" # ["greedy", "greedy_batch", "beam", "tsd", "alsd", "maes", "maes_batch"]
 
     # Beam Search hyperparameters
     beam_width: List[int] = field(default_factory=lambda: [8])  # The width or list of the widths for the beam search decoding
@@ -161,8 +161,8 @@ def decoding_step(
         out_file = open(preds_output_file, 'w', encoding='utf_8', newline='\n')
 
     if progress_bar:
-        if cfg.decoding_strategy == "greedy_batch":
-            description = "Greedy_batch decoding.."
+        if cfg.decoding_strategy in ["greedy", "greedy_batch"]:
+            description = f"{cfg.decoding_strategy} decoding.."
         else:
             description = f"{cfg.decoding_strategy} decoding with bw={cfg.decoding.beam_size}, ba={cfg.decoding.ngram_lm_alpha}, ma={cfg.decoding.maes_prefix_alpha}, mg={cfg.decoding.maes_expansion_gamma}, hat_ilmw={cfg.decoding.hat_ilm_weight}"
         it = tqdm(range(int(np.ceil(len(all_probs) / beam_batch_size))), desc=description, ncols=120)
@@ -182,7 +182,7 @@ def decoding_step(
             best_hyp_batch, beams_batch = model.decoding.rnnt_decoder_predictions_tensor(
                 packed_batch, probs_lens, return_hypotheses=True,
             )
-        if cfg.decoding_strategy == "greedy_batch":
+        if cfg.decoding_strategy in ["greedy", "greedy_batch"]:
             beams_batch = [[x] for x in best_hyp_batch]
 
         for beams_idx, beams in enumerate(beams_batch):
@@ -214,7 +214,7 @@ def decoding_step(
             cer_dist_best += cer_dist_min
         sample_idx += len(probs_batch)
 
-    if cfg.decoding_strategy == "greedy_batch":
+    if cfg.decoding_strategy in ["greedy", "greedy_batch"]:
         return wer_dist_first / words_count, cer_dist_first / chars_count
 
     if preds_output_file:
@@ -242,7 +242,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
     if is_dataclass(cfg):
         cfg = OmegaConf.structured(cfg)  # type: EvalBeamSearchNGramConfig
 
-    valid_decoding_strategis = ["greedy_batch", "beam", "tsd", "alsd", "maes", "maes_batch"]
+    valid_decoding_strategis = ["greedy", "greedy_batch", "beam", "tsd", "alsd", "maes", "maes_batch"]
     if cfg.decoding_strategy not in valid_decoding_strategis:
         raise ValueError(
             f"Given decoding_strategy={cfg.decoding_strategy} is invalid. Available options are :\n"
@@ -349,7 +349,19 @@ def main(cfg: EvalBeamSearchNGramConfig):
             with open(cfg.probs_cache_file, 'wb') as f_dump:
                 pickle.dump(all_probs, f_dump)
 
-    if cfg.decoding_strategy == "greedy_batch":
+    # sort all_probs according to length:
+    all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
+    all_probs_sorted = []
+    target_transcripts_sorted = []
+    for pair in all_probs_with_indeces:
+        all_probs_sorted.append(pair[1])
+        target_transcripts_sorted.append(target_transcripts[pair[0]])
+    all_probs = all_probs_sorted
+    target_transcripts = target_transcripts_sorted
+
+    
+
+    if cfg.decoding_strategy in ["greedy", "greedy_batch"]:
         asr_model = asr_model.to('cpu')
         candidate_wer, candidate_cer = decoding_step(
             asr_model,
@@ -359,7 +371,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
             beam_batch_size=cfg.beam_batch_size,
             progress_bar=True,
         )
-        logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
+        logging.info(f"{cfg.decoding_strategy} WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
 
     asr_model = asr_model.to('cpu')
 

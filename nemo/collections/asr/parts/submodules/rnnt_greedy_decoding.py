@@ -475,6 +475,45 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         return hypothesis
 
 
+class BatchedHyps:
+    def __init__(self, batch_size: int, init_length: int, device=None, float_dtype=None):
+        self.y_sequence = torch.empty((batch_size, init_length), device=device, dtype=torch.long)
+        self.timestep = torch.empty((batch_size, init_length), device=device, dtype=torch.long)
+        self.scores = torch.zeros(batch_size, device=device, dtype=float_dtype)
+        self.max_length = init_length
+        self.indices = torch.zeros(batch_size, device=device, dtype=torch.long)
+
+    def _allocate_more(self):
+        """Allocate twice"""
+        self.y_sequence = torch.cat((self.y_sequence, torch.empty_like(self.y_sequence)), dim=-1)
+        self.timestep = torch.cat((self.timestep, torch.empty_like(self.timestep)), dim=-1)
+        self.max_length *= 2
+
+    def add_results(self, active_indices, labels, time_indices, scores):
+        # we assume that all tensors have the same first dimension, and labels are non-blanks
+        if active_indices.shape[0] == 0:
+            return  # nothing to add
+        if self.indices.max().item() >= self.max_length:
+            self._allocate_more()
+        self.scores[active_indices] += scores
+        self.y_sequence.view(-1)[active_indices * self.max_length + self.indices[active_indices]] = labels
+        self.timestep.view(-1)[active_indices * self.max_length + self.indices[active_indices]] = time_indices
+        self.indices[active_indices] += 1
+
+    def to_hyps(self) -> List[rnnt_utils.Hypothesis]:
+        hypotheses = [
+            rnnt_utils.Hypothesis(
+                score=self.scores[i].item(),
+                y_sequence=self.y_sequence[i, : self.indices[i]].tolist(),
+                timestep=self.timestep[i, : self.indices[i]].tolist(),
+                dec_state=None,
+            )
+            for i in range(self.scores.shape[0])
+        ]
+        return hypotheses
+
+
+
 class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
     """A batch level greedy transducer decoder.
 
@@ -835,9 +874,10 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
 
             # Initialize list of Hypothesis
             batch_size, time, emb_size = x.shape
-            hypotheses = [
-                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batch_size)
-            ]
+            # hypotheses = [
+            #     rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batch_size)
+            # ]
+            batched_hyps = BatchedHyps(batch_size=batch_size, init_length=time, device=x.device, float_dtype=x.dtype)
 
             # Initialize Hidden state matrix (shared by entire batch)
             hidden = None
@@ -868,15 +908,25 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
                 scores, labels = logp.max(1)
                 del g
 
-                for current_batch_i, source_batch_i in enumerate(active_indices):
-                    label = labels[current_batch_i].item()
-                    if label != self._blank_index:
-                        hypotheses[source_batch_i].y_sequence.append(label)
-                        hypotheses[source_batch_i].timestep.append(time_indices[source_batch_i].item())
-                        hypotheses[source_batch_i].score += float(scores[current_batch_i].item())
+                # for current_batch_i, source_batch_i in enumerate(active_indices):
+                #     label = labels[current_batch_i].item()
+                #     if label != self._blank_index:
+                #         hypotheses[source_batch_i].y_sequence.append(label)
+                #         hypotheses[source_batch_i].timestep.append(time_indices[source_batch_i].item())
+                #         hypotheses[source_batch_i].score += float(scores[current_batch_i].item())
 
                 is_active_prev = is_active
                 blank_mask = labels == self._blank_index
+
+                not_blank_mask = ~blank_mask
+                # store hypotheses
+                batched_hyps.add_results(
+                    active_indices[not_blank_mask],
+                    labels[not_blank_mask],
+                    time_indices[active_indices[not_blank_mask]],
+                    scores[not_blank_mask],
+                )
+
                 time_indices[is_active_prev] += blank_mask  # .long()
                 is_active = time_indices < out_len
                 local_mask = is_active[is_active_prev]
@@ -905,7 +955,8 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         # for batch_idx in range(batch_size):
         #     hypotheses[batch_idx].dec_state = self.decoder.batch_select_state(hidden, batch_idx)
 
-        return hypotheses
+        # return hypotheses
+        return batched_hyps.to_hyps()
 
 
     def _greedy_decode_masked(
