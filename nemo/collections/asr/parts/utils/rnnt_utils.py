@@ -221,3 +221,57 @@ def select_k_expansions(
             k_expansions.append([(k_best_exp_idx, k_best_exp)])
 
     return k_expansions
+
+
+
+def select_k_expansions_fast(
+    hyps: List[Hypothesis], topk_idxs: torch.Tensor, topk_logps: torch.Tensor, gamma: float, beta: int,
+) -> List[Tuple[int, Hypothesis]]:
+    """
+    Obtained from https://github.com/espnet/espnet
+
+    Return K hypotheses candidates for expansion from a list of hypothesis.
+    K candidates are selected according to the extended hypotheses probabilities
+    and a prune-by-value method. Where K is equal to beam_size + beta.
+
+    Args:
+        hyps: Hypotheses.
+        topk_idxs: Indices of candidates hypothesis. Shape = [B, num_candidates]
+        topk_logps: Log-probabilities for hypotheses expansions. Shape = [B, V + 1]
+        gamma: Allowed logp difference for prune-by-value method.
+        beta: Number of additional candidates to store.
+
+    Return:
+        k_expansions: Best K expansion hypotheses candidates.
+    """
+    k_expansions = []
+
+    for i, hyp in enumerate(hyps):
+
+        topk_logps[i] += hyp.score
+        k_best_exp_score, k_best_exp_score_idx = topk_logps[i].max(dim=0)
+        # k_best_exp_score_idx = topk_logps[i].argmax()
+
+        k_best_exp_label = int(topk_idxs[i][k_best_exp_score_idx])
+
+        beam_mask = topk_logps[i] >= k_best_exp_score - gamma
+        expansions_logps = topk_logps[i][beam_mask]
+        expansions_idxs = topk_idxs[i][beam_mask]
+
+        expansions = [(int(expansions_idxs[j]), float(expansions_logps[j])) for j in range(expansions_idxs.shape[0])]
+        expansions = sorted(expansions, key=lambda x: x[1])
+
+        # hyp_i = [(int(k), hyp.score + float(v)) for k, v in zip(topk_idxs[i], topk_logps[i])]
+        # k_best_exp_val = max(hyp_i, key=lambda x: x[1])
+
+        # k_best_exp_idx = k_best_exp_val[0]
+        # k_best_exp = k_best_exp_val[1]
+
+        # expansions = sorted(filter(lambda x: (k_best_exp - gamma) <= x[1], hyp_i), key=lambda x: x[1],)
+
+        if len(expansions) > 0:
+            k_expansions.append(expansions)
+        else:
+            k_expansions.append([(k_best_exp_label, k_best_exp_score)])
+
+    return k_expansions
