@@ -41,6 +41,8 @@ from nemo.collections.asr.parts.utils.rnnt_utils import (
     NBestHypotheses,
     is_prefix,
     select_k_expansions,
+    select_k_expansions_fast,
+    select_k_expansions_turbo
 )
 from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
@@ -1461,6 +1463,8 @@ class BeamRNNTInfer(Typing):
 
         final_hyps = []
 
+        do_prefix = True
+
         # logging.warning("------------------------ I am here!!! ------------------------")
         # logging.warning(f"encoded_lengths: {encoded_lengths}")
         # logging.warning(f"h.shape: {h.shape}")
@@ -1470,30 +1474,29 @@ class BeamRNNTInfer(Typing):
 
             # get sliced hypotesis list:
             # hyp_slices = self.get_hyp_slices_per_batch(kept_hyps, hyps_batch_indeces) # [B * [hyps, batch_idx]]
+            
+            
+            if not do_prefix:
+                kept_hyps = sorted(kept_hyps, key=lambda x: len(x.y_sequence), reverse=False)
+                hyps = kept_hyps
+            
             hyp_slices = self.get_hyp_slices_per_batch(kept_hyps) # [B * [hyps, batch_idx]]
+            
             # logging.warning("------------------------ I am here!!! ------------------------")
             # logging.warning(f"hyp_slices: {hyp_slices}")
 
-            # Perform prefix search to obtain hypothesis
-            # hypotheses_list = []
-            # for item in hyp_slices:
-            #     hyps = self.prefix_search(
-            #         sorted(item[0], key=lambda x: len(x.y_sequence), reverse=True),
-            #         enc_out_t[item[1]],
-            #         prefix_alpha=self.maes_prefix_alpha,
-            #     )  # type: List[Hypothesis]
-            #     hypotheses_list.extend(hyps)
-            # hyps = hypotheses_list
-            hypotheses_list = []
-            for batch_idx in hyp_slices:
-                hyps = self.prefix_search(
-                    sorted(hyp_slices[batch_idx], key=lambda x: len(x.y_sequence), reverse=True),
-                    enc_out_t[batch_idx].unsqueeze(0), # [1, 1, D]
-                    prefix_alpha=self.maes_prefix_alpha,
-                )  # type: List[Hypothesis]
-                hypotheses_list.extend(hyps)
-            hyps = hypotheses_list
-            # hyps = kept_hyps
+            if do_prefix:
+                # Perform prefix search to obtain hypothesis
+                hypotheses_list = []
+                for batch_idx in hyp_slices:
+                    hyps = self.prefix_search(
+                        sorted(hyp_slices[batch_idx][0], key=lambda x: len(x.y_sequence), reverse=True),
+                        enc_out_t[batch_idx].unsqueeze(0), # [1, 1, D]
+                        prefix_alpha=self.maes_prefix_alpha,
+                    )  # type: List[Hypothesis]
+                    hypotheses_list.extend(hyps)
+                hyps = hypotheses_list
+                hyps = kept_hyps
 
             # logging.warning("------------------------ I am here!!! ------------------------")
             # logging.warning(f"len(hypotheses_list): {len(hypotheses_list)}")
@@ -1509,8 +1512,12 @@ class BeamRNNTInfer(Typing):
             # List of last labels for hyps in batch format
             duplication_check_batch = {} # [B*([labels_list], b_idx)]
             for batch_idx in hyp_slices:
-                duplication_check = [hyp.y_sequence for hyp in hyp_slices[batch_idx]]
-                duplication_check_batch[batch_idx] = duplication_check
+                duplication_check = [hyp.y_sequence for hyp in hyp_slices[batch_idx][0]]
+                if not do_prefix:
+                    duplication_check_hyp_idx = [idx for idx in hyp_slices[batch_idx][1]]
+                else:
+                    duplication_check_hyp_idx = 0
+                duplication_check_batch[batch_idx] = [duplication_check, duplication_check_hyp_idx]
 
             # logging.warning("------------------------ I am here!!! ------------------------")
             # logging.warning(f"duplication_check_batch: {duplication_check_batch}")
@@ -1536,7 +1543,7 @@ class BeamRNNTInfer(Typing):
                 beam_idx = beam_idx[:, 0, 0, :]  # [B, max_candidates]
 
                 # Compute k expansions for all the current hypotheses
-                k_expansions = select_k_expansions(
+                k_expansions = select_k_expansions_turbo(
                     hyps, beam_idx, beam_logp, self.maes_expansion_gamma, self.maes_expansion_beta
                 )
 
@@ -1564,7 +1571,7 @@ class BeamRNNTInfer(Typing):
                         else:
                             # If the expansion was a token
                             # new_hyp.y_sequence.append(int(k))
-                            if (new_hyp.y_sequence + [int(k)]) not in duplication_check_batch[new_hyp.batch_index]:
+                            if (new_hyp.y_sequence + [int(k)]) not in duplication_check_batch[new_hyp.batch_index][0]:
                                 # logging.warning("------------------------ I am here!!! ------------------------")
                                 # logging.warning(f"len(hyps): {len(hyps)}")
                                 # logging.warning(f"k_expansions: {k_expansions}")
@@ -1596,6 +1603,22 @@ class BeamRNNTInfer(Typing):
                                 #     pass
 
                                 list_exp.append(new_hyp)
+                            elif not do_prefix and n == 0:
+                                duplication_hyp_idx_slice = duplication_check_batch[new_hyp.batch_index][0].index((new_hyp.y_sequence + [int(k)]))
+                                duplication_hyp_idx = duplication_check_batch[new_hyp.batch_index][1][duplication_hyp_idx_slice]
+                            
+                                for expansion in k_expansions[duplication_hyp_idx]:
+                                    # x = np.logaddexp(expansion[1], new_score)
+                                    # expansion[1] = min(x, -1e-2)
+                                    # if expansion[1] 
+                                    expansion[1] = np.logaddexp(expansion[1], 1.0*new_score)
+                                    
+                                    # logging.warning("------------------------ I am here!!! ------------------------")
+                                    # logging.warning(f"new_hyp.y_sequence: {new_hyp.y_sequence}")
+                                    # logging.warning(f"new_hyp.y_sequence + [int(k)]: {new_hyp.y_sequence + [int(k)]}")
+                                    # logging.warning(f"expansion[1]: {expansion[1]}")
+                                    # logging.warning(f"new_score: {new_score}")
+                                    # logging.warning(f"np.logaddexp(expansion[1], new_score): {np.logaddexp(expansion[1], new_score)}")
                             # else:
                             #     logging.warning("------------------------ I am here!!! ------------------------")
                             #     logging.warning(f"new_hyp.y_sequence + [int(k)] in duplication_check_batch[new_hyp.batch_index]: {new_hyp.y_sequence + [int(k)]}")
@@ -1622,7 +1645,7 @@ class BeamRNNTInfer(Typing):
                     # do sorting for each batch slice separatly!!
                     list_b_slices = self.get_hyp_slices_per_batch(list_b)
                     for batch_idx in list_b_slices:
-                        hyps_sorted = sorted(list_b_slices[batch_idx], key=lambda x: x.score, reverse=True)[:beam]
+                        hyps_sorted = sorted(list_b_slices[batch_idx][0], key=lambda x: x.score, reverse=True)[:beam]
                         for hyp in hyps_sorted:
                             if hyp.length == encoded_lengths[hyp.batch_index]-1:
                                 final_hyps.append(hyp)
@@ -1725,7 +1748,7 @@ class BeamRNNTInfer(Typing):
                         list_b_exp = list_b + list_exp
                         list_b_exp_slices = self.get_hyp_slices_per_batch(list_b_exp)
                         for batch_idx in list_b_exp_slices:
-                            hyps_sorted = sorted(list_b_exp_slices[batch_idx], key=lambda x: x.score, reverse=True)[:beam]
+                            hyps_sorted = sorted(list_b_exp_slices[batch_idx][0], key=lambda x: x.score, reverse=True)[:beam]
                             for hyp in hyps_sorted:
                                 if hyp.length == encoded_lengths[hyp.batch_index]-1:
                                     final_hyps.append(hyp)
@@ -1753,7 +1776,7 @@ class BeamRNNTInfer(Typing):
         final_hyps_slices = self.get_hyp_slices_per_batch(final_hyps)
         final_hyps_slices = dict(sorted(final_hyps_slices.items()))
         for batch_idx in final_hyps_slices:
-            sorted_hyps = self.sort_nbest(final_hyps_slices[batch_idx])
+            sorted_hyps = self.sort_nbest(final_hyps_slices[batch_idx][0])
             output_hyps.append(sorted_hyps)
         # logging.warning("------------------------ I am here!!! ------------------------")
         # logging.warning(f"len(final_hyps): {len(final_hyps)}")
@@ -1855,6 +1878,12 @@ class BeamRNNTInfer(Typing):
                                 curr_score += self.ngram_lm_alpha * lm_score
 
                     hyp_j.score = np.logaddexp(hyp_j.score, curr_score)
+                    # logging.warning("------------------------ I am here!!! ------------------------")
+                    # logging.warning(f"hyp_j.y_sequence: {hyp_j.y_sequence}")
+                    # logging.warning(f"hyp_i.y_sequence: {hyp_i.y_sequence}")
+                    # logging.warning(f"hyp_j.score: {hyp_j.score}")
+                    # logging.warning(f"curr_score: {curr_score}")
+                    # logging.warning(f"np.logaddexp(hyp_j.score, curr_score): {np.logaddexp(hyp_j.score, curr_score)}")
 
         return hypotheses
 
@@ -1910,12 +1939,13 @@ class BeamRNNTInfer(Typing):
     def get_hyp_slices_per_batch(self, hypotheses: List[Hypothesis]) -> List[Hypothesis]:
         
         hyp_slices = {} # {B * [hyps, batch_idx]}
-        for hyp in hypotheses:
+        for idx, hyp in enumerate(hypotheses):
             batch_idx = hyp.batch_index
             if batch_idx not in hyp_slices:
-                hyp_slices[batch_idx] = [hyp]
+                hyp_slices[batch_idx] = [[hyp], [idx]]
             else:
-                hyp_slices[batch_idx].append(hyp)
+                hyp_slices[batch_idx][0].append(hyp)
+                hyp_slices[batch_idx][1].append(idx)
 
         return hyp_slices
 

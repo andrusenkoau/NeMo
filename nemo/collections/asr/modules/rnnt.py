@@ -979,10 +979,12 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                 ([L x (1, H)], [L x (1, H)])
         """
         if batch_states is not None:
-            state_list = []
-            for state_id in range(len(batch_states)):
-                states = [batch_states[state_id][layer][idx] for layer in range(self.pred_rnn_layers)]
-                state_list.append(states)
+            state_list = [batch_states[state_id][:,idx,:] for state_id in range(len(batch_states))]
+            # state_list = []
+            # for state_id in range(len(batch_states)):
+            #     # states = [batch_states[state_id][layer][idx] for layer in range(self.pred_rnn_layers)]
+            #     states = batch_states[state_id][:,idx,:]
+            #     state_list.append(states)
 
             return state_list
         else:
