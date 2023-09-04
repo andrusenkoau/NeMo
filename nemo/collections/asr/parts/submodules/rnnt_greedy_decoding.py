@@ -598,7 +598,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         # Depending on availability of `blank_as_pad` support
         # switch between more efficient batch decoding technique
         if self.decoder.blank_as_pad:
-            self._greedy_decode = self._greedy_decode_blank_as_pad_fast
+            self._greedy_decode = self._greedy_decode_blank_as_pad
         else:
             self._greedy_decode = self._greedy_decode_masked
 

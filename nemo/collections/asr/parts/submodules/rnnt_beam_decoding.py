@@ -1463,7 +1463,7 @@ class BeamRNNTInfer(Typing):
 
         final_hyps = []
 
-        do_prefix = True
+        do_prefix = False
 
         # logging.warning("------------------------ I am here!!! ------------------------")
         # logging.warning(f"encoded_lengths: {encoded_lengths}")
@@ -1496,7 +1496,7 @@ class BeamRNNTInfer(Typing):
                     )  # type: List[Hypothesis]
                     hypotheses_list.extend(hyps)
                 hyps = hypotheses_list
-                hyps = kept_hyps
+            # hyps = kept_hyps
 
             # logging.warning("------------------------ I am here!!! ------------------------")
             # logging.warning(f"len(hypotheses_list): {len(hypotheses_list)}")
