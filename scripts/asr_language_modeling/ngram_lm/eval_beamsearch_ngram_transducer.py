@@ -125,6 +125,8 @@ class EvalBeamSearchNGramConfig:
 
     softmax_temperature: float = 1.00
 
+    preserve_alignments: bool = False
+
 
     decoding: rnnt_beam_decoding.BeamRNNTInferConfig = rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=128)
 
@@ -155,6 +157,9 @@ def decoding_step(
     cfg.decoding.ngram_lm_model = cfg.kenlm_model_file
     cfg.decoding.hat_subtract_ilm = cfg.hat_subtract_ilm
 
+    # preserve aligmnet:
+    model.cfg.decoding.preserve_alignments = cfg.preserve_alignments
+
     # Update model's decoding strategy config
     model.cfg.decoding.strategy = cfg.decoding_strategy
     model.cfg.decoding.beam = cfg.decoding
@@ -176,7 +181,7 @@ def decoding_step(
         out_manifest = open(preds_output_manifest, 'w', encoding='utf_8', newline='\n')
 
     if progress_bar:
-        if cfg.decoding_strategy == "greedy_batch":
+        if cfg.decoding_strategy.startswith("greedy"):
             description = "Greedy_batch decoding.."
         else:
             description = f"{cfg.decoding_strategy} decoding with bw={cfg.decoding.beam_size}, ba={cfg.decoding.ngram_lm_alpha}, ma={cfg.decoding.maes_prefix_alpha}, mg={cfg.decoding.maes_expansion_gamma}, hat_ilmw={cfg.decoding.hat_ilm_weight}"
@@ -197,7 +202,7 @@ def decoding_step(
             best_hyp_batch, beams_batch = model.decoding.rnnt_decoder_predictions_tensor(
                 packed_batch, probs_lens, return_hypotheses=True,
             )
-        if cfg.decoding_strategy == "greedy_batch":
+        if cfg.decoding_strategy.startswith("greedy"):
             beams_batch = [[x] for x in best_hyp_batch]
 
         for beams_idx, beams in enumerate(beams_batch):
@@ -234,17 +239,28 @@ def decoding_step(
             cer_dist_best += cer_dist_min
 
             # write manifest with prediction results
+            alignment = []
+            if cfg.preserve_alignments:
+                for idx, x in enumerate(candidate.alignments):
+                    token_id = x[0][-1].item()
+                    if token_id == 1024:
+                        token_text = "blank"
+                    else:
+                        token_text = model.tokenizer.ids_to_text(token_id)
+                    alignment.append(f"{token_text}: {idx}")
+            #alignment = [model.tokenizer.ids_to_text(x[0][-1].item()) for x in candidate.alignments]
             if preds_output_manifest:
                 item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
                         'duration': durations[sample_idx + beams_idx],
                         'text': target_transcripts[sample_idx + beams_idx],
                         'pred_text': beams[0].text,
-                        'wer': f"{wer_dist_tosave/len(target_split_w):.3f}"}
+                        'wer': f"{wer_dist_tosave/len(target_split_w):.3f}",
+                        'alignment': f"{alignment}"}
                 out_manifest.write(json.dumps(item) + "\n")
         
         sample_idx += len(probs_batch)
 
-    if cfg.decoding_strategy == "greedy_batch":
+    if cfg.decoding_strategy.startswith("greedy"):
         return wer_dist_first / words_count, cer_dist_first / chars_count
 
     if preds_output_file:
@@ -272,7 +288,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
     if is_dataclass(cfg):
         cfg = OmegaConf.structured(cfg)  # type: EvalBeamSearchNGramConfig
 
-    valid_decoding_strategis = ["greedy_batch", "beam", "tsd", "alsd", "maes"]
+    valid_decoding_strategis = ["greedy", "greedy_batch", "beam", "tsd", "alsd", "maes"]
     if cfg.decoding_strategy not in valid_decoding_strategis:
         raise ValueError(
             f"Given decoding_strategy={cfg.decoding_strategy} is invalid. Available options are :\n"
@@ -382,7 +398,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
             with open(cfg.probs_cache_file, 'wb') as f_dump:
                 pickle.dump(all_probs, f_dump)
 
-    if cfg.decoding_strategy == "greedy_batch":
+    if cfg.decoding_strategy.startswith("greedy"):
         asr_model = asr_model.to('cpu')
         preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")
         preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
