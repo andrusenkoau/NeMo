@@ -361,6 +361,16 @@ def main(cfg: EvalBeamSearchNGramConfig):
             with open(cfg.probs_cache_file, 'wb') as f_dump:
                 pickle.dump(all_probs, f_dump)
 
+    asr_model = asr_model.to('cpu')
+
+    # save logprobs:
+    torch.save(all_probs, os.path.join(cfg.preds_output_folder, "ctc_logprobs.pt"))
+
+
+    preds_output_manifest = os.path.join(cfg.preds_output_folder, "recognition_results.json")
+    if preds_output_manifest:
+        out_manifest = open(preds_output_manifest, 'w', encoding='utf_8', newline='\n')
+    
     wer_dist_greedy = 0
     cer_dist_greedy = 0
     words_count = 0
@@ -392,6 +402,26 @@ def main(cfg: EvalBeamSearchNGramConfig):
         cer_dist_greedy += cer_dist
         words_count += len(target_split_w)
         chars_count += len(target_split_c)
+
+        # write manifest with prediction results
+        alignment = []
+        for idx, token_id in enumerate(preds):
+            # # token_id = x[0][-1].item()
+            if token_id == 1024:
+                token_text = "blank"
+            else:
+                token_text = asr_model.tokenizer.ids_to_text(int(token_id))
+            alignment.append(f"{token_text}: {idx}")
+            # alignment.append(f"{token_id}: {idx}")
+
+        if preds_output_manifest:
+            item = {'audio_filepath': audio_file_paths[batch_idx],
+                    'duration': durations[batch_idx],
+                    'text': target_transcripts[batch_idx],
+                    'pred_text': pred_text,
+                    'wer': f"{wer_dist/len(target_split_w):.4f}",
+                    'alignment': f"{alignment}"}
+            out_manifest.write(json.dumps(item) + "\n")
 
     logging.info('Greedy WER/CER = {:.2%}/{:.2%}'.format(wer_dist_greedy / words_count, cer_dist_greedy / chars_count))
 
