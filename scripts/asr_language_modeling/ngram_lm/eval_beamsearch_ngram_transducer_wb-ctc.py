@@ -222,29 +222,77 @@ def decoding_step(
             for candidate_idx, candidate in enumerate(beams):  # type: (int, rnnt_beam_decoding.rnnt_utils.Hypothesis)
                 
                 ###################################
-                if cfg.applay_context_biasing:
+                if cfg.applay_context_biasing and wb_results[audio_file_paths[sample_idx + beams_idx]]:
                     # make new text by mearging alignment with ctc-wb predictions:
                     alignment = candidate.alignments
                     alignment = [x[0][-1].item() for x in alignment]
-                    # logging.warning("-------------------------------")
-                    # logging.warning(f"alignemt is: {alignment}")
-                    # merge alighment:
-                    # logging.warning(f"wb_results is: {wb_results}")
-                    for wb_hyp in wb_results[beams_idx]:
-                        # logging.warning("-------------------------------")
-                        # logging.warning(f"wb_hyps is: {wb_hyps}")
-                        for step, i in enumerate(range(wb_hyp.start_frame, wb_hyp.end_frame+1)):
-                            if i >= len(alignment):
-                                break
-                            if step < len(wb_hyp.tokenization):
-                                token = wb_hyp.tokenization[step]
+
+                    # get words borders
+                    alignment_tokens = []
+                    for idx, token in enumerate(alignment):
+                        if token != model.decoder.blank_idx:
+                            alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
+
+                    slash = "▁"
+                    word_alignment = []
+                    word = ""
+                    l, r, = None, None
+                    for item in alignment_tokens:
+                        if not word:
+                            word = item[1][1:]
+                            l = item[0]
+                            r = item[0]
+                        else:
+                            if item[1].startswith(slash):
+                                word_alignment.append((word, l, r))
+                                word = item[1][1:]
+                                l = item[0]
+                                r = item[0]
                             else:
-                                token = model.decoder.blank_idx
-                            alignment[i] = token
-                    clean_alignment = [token for token in alignment if token != model.decoder.blank_idx]
-                    boosted_text = model.tokenizer.ids_to_text(clean_alignment)
-                    # logging.warning(f"boosted_text is: {boosted_text}")
-                    # logging.warning(f"old_text is: {beams[0].text}")
+                                word += item[1]
+                                r = item[0]
+                    word_alignment.append((word, l, r))
+                    initial_word_alignment = word_alignment
+                    # print(word_alignment)
+
+                    # merge wb_hyps and word alignment:
+                    for wb_hyp in wb_results[audio_file_paths[sample_idx + beams_idx]]:
+                        new_word_alignment = []
+                        already_pasted = False
+                        lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+                        for item in word_alignment:
+                            li, ri = item[1], item[2]
+                            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+                                if not already_pasted:
+                                    new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+                                    already_pasted = True
+                            else:
+                                new_word_alignment.append(item)
+                        word_alignment = new_word_alignment
+
+                    # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
+                    boosted_text_list = [item[0] for item in new_word_alignment]
+                    boosted_text = " ".join(boosted_text_list)
+
+  
+                    # # merge alighment:
+                    # for wb_hyp in wb_results[audio_file_paths[sample_idx + beams_idx]]:
+                    #     # logging.warning("-------------------------------")
+                    #     # logging.warning(f"wb_hyps is: {wb_hyps}")
+                    #     for step, i in enumerate(range(wb_hyp.start_frame, wb_hyp.end_frame+1)):
+                    #         if i >= len(alignment):
+                    #             break
+                    #         if step < len(wb_hyp.tokenization):
+                    #             token = wb_hyp.tokenization[step]
+                    #         else:
+                    #             token = model.decoder.blank_idx
+                    #         alignment[i] = token
+                    # clean_alignment = [token for token in alignment if token != model.decoder.blank_idx]
+                    # boosted_text = model.tokenizer.ids_to_text(clean_alignment)
+
+
+
+                    # print(boosted_text)
                     pred_text = boosted_text
                     beams[0].text = pred_text
                 else:
@@ -282,10 +330,11 @@ def decoding_step(
                 for idx, x in enumerate(candidate.alignments):
                     token_id = x[0][-1].item()
                     if token_id == model.decoder.blank_idx:
-                        token_text = "blank"
+                        token_text = "-"
                     else:
-                        token_text = model.tokenizer.ids_to_text(token_id)
-                    alignment.append(f"{token_text}: {idx}")
+                        token_text = model.tokenizer.ids_to_tokens([token_id])[0]
+                    # alignment.append(f"{token_text}: {idx}")
+                    alignment.append(f"{token_id}: {idx}")
             #alignment = [model.tokenizer.ids_to_text(x[0][-1].item()) for x in candidate.alignments]
             if preds_output_manifest:
                 item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
@@ -437,7 +486,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 pickle.dump(all_probs, f_dump)
 
 ################
-    wb_results = []
+    wb_results = {}
     if cfg.applay_context_biasing:
         # load context graph:
         context_transcripts = []
@@ -457,13 +506,14 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
         # run WB search:
         for idx, logits in tqdm(enumerate(ctc_logits), desc=f"CTC based word boosting...", ncols=120):
-            wb_result = recognize_wb(logits, context_graph, asr_model, beam_threshold=4, context_score=4, keyword_thr=0)
-            wb_results.append(wb_result)
+            wb_result = recognize_wb(logits, context_graph, asr_model, beam_threshold=5, context_score=5, keyword_thr=0)
+            wb_results[audio_file_paths[idx]] = wb_result
             print(audio_file_paths[idx])
         
         # logging.warning("--------------------------")
         # logging.warning(f"len(wb_results): {len(wb_results)}")
         # logging.warning(f"len(audio_file_paths): {len(audio_file_paths)}")
+        # raise FileExistsError
 
     # get RNNT results:
 
