@@ -485,7 +485,8 @@ def main(cfg: EvalBeamSearchNGramConfig):
             with open(cfg.probs_cache_file, 'wb') as f_dump:
                 pickle.dump(all_probs, f_dump)
 
-################
+################################
+
     wb_results = {}
     if cfg.applay_context_biasing:
         # load context graph:
@@ -505,20 +506,24 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 ctc_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
 
         # run WB search:
-        for idx, logits in tqdm(enumerate(ctc_logits), desc=f"CTC based word boosting...", ncols=120):
-            wb_result = recognize_wb(logits, context_graph, asr_model, beam_threshold=5, context_score=5, keyword_thr=0)
+        for idx, logits in tqdm(enumerate(ctc_logits), desc=f"CTC based word boosting...", ncols=120, total=len(ctc_logits)):
+            wb_result = recognize_wb(
+                logits,
+                context_graph,
+                asr_model,
+                beam_threshold=5,        # 5
+                context_score=5,         # 5 6?
+                keyword_thr=-3,          # 0
+                ctc_ali_token_weight=3.5 # 2.5
+            )
             wb_results[audio_file_paths[idx]] = wb_result
-            print(audio_file_paths[idx])
+            print(audio_file_paths[idx] + "\n")
         
-        # logging.warning("--------------------------")
-        # logging.warning(f"len(wb_results): {len(wb_results)}")
-        # logging.warning(f"len(audio_file_paths): {len(audio_file_paths)}")
-        # raise FileExistsError
 
     # get RNNT results:
 
 
-################
+################################
     if cfg.decoding_strategy.startswith("greedy"):
         asr_model = asr_model.to('cpu')
         preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")
