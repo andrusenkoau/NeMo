@@ -124,7 +124,7 @@ def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True)
 
     print(" ")
     print("***"*10)
-    print(f"Precision: {precision:.4f} ({tp}/{tp + fp})")
+    print(f"Precision: {precision:.4f} ({tp}/{tp + fp}) fp:{fp}")
     print(f"Recall:    {recall:.4f} ({tp}/{gt})")
     print(f"Fscore:    {fscore:.4f}")
     print("***"*10) 
