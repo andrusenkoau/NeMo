@@ -139,6 +139,66 @@ class EvalBeamSearchNGramConfig:
 # fmt: on
 
 
+def merge_alignment_with_wb_hyps(
+    alignment,
+    model,
+    wb_result,
+):
+    
+    alignment = [x[0][-1].item() for x in alignment]
+
+    # get words borders
+    alignment_tokens = []
+    for idx, token in enumerate(alignment):
+        if token != model.decoder.blank_idx:
+            alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
+
+    if not alignment_tokens:
+        return " ".join([wb_hyp.word for wb_hyp in wb_result])
+
+
+    slash = "▁"
+    word_alignment = []
+    word = ""
+    l, r, = None, None
+    for item in alignment_tokens:
+        if not word:
+            word = item[1][1:]
+            l = item[0]
+            r = item[0]
+        else:
+            if item[1].startswith(slash):
+                word_alignment.append((word, l, r))
+                word = item[1][1:]
+                l = item[0]
+                r = item[0]
+            else:
+                word += item[1]
+                r = item[0]
+    word_alignment.append((word, l, r))
+
+    # merge wb_hyps and word alignment:
+    for wb_hyp in wb_result:
+        new_word_alignment = []
+        already_pasted = False
+        lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+        for item in word_alignment:
+            li, ri = item[1], item[2]
+            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+                if not already_pasted:
+                    new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+                    already_pasted = True
+            else:
+                new_word_alignment.append(item)
+        word_alignment = new_word_alignment
+
+    # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
+    boosted_text_list = [item[0] for item in new_word_alignment]
+    boosted_text = " ".join(boosted_text_list)
+    
+    return boosted_text
+
+
 def decoding_step(
     model: nemo_asr.models.ASRModel,
     cfg: EvalBeamSearchNGramConfig,
@@ -223,76 +283,13 @@ def decoding_step(
                 
                 ###################################
                 if cfg.applay_context_biasing and wb_results[audio_file_paths[sample_idx + beams_idx]]:
+                    
                     # make new text by mearging alignment with ctc-wb predictions:
-                    alignment = candidate.alignments
-                    alignment = [x[0][-1].item() for x in alignment]
-
-                    # get words borders
-                    alignment_tokens = []
-                    for idx, token in enumerate(alignment):
-                        if token != model.decoder.blank_idx:
-                            alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
-
-                    slash = "▁"
-                    word_alignment = []
-                    word = ""
-                    l, r, = None, None
-                    for item in alignment_tokens:
-                        if not word:
-                            word = item[1][1:]
-                            l = item[0]
-                            r = item[0]
-                        else:
-                            if item[1].startswith(slash):
-                                word_alignment.append((word, l, r))
-                                word = item[1][1:]
-                                l = item[0]
-                                r = item[0]
-                            else:
-                                word += item[1]
-                                r = item[0]
-                    word_alignment.append((word, l, r))
-                    initial_word_alignment = word_alignment
-                    # print(word_alignment)
-
-                    # merge wb_hyps and word alignment:
-                    for wb_hyp in wb_results[audio_file_paths[sample_idx + beams_idx]]:
-                        new_word_alignment = []
-                        already_pasted = False
-                        lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
-                        for item in word_alignment:
-                            li, ri = item[1], item[2]
-                            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
-                                if not already_pasted:
-                                    new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
-                                    already_pasted = True
-                            else:
-                                new_word_alignment.append(item)
-                        word_alignment = new_word_alignment
-
-                    # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
-                    boosted_text_list = [item[0] for item in new_word_alignment]
-                    boosted_text = " ".join(boosted_text_list)
-
-  
-                    # # merge alighment:
-                    # for wb_hyp in wb_results[audio_file_paths[sample_idx + beams_idx]]:
-                    #     # logging.warning("-------------------------------")
-                    #     # logging.warning(f"wb_hyps is: {wb_hyps}")
-                    #     for step, i in enumerate(range(wb_hyp.start_frame, wb_hyp.end_frame+1)):
-                    #         if i >= len(alignment):
-                    #             break
-                    #         if step < len(wb_hyp.tokenization):
-                    #             token = wb_hyp.tokenization[step]
-                    #         else:
-                    #             token = model.decoder.blank_idx
-                    #         alignment[i] = token
-                    # clean_alignment = [token for token in alignment if token != model.decoder.blank_idx]
-                    # boosted_text = model.tokenizer.ids_to_text(clean_alignment)
-
-
-
-                    # print(boosted_text)
+                    boosted_text = merge_alignment_with_wb_hyps(
+                        candidate.alignments,
+                        model,
+                        wb_results[audio_file_paths[sample_idx + beams_idx]]
+                    )
                     pred_text = boosted_text
                     beams[0].text = pred_text
                 else:
@@ -457,6 +454,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 asr_model.encoder.freeze()
                 device = next(asr_model.parameters()).device
                 all_probs = []
+                ctc_logprobs = []
                 with tempfile.TemporaryDirectory() as tmpdir:
                     with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
                         for audio_file in audio_file_paths:
@@ -471,14 +469,22 @@ def main(cfg: EvalBeamSearchNGramConfig):
                         'augmentor': None,
                     }
                     temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
-                    for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=True):
+                    # logging.warning("Getting encoder and CTC decoder outputs...")
+                    for test_batch in tqdm(temporary_datalayer, desc="Getting encoder and CTC decoder outputs...", disable=False):
                         encoded, encoded_len = asr_model.forward(
                             input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
                         )
+                        ctc_dec_outputs = asr_model.ctc_decoder(encoder_output=encoded).cpu()
+                        # logging.warning("-"*100)
+                        # logging.warning(f"encoded.shape is: {encoded.shape}")
+                        # logging.warning(f"ctc_dec_outputs.shape is: {ctc_dec_outputs.shape}")
+                        # raise KeyError
                         # dump encoder embeddings per file
                         for idx in range(encoded.shape[0]):
                             encoded_no_pad = encoded[idx, :, : encoded_len[idx]]
+                            ctc_dec_outputs_no_pad = ctc_dec_outputs[idx, : encoded_len[idx]]
                             all_probs.append(encoded_no_pad)
+                            ctc_logprobs.append(ctc_dec_outputs_no_pad)
 
         if cfg.probs_cache_file:
             logging.info(f"Writing pickle files of probabilities at '{cfg.probs_cache_file}'...")
@@ -498,24 +504,29 @@ def main(cfg: EvalBeamSearchNGramConfig):
         context_graph = ContextGraphCTC(blank_id=asr_model.decoder.blank_idx)
         context_graph.build(context_transcripts)
 
-        # get CTC logits:
-        with autocast():
-            with torch.no_grad():
-                if isinstance(asr_model, EncDecHybridRNNTCTCModel):
-                    asr_model.cur_decoder = 'ctc'
-                ctc_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
+        # # get CTC logits:
+        # logging.warning("Getting CTC logprobs for CTC based word boosting...")
+        # with autocast():
+        #     with torch.no_grad():
+        #         if isinstance(asr_model, EncDecHybridRNNTCTCModel):
+        #             asr_model.cur_decoder = 'ctc'
+        #         ctc_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
 
         # run WB search:
-        for idx, logits in tqdm(enumerate(ctc_logits), desc=f"CTC based word boosting...", ncols=120, total=len(ctc_logits)):
+        for idx, logits in tqdm(enumerate(ctc_logprobs), desc=f"CTC based word boosting...", ncols=120, total=len(ctc_logprobs)):
+            # try:
             wb_result = recognize_wb(
-                logits,
+                logits.numpy(),
                 context_graph,
                 asr_model,
-                beam_threshold=5,        # 5
-                context_score=5,         # 5 6?
-                keyword_thr=-3,          # 0
-                ctc_ali_token_weight=3.5 # 2.5
+                beam_threshold=7,        # 5
+                context_score=6,         # 5
+                keyword_thr=-3,          # -3
+                ctc_ali_token_weight=5.0 # 3.5
             )
+            # except:
+            #     logging.warning("-------------------------")
+            #     logging.warning(f"audio file is: {audio_file_paths[idx]}")
             wb_results[audio_file_paths[idx]] = wb_result
             print(audio_file_paths[idx] + "\n")
         
@@ -524,6 +535,21 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
 
 ################################
+
+    # sort all_probs according to length:
+    all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
+    all_probs_sorted = []
+    target_transcripts_sorted = []
+    audio_file_paths_sorted = []
+    for pair in all_probs_with_indeces:
+        all_probs_sorted.append(pair[1])
+        target_transcripts_sorted.append(target_transcripts[pair[0]])
+        audio_file_paths_sorted.append(audio_file_paths[pair[0]])
+    all_probs = all_probs_sorted
+    target_transcripts = target_transcripts_sorted
+    audio_file_paths = audio_file_paths_sorted
+
+
     if cfg.decoding_strategy.startswith("greedy"):
         asr_model = asr_model.to('cpu')
         preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")

@@ -17,6 +17,7 @@ class ContextState:
         self.next = {}
         self.is_end = False
         self.word = None
+        self.best_token = None
 
 
 class ContextGraphCTC:

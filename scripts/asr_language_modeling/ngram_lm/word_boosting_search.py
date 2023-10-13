@@ -1,5 +1,8 @@
 import copy
 import numpy as np
+from nemo.utils import logging
+from collections import deque
+
 
 class Token:
     def __init__(self, state, dist=0.0, start_frame=None):
@@ -17,11 +20,36 @@ class WBHyp:
         self.tokenization = tokenization
         
 
-def beam_pruning(next_tokens, threshold):   
+def beam_pruning(next_tokens, threshold):
+    if not next_tokens:
+        return []   
     alive_tokens = [token for token in next_tokens if token.alive]
     best_token = alive_tokens[np.argmax([token.dist for token in alive_tokens])]
     next_tokens = [token for token in alive_tokens if token.dist > best_token.dist - threshold]
     return next_tokens
+
+
+def state_pruning(next_tokens):
+    if not next_tokens:
+        return []
+    # hyps pruning
+    for token in next_tokens:
+        if not token.state.best_token:
+            token.state.best_token = token
+        else:
+            if token.dist <= token.state.best_token.dist:
+                token.alive = False
+            else:
+                token.state.best_token.alive = False
+                token.state.best_token = token
+    next_tokens = [token for token in next_tokens if token.alive]
+
+    # clean best_tokens in context_graph
+    for token in next_tokens:
+        token.state.best_token = None
+    
+    return next_tokens
+
 
 def find_best_hyp(spotted_words):
 
@@ -52,6 +80,8 @@ def find_best_hyp(spotted_words):
 def get_ctc_word_alignment(logprob, model, token_weight=1.0):
     
     alignment_ctc = np.argmax(logprob, axis=1)
+    # logging.warning("---------------------")
+    # logging.warning(f"alignment_ctc is: {alignment_ctc}")
 
     # get token alignment
     token_alignment = []
@@ -85,11 +115,19 @@ def get_ctc_word_alignment(logprob, model, token_weight=1.0):
                 score += item[2]+token_boost
     word_alignment.append((word, l, r, score))
     
+    if len(word_alignment) == 1 and not word_alignment[0][0]:
+        word_alignment = []
+    
     return word_alignment
 
 
 def filter_wb_hyps(best_hyp_list, word_alignment):
     
+    # logging.warning("---------------------")
+    # logging.warning(f"word_alignment is: {word_alignment}")
+    if not word_alignment:
+        return best_hyp_list
+
     best_hyp_list_new = []
     current_frame = 0
     for hyp in best_hyp_list:
@@ -137,16 +175,27 @@ def recognize_wb(logprobs, context_graph, asr_model, beam_threshold=None, contex
     for frame in range(logprobs.shape[0]):
         active_tokens.append(Token(start_state))
         logprob_frame = logprobs[frame]
+        best_dist = None
         for token in active_tokens:
             for transition_state in token.state.next:
-                # parent_dist = copy.deepcopy(token.dist)
-                # new_token = Token(token.state.next[transition_state], parent_dist, token.start_frame)
-                new_token = Token(token.state.next[transition_state], token.dist, token.start_frame)
-                new_token.dist += logprob_frame[int(transition_state)].item()
-                # boost hyp only if token is not blank
+
+                ### running beam (start):
                 if transition_state != asr_model.decoder.blank_idx:
-                    new_token.dist += context_score
-                # define start_frame
+                    current_dist = token.dist + logprob_frame[int(transition_state)].item() + context_score
+                else:
+                    current_dist = token.dist + logprob_frame[int(transition_state)].item()
+                
+                if not best_dist:
+                    best_dist = current_dist
+                else:
+                    if current_dist < best_dist - beam_threshold:
+                        continue
+                    elif current_dist > best_dist:
+                        best_dist = current_dist
+                ### running beam (end)
+
+                new_token = Token(token.state.next[transition_state], current_dist, token.start_frame)
+
                 if not new_token.start_frame:
                     new_token.start_frame = frame
 
@@ -154,11 +203,13 @@ def recognize_wb(logprobs, context_graph, asr_model, beam_threshold=None, contex
                 if new_token.state.is_end and new_token.dist > keyword_thr:
                     word = asr_model.tokenizer.ids_to_text(new_token.state.word)
                     spotted_words.append(WBHyp(word, new_token.dist, new_token.start_frame, frame, new_token.state.word))
+                    if current_dist is best_dist:
+                        best_dist = None
                 else:
                     next_tokens.append(new_token)
         # state and beam prunings:
-        # next_tokens = state_pruning(next_tokens)
         next_tokens = beam_pruning(next_tokens, beam_threshold)
+        next_tokens = state_pruning(next_tokens)
         # print(f"frame step is: {frame}")
         # print(f"number of active_tokens is: {len(next_tokens)}")
 
