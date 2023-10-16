@@ -18,7 +18,7 @@ def load_data(manifest):
 def print_alignment(audio_filepath, ali, key_words):
     ref, hyp = [], []
     for pair in ali:
-        if pair[0] in key_words:
+        if pair[1] in key_words:
             ref.append(pair[0].upper()) 
             hyp.append(pair[1].upper()) 
         else:
@@ -56,6 +56,7 @@ def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True)
         hyp = item['pred_text'].split()
         ali = align(ref, hyp, eps)
         recognized_words = []
+        false_positive_words = []
         for idx, pair in enumerate(ali):
             phrase_match = True
             if pair[0] in key_words_dict:
@@ -91,6 +92,7 @@ def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True)
                 if not key_words_dict[pair[1]]:
                     fp += 1
                     key_words_stat[pair[1]][2] += 1
+                    false_positive_words.append(pair[1])
                 else:
                     i = idx
                     phrase_hyp = pair[1]
@@ -103,9 +105,11 @@ def compute_fscore(recognition_results_manifest, key_words_list, print_ali=True)
                     if phrase_match:
                         fp += 1
                         key_words_stat[phrase_hyp][2] += 1
+                        false_positive_words.append(phrase_hyp)
                     
         if recognized_words and print_ali:
-            print_alignment(audio_filepath, ali, recognized_words)
+            # print_alignment(audio_filepath, ali, recognized_words)
+            print_alignment(audio_filepath, ali, false_positive_words)
 
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (gt + 1e-8)

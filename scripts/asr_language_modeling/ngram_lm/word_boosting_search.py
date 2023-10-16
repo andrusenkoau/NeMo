@@ -172,11 +172,17 @@ def recognize_wb(logprobs, context_graph, asr_model, beam_threshold=None, contex
     next_tokens = []
     spotted_words = []
 
+    blank_thr = np.log(0.80)
+
     for frame in range(logprobs.shape[0]):
         active_tokens.append(Token(start_state))
         logprob_frame = logprobs[frame]
         best_dist = None
         for token in active_tokens:
+            ## skip blank for first token if root:
+            if token.state is context_graph.root and logprobs[frame][asr_model.decoder.blank_idx] > blank_thr:
+                continue
+            ## end skip blank
             for transition_state in token.state.next:
 
                 ### running beam (start):
@@ -203,10 +209,13 @@ def recognize_wb(logprobs, context_graph, asr_model, beam_threshold=None, contex
                 if new_token.state.is_end and new_token.dist > keyword_thr:
                     word = asr_model.tokenizer.ids_to_text(new_token.state.word)
                     spotted_words.append(WBHyp(word, new_token.dist, new_token.start_frame, frame, new_token.state.word))
-                    if current_dist is best_dist:
-                        best_dist = None
-                else:
-                    next_tokens.append(new_token)
+                    if len(new_token.state.next) == 1:
+                        if current_dist is best_dist:
+                            best_dist = None
+                        continue
+                next_tokens.append(new_token)
+                # else:
+                #     next_tokens.append(new_token)
         # state and beam prunings:
         next_tokens = beam_pruning(next_tokens, beam_threshold)
         next_tokens = state_pruning(next_tokens)

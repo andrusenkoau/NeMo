@@ -323,15 +323,15 @@ def decoding_step(
 
             # write manifest with prediction results
             alignment = []
-            if cfg.preserve_alignments:
-                for idx, x in enumerate(candidate.alignments):
-                    token_id = x[0][-1].item()
-                    if token_id == model.decoder.blank_idx:
-                        token_text = "-"
-                    else:
-                        token_text = model.tokenizer.ids_to_tokens([token_id])[0]
-                    # alignment.append(f"{token_text}: {idx}")
-                    alignment.append(f"{token_id}: {idx}")
+            # if cfg.preserve_alignments:
+            #     for idx, x in enumerate(candidate.alignments):
+            #         token_id = x[0][-1].item()
+            #         if token_id == model.decoder.blank_idx:
+            #             token_text = "-"
+            #         else:
+            #             token_text = model.tokenizer.ids_to_tokens([token_id])[0]
+            #         # alignment.append(f"{token_text}: {idx}")
+            #         alignment.append(f"{token_id}: {idx}")
             #alignment = [model.tokenizer.ids_to_text(x[0][-1].item()) for x in candidate.alignments]
             if preds_output_manifest:
                 item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
@@ -519,10 +519,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 logits.numpy(),
                 context_graph,
                 asr_model,
-                beam_threshold=7,        # 5
-                context_score=6,         # 5
-                keyword_thr=-3,          # -3
-                ctc_ali_token_weight=5.0 # 3.5
+                beam_threshold=5,        # 5
+                context_score=5,         # 5
+                keyword_thr=-5,          # -5
+                ctc_ali_token_weight=3.0 # 3.0
             )
             # except:
             #     logging.warning("-------------------------")
