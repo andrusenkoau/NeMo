@@ -85,10 +85,14 @@ def get_ctc_word_alignment(logprob, model, token_weight=1.0):
 
     # get token alignment
     token_alignment = []
+    prev_idx = None
     for i, idx in enumerate(alignment_ctc):
         if idx != model.decoder.blank_idx:
             token = model.tokenizer.ids_to_tokens([int(idx)])[0]
+            if idx == prev_idx:
+                token_alignment.pop()
             token_alignment.append((token, i, logprob[i, idx].item()))
+        prev_idx = idx
     
     # get word alignment
     slash = "▁"
