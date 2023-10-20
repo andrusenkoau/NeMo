@@ -686,6 +686,12 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
                         :, 0, 0, :
                     ]
 
+                    # logging.warning("---------------------")
+                    # logging.warning(f"logp.shape is: {logp.shape}")
+                    # logging.warning(f"logp[:, -1]: {logp[:, -1]}")
+                    # raise TabError
+                    # logp[:, -1] -= 0.2
+
                     if logp.dtype != torch.float32:
                         logp = logp.float()
 
@@ -713,7 +719,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
                             # saved in alignments
                             if time_idx < out_len[batch_idx] and (all_blanks or not is_blank):
                                 hypotheses[batch_idx].alignments[-1].append(
-                                    (logp_vals[batch_idx], logp_ids[batch_idx])
+                                    (logp_vals[batch_idx], logp_ids[batch_idx], time_idx)
                                 )
                         del logp_vals
 
