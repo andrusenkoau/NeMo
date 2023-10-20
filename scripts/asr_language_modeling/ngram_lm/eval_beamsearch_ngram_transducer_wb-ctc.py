@@ -128,6 +128,9 @@ class EvalBeamSearchNGramConfig:
     context_score: float = 4.0  # per token weight for context biasing words
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
 
+    sort_logits: bool = True # do logits sorting before decoding - it reduces computation on puddings
+
+
     softmax_temperature: float = 1.00
 
     preserve_alignments: bool = True
@@ -145,7 +148,7 @@ def merge_alignment_with_wb_hyps(
     wb_result,
 ):
     
-    alignment = [x[0][-1].item() for x in alignment]
+    alignment = [x[0][1].item() for x in alignment]
 
     # get words borders
     alignment_tokens = []
@@ -176,6 +179,9 @@ def merge_alignment_with_wb_hyps(
                 word += item[1]
                 r = item[0]
     word_alignment.append((word, l, r))
+    ref_text = [item[0] for item in word_alignment]
+    ref_text = " ".join(ref_text)
+    print(f"before: {ref_text}")
 
     # merge wb_hyps and word alignment:
     for wb_hyp in wb_result:
@@ -195,6 +201,7 @@ def merge_alignment_with_wb_hyps(
     # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
     boosted_text_list = [item[0] for item in new_word_alignment]
     boosted_text = " ".join(boosted_text_list)
+    print(f"after : {boosted_text}")
     
     return boosted_text
 
@@ -285,6 +292,7 @@ def decoding_step(
                 if cfg.applay_context_biasing and wb_results[audio_file_paths[sample_idx + beams_idx]]:
                     
                     # make new text by mearging alignment with ctc-wb predictions:
+                    print("----")
                     boosted_text = merge_alignment_with_wb_hyps(
                         candidate.alignments,
                         model,
@@ -292,6 +300,8 @@ def decoding_step(
                     )
                     pred_text = boosted_text
                     beams[0].text = pred_text
+                    print(f"ref   : {target}")
+                    print("\n" + audio_file_paths[sample_idx + beams_idx])
                 else:
                     pred_text = candidate.text
                 
@@ -323,16 +333,21 @@ def decoding_step(
 
             # write manifest with prediction results
             alignment = []
-            # if cfg.preserve_alignments:
-            #     for idx, x in enumerate(candidate.alignments):
-            #         token_id = x[0][-1].item()
-            #         if token_id == model.decoder.blank_idx:
-            #             token_text = "-"
-            #         else:
-            #             token_text = model.tokenizer.ids_to_tokens([token_id])[0]
-            #         # alignment.append(f"{token_text}: {idx}")
-            #         alignment.append(f"{token_id}: {idx}")
-            #alignment = [model.tokenizer.ids_to_text(x[0][-1].item()) for x in candidate.alignments]
+            if cfg.preserve_alignments:
+                prev_frame_idx = None
+                for x in candidate.alignments:
+                    token_id = x[0][1].item()
+                    frame_idx = x[0][2]
+                    if token_id == model.decoder.blank_idx:
+                        token_text = "-"
+                    else:
+                        token_text = model.tokenizer.ids_to_tokens([token_id])[0]
+                    # alignment.append(f"{token_text}: {idx}")
+                    alignment.append(f"{token_id}: {frame_idx}")
+                    if frame_idx == prev_frame_idx:
+                        logging.warning(f"----------- same time frame for token -----------")
+                    prev_frame_idx = frame_idx
+            # alignment = [(model.tokenizer.ids_to_text(x[0][1].item()), x[0][2]) for x in candidate.alignments]
             if preds_output_manifest:
                 item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
                         'duration': durations[sample_idx + beams_idx],
@@ -520,9 +535,9 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 context_graph,
                 asr_model,
                 beam_threshold=5,        # 5
-                context_score=5,         # 5
+                context_score=5,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3.0 # 3.0
+                ctc_ali_token_weight=3.0 # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")
@@ -537,17 +552,18 @@ def main(cfg: EvalBeamSearchNGramConfig):
 ################################
 
     # sort all_probs according to length:
-    all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
-    all_probs_sorted = []
-    target_transcripts_sorted = []
-    audio_file_paths_sorted = []
-    for pair in all_probs_with_indeces:
-        all_probs_sorted.append(pair[1])
-        target_transcripts_sorted.append(target_transcripts[pair[0]])
-        audio_file_paths_sorted.append(audio_file_paths[pair[0]])
-    all_probs = all_probs_sorted
-    target_transcripts = target_transcripts_sorted
-    audio_file_paths = audio_file_paths_sorted
+    if cfg.sort_logits:
+        all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
+        all_probs_sorted = []
+        target_transcripts_sorted = []
+        audio_file_paths_sorted = []
+        for pair in all_probs_with_indeces:
+            all_probs_sorted.append(pair[1])
+            target_transcripts_sorted.append(target_transcripts[pair[0]])
+            audio_file_paths_sorted.append(audio_file_paths[pair[0]])
+        all_probs = all_probs_sorted
+        target_transcripts = target_transcripts_sorted
+        audio_file_paths = audio_file_paths_sorted
 
 
     if cfg.decoding_strategy.startswith("greedy"):
