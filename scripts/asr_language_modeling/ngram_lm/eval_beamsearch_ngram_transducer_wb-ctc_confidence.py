@@ -1,0 +1,781 @@
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+"""
+# This script would evaluate an N-gram language model trained with KenLM library (https://github.com/kpu/kenlm) in
+# fusion with beam search decoders on top of a trained ASR Transducer model. NeMo's beam search decoders are capable of using the
+# KenLM's N-gram models to find the best candidates. This script supports both character level and BPE level
+# encodings and models which is detected automatically from the type of the model.
+# You may train the LM model with 'scripts/ngram_lm/train_kenlm.py'.
+
+# Config Help
+
+To discover all arguments of the script, please run :
+python eval_beamsearch_ngram.py --help
+python eval_beamsearch_ngram.py --cfg job
+
+# USAGE
+
+python eval_beamsearch_ngram_transducer.py nemo_model_file=<path to the .nemo file of the model> \
+           input_manifest=<path to the evaluation JSON manifest file \
+           kenlm_model_file=<path to the binary KenLM model> \
+           beam_width=[<list of the beam widths, separated with commas>] \
+           beam_alpha=[<list of the beam alphas, separated with commas>] \
+           preds_output_folder=<optional folder to store the predictions> \
+           probs_cache_file=null \
+           decoding_strategy=<greedy_batch or maes decoding>
+           maes_prefix_alpha=[<list of the maes prefix alphas, separated with commas>] \
+           maes_expansion_gamma=[<list of the maes expansion gammas, separated with commas>] \
+           hat_subtract_ilm=<in case of HAT model: subtract internal LM or not> \
+           hat_ilm_weight=[<in case of HAT model: list of the HAT internal LM weights, separated with commas>] \
+           ...
+
+
+# Grid Search for Hyper parameters
+
+For grid search, you can provide a list of arguments as follows -
+
+           beam_width=[4,8,16,....] \
+           beam_alpha=[-2.0,-1.0,...,1.0,2.0] \
+
+# You may find more info on how to use this script at:
+# https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/asr_language_modeling.html
+
+"""
+
+
+import contextlib
+import json
+import os
+import pickle
+import tempfile
+from dataclasses import dataclass, field, is_dataclass
+from pathlib import Path
+from typing import List, Optional
+
+import editdistance
+import numpy as np
+import torch
+from omegaconf import MISSING, OmegaConf
+from sklearn.model_selection import ParameterGrid
+from tqdm.auto import tqdm
+
+import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.parts.submodules import rnnt_beam_decoding
+from nemo.collections.asr.metrics.rnnt_wer import RNNTDecodingConfig
+from nemo.core.config import hydra_runner
+from nemo.utils import logging
+from nemo.collections.asr.parts.k2.context_graph import ContextGraph
+from nemo.collections.asr.parts.k2.context_graph_ctc import ContextGraphCTC
+from nemo.collections.asr.models import EncDecHybridRNNTCTCModel
+
+from word_boosting_search import recognize_wb
+
+from nemo.collections.asr.parts.utils.asr_confidence_utils import (
+    ConfidenceConfig,
+    ConfidenceConstants,
+    ConfidenceMethodConfig,
+    ConfidenceMethodConstants,
+)
+
+# fmt: off
+
+
+@dataclass
+class EvalBeamSearchNGramConfig:
+    """
+    Evaluate an ASR model with beam search decoding and n-gram KenLM language model.
+    """
+    # # The path of the '.nemo' file of the ASR model or the name of a pretrained model (ngc / huggingface)
+    nemo_model_file: str = MISSING
+
+    # File paths
+    input_manifest: str = MISSING  # The manifest file of the evaluation set
+    kenlm_model_file: Optional[str] = None  # The path of the KenLM binary model file
+    preds_output_folder: Optional[str] = None  # The optional folder where the predictions are stored
+    probs_cache_file: Optional[str] = None  # The cache file for storing the logprobs of the model
+
+    # Parameters for inference
+    acoustic_batch_size: int = 128  # The batch size to calculate log probabilities
+    beam_batch_size: int = 128  # The batch size to be used for beam search decoding
+    device: str = "cuda"  # The device to load the model onto to calculate log probabilities
+    use_amp: bool = False  # Whether to use AMP if available to calculate log probabilities
+    num_workers: int = 1  # Number of workers for DataLoader
+    
+    # for hybrid model
+    decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
+
+    # The decoding scheme to be used for evaluation
+    decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes"]
+
+    # Beam Search hyperparameters
+    beam_width: List[int] = field(default_factory=lambda: [8])  # The width or list of the widths for the beam search decoding
+    beam_alpha: List[float] = field(default_factory=lambda: [0.2])  # The alpha parameter or list of the alphas for the beam search decoding
+
+    maes_prefix_alpha: List[int] = field(default_factory=lambda: [2])  # The maes_prefix_alpha or list of the maes_prefix_alpha for the maes decoding
+    maes_expansion_gamma: List[float] = field(default_factory=lambda: [2.3])  # The maes_expansion_gamma or list of the maes_expansion_gamma for the maes decoding
+
+    # HAT related parameters (only for internal lm subtraction)
+    hat_subtract_ilm: bool = False
+    hat_ilm_weight: List[float] = field(default_factory=lambda: [0.0])
+
+    # Context Biasing:
+    applay_context_biasing: bool = True
+    context_score: float = 4.0  # per token weight for context biasing words
+    context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
+
+    sort_logits: bool = True # do logits sorting before decoding - it reduces computation on puddings
+
+
+    softmax_temperature: float = 1.00
+
+    preserve_alignments: bool = True
+
+
+    decoding: rnnt_beam_decoding.BeamRNNTInferConfig = rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=128)
+    # decoding: RNNTDecodingConfig = RNNTDecodingConfig(beam_size=128)
+
+    use_confidence: bool = True
+    confidence_cfg: ConfidenceConfig = ConfidenceConfig()
+
+
+# fmt: on
+
+
+def merge_alignment_with_wb_hyps(
+    alignment,
+    model,
+    wb_result,
+):
+    
+    alignment_per_frame = []
+    for items in alignment:
+        current_frame_ali = [x[1].item() for x in items]
+        alignment_per_frame.append(current_frame_ali)
+
+    # alignment = [x[0][1].item() for x in alignment]
+
+    # get words borders
+    alignment_tokens = []
+    for idx, frame_ali in enumerate(alignment_per_frame):
+        for token in frame_ali:
+            if token != model.decoder.blank_idx:
+                alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
+
+    if not alignment_tokens:
+        return " ".join([wb_hyp.word for wb_hyp in wb_result])
+
+
+    slash = "▁"
+    word_alignment = []
+    word = ""
+    l, r, = None, None
+    for item in alignment_tokens:
+        if not word:
+            word = item[1][1:]
+            l = item[0]
+            r = item[0]
+        else:
+            if item[1].startswith(slash):
+                word_alignment.append((word, l, r))
+                word = item[1][1:]
+                l = item[0]
+                r = item[0]
+            else:
+                word += item[1]
+                r = item[0]
+    word_alignment.append((word, l, r))
+    ref_text = [item[0] for item in word_alignment]
+    ref_text = " ".join(ref_text)
+    print(f"before: {ref_text}")
+
+    # merge wb_hyps and word alignment:
+    for wb_hyp in wb_result:
+        new_word_alignment = []
+        already_pasted = False
+        lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+        for item in word_alignment:
+            li, ri = item[1], item[2]
+            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+                if not already_pasted:
+                    new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+                    already_pasted = True
+            else:
+                new_word_alignment.append(item)
+        word_alignment = new_word_alignment
+
+    # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
+    boosted_text_list = [item[0] for item in new_word_alignment]
+    boosted_text = " ".join(boosted_text_list)
+    print(f"after : {boosted_text}")
+    
+    return boosted_text
+
+
+def decoding_step(
+    model: nemo_asr.models.ASRModel,
+    cfg: EvalBeamSearchNGramConfig,
+    all_probs: List[torch.Tensor],
+    target_transcripts: List[str],
+    audio_file_paths: List[str],
+    durations: List[str],
+    preds_output_file: str = None,
+    preds_output_manifest: str = None,
+    beam_batch_size: int = 128,
+    progress_bar: bool = True,
+    wb_results: List[dict] = None,
+):
+    level = logging.getEffectiveLevel()
+    logging.setLevel(logging.CRITICAL)
+    # Reset config
+    model.change_decoding_strategy(None)
+
+    cfg.decoding.hat_ilm_weight = cfg.decoding.hat_ilm_weight * cfg.hat_subtract_ilm
+    # Override the beam search config with current search candidate configuration
+    cfg.decoding.return_best_hypothesis = False
+    cfg.decoding.ngram_lm_model = cfg.kenlm_model_file
+    cfg.decoding.hat_subtract_ilm = cfg.hat_subtract_ilm
+
+    # preserve aligmnet:
+    model.cfg.decoding.preserve_alignments = cfg.preserve_alignments
+
+    # Update model's decoding strategy config
+    model.cfg.decoding.strategy = cfg.decoding_strategy
+    model.cfg.decoding.beam = cfg.decoding
+    if cfg.use_confidence:
+        # model.cfg.decoding.preserve_frame_confidence = True
+        model.cfg.decoding.confidence_cfg = cfg.confidence_cfg
+        logging.warning("-------------")
+        logging.warning(f"confidence_cfg is: {model.cfg.decoding.confidence_cfg}")
+
+    # Update model's decoding strategy
+    model.change_decoding_strategy(model.cfg.decoding)
+    logging.setLevel(level)
+
+    wer_dist_first = cer_dist_first = 0
+    wer_dist_best = cer_dist_best = 0
+    words_count = 0
+    chars_count = 0
+    sample_idx = 0
+
+    if preds_output_file:
+        out_file = open(preds_output_file, 'w', encoding='utf_8', newline='\n')
+
+    if preds_output_manifest:
+        out_manifest = open(preds_output_manifest, 'w', encoding='utf_8', newline='\n')
+
+    if progress_bar:
+        if cfg.decoding_strategy.startswith("greedy"):
+            description = "Greedy_batch decoding.."
+        else:
+            description = f"{cfg.decoding_strategy} decoding with bw={cfg.decoding.beam_size}, ba={cfg.decoding.ngram_lm_alpha}, ma={cfg.decoding.maes_prefix_alpha}, mg={cfg.decoding.maes_expansion_gamma}, hat_ilmw={cfg.decoding.hat_ilm_weight}"
+        it = tqdm(range(int(np.ceil(len(all_probs) / beam_batch_size))), desc=description, ncols=120)
+    else:
+        it = range(int(np.ceil(len(all_probs) / beam_batch_size)))
+    for batch_idx in it:
+        # disabling type checking
+        probs_batch = all_probs[batch_idx * beam_batch_size : (batch_idx + 1) * beam_batch_size]
+        probs_lens = torch.tensor([prob.shape[-1] for prob in probs_batch])
+        with torch.no_grad():
+            packed_batch = torch.zeros(len(probs_batch), probs_batch[0].shape[0], max(probs_lens), device='cpu')
+
+            for prob_index in range(len(probs_batch)):
+                packed_batch[prob_index, :, : probs_lens[prob_index]] = torch.tensor(
+                    probs_batch[prob_index].unsqueeze(0), device=packed_batch.device, dtype=packed_batch.dtype
+                )
+            best_hyp_batch, beams_batch = model.decoding.rnnt_decoder_predictions_tensor(
+                packed_batch, probs_lens, return_hypotheses=True,
+            )
+        if cfg.decoding_strategy.startswith("greedy"):
+            beams_batch = [[x] for x in best_hyp_batch]
+
+        for beams_idx, beams in enumerate(beams_batch):
+            target = target_transcripts[sample_idx + beams_idx]
+            target_split_w = target.split()
+            target_split_c = list(target)
+            words_count += len(target_split_w)
+            chars_count += len(target_split_c)
+            wer_dist_min = cer_dist_min = 10000
+            audio_id = os.path.basename(audio_file_paths[sample_idx + beams_idx])
+            for candidate_idx, candidate in enumerate(beams):  # type: (int, rnnt_beam_decoding.rnnt_utils.Hypothesis)
+                
+                ###################################
+                if cfg.applay_context_biasing and wb_results[audio_file_paths[sample_idx + beams_idx]]:
+                    
+                    # make new text by mearging alignment with ctc-wb predictions:
+                    print("----")
+                    boosted_text = merge_alignment_with_wb_hyps(
+                        candidate.alignments,
+                        model,
+                        wb_results[audio_file_paths[sample_idx + beams_idx]]
+                    )
+                    pred_text = boosted_text
+                    beams[0].text = pred_text
+                    print(f"ref   : {target}")
+                    print("\n" + audio_file_paths[sample_idx + beams_idx])
+                else:
+                    pred_text = candidate.text
+                
+                #######################################
+
+                # pred_text = candidate.text
+                pred_split_w = pred_text.split()
+                wer_dist = editdistance.eval(target_split_w, pred_split_w)
+                pred_split_c = list(pred_text)
+                cer_dist = editdistance.eval(target_split_c, pred_split_c)
+
+                wer_dist_min = min(wer_dist_min, wer_dist)
+                cer_dist_min = min(cer_dist_min, cer_dist)
+
+                if candidate_idx == 0:
+                    # first candidate
+                    wer_dist_tosave = wer_dist
+                    wer_dist_first += wer_dist
+                    cer_dist_first += cer_dist
+
+                score = candidate.score
+                if preds_output_file:
+                    
+                    out_file.write('{}\t{}\t{}\n'.format(audio_id, pred_text, score))
+
+                    #out_file.write('{}\t{}\n'.format(pred_text, score))
+            wer_dist_best += wer_dist_min
+            cer_dist_best += cer_dist_min
+
+            # write manifest with prediction results
+            alignment = []
+            if cfg.preserve_alignments:
+                prev_frame_idx = None
+                for i, items in enumerate(candidate.alignments):
+                    # token_id = item[0][1].item()
+                    token_id = [x[1].item() for x in items]
+                    # frame_idx = item[0][2]
+                    frame_idx = [x[2] for x in items]
+                    # if token_id == model.decoder.blank_idx:
+                    #     token_text = "-"
+                    # else:
+                    #     token_text = model.tokenizer.ids_to_tokens([token_id])[0]
+                    # alignment.append(f"{i}: {token_text}")
+                    alignment.append(f"{token_id}: {frame_idx}")
+                    # if frame_idx == prev_frame_idx:
+                    #     logging.warning(f"----------- same time frame for token -----------")
+                    # prev_frame_idx = frame_idx
+            ## alignment = [(model.tokenizer.ids_to_text(x[0][1].item()), x[0][2]) for x in candidate.alignments]
+
+            frame_confidence = []
+            if cfg.use_confidence:
+                frame_confidence = [f"{i}: {round(x[0], 3)}" for i, x in enumerate(candidate.frame_confidence)]
+
+            if preds_output_manifest:
+                item = {'audio_filepath': audio_file_paths[sample_idx + beams_idx],
+                        'duration': durations[sample_idx + beams_idx],
+                        'text': target_transcripts[sample_idx + beams_idx],
+                        'pred_text': beams[0].text,
+                        'wer': f"{wer_dist_tosave/len(target_split_w):.3f}",
+                        'alignment': f"{alignment}",
+                        'confidence': f"{frame_confidence}",
+                        'timestep': f"{beams[0].timestep}"}
+                out_manifest.write(json.dumps(item) + "\n")
+        
+        sample_idx += len(probs_batch)
+
+    if cfg.decoding_strategy.startswith("greedy"):
+        return wer_dist_first / words_count, cer_dist_first / chars_count
+
+    if preds_output_file:
+        out_file.close()
+        logging.info(f"Stored the predictions of {cfg.decoding_strategy} decoding at '{preds_output_file}'.")
+
+    if cfg.decoding.ngram_lm_model:
+        logging.info(
+            f"WER/CER with {cfg.decoding_strategy} decoding and N-gram model = {wer_dist_first / words_count:.2%}/{cer_dist_first / chars_count:.2%}"
+        )
+    else:
+        logging.info(
+            f"WER/CER with {cfg.decoding_strategy} decoding = {wer_dist_first / words_count:.2%}/{cer_dist_first / chars_count:.2%}"
+        )
+    logging.info(
+        f"Oracle WER/CER in candidates with perfect LM= {wer_dist_best / words_count:.2%}/{cer_dist_best / chars_count:.2%}"
+    )
+    logging.info(f"=================================================================================")
+
+    return wer_dist_first / words_count, cer_dist_first / chars_count
+
+
+@hydra_runner(config_path=None, config_name='EvalBeamSearchNGramConfig', schema=EvalBeamSearchNGramConfig)
+def main(cfg: EvalBeamSearchNGramConfig):
+    if is_dataclass(cfg):
+        cfg = OmegaConf.structured(cfg)  # type: EvalBeamSearchNGramConfig
+
+    valid_decoding_strategis = ["greedy", "greedy_batch", "beam", "tsd", "alsd", "maes"]
+    if cfg.decoding_strategy not in valid_decoding_strategis:
+        raise ValueError(
+            f"Given decoding_strategy={cfg.decoding_strategy} is invalid. Available options are :\n"
+            f"{valid_decoding_strategis}"
+        )
+
+    if cfg.nemo_model_file.endswith('.nemo'):
+        asr_model = nemo_asr.models.ASRModel.restore_from(cfg.nemo_model_file, map_location=torch.device(cfg.device))
+        # asr_model.change_attention_model(self_attention_model="rel_pos_local_attn", att_context_size=[128, 128])
+    else:
+        logging.warning(
+            "nemo_model_file does not end with .nemo, therefore trying to load a pretrained model with this name."
+        )
+        asr_model = nemo_asr.models.ASRModel.from_pretrained(
+            cfg.nemo_model_file, map_location=torch.device(cfg.device)
+        )
+
+    if cfg.kenlm_model_file:
+        if not os.path.exists(cfg.kenlm_model_file):
+            raise FileNotFoundError(f"Could not find the KenLM model file '{cfg.kenlm_model_file}'.")
+        if cfg.decoding_strategy != "maes":
+            raise ValueError(f"Decoding with kenlm model is supported only for maes decoding algorithm.")
+        lm_path = cfg.kenlm_model_file
+    else:
+        lm_path = None
+        cfg.beam_alpha = [0.0]
+    if cfg.hat_subtract_ilm:
+        assert lm_path, "kenlm must be set for hat internal lm subtraction"
+
+    if cfg.decoding_strategy != "maes":
+        cfg.maes_prefix_alpha, cfg.maes_expansion_gamma, cfg.hat_ilm_weight = [0], [0], [0]
+
+    target_transcripts = []
+    durations = []
+    manifest_dir = Path(cfg.input_manifest).parent
+    with open(cfg.input_manifest, 'r', encoding='utf_8') as manifest_file:
+        audio_file_paths = []
+        for line in tqdm(manifest_file, desc=f"Reading Manifest {cfg.input_manifest} ...", ncols=120):
+            data = json.loads(line)
+            audio_file = Path(data['audio_filepath'])
+            if not audio_file.is_file() and not audio_file.is_absolute():
+                audio_file = manifest_dir / audio_file
+            target_transcripts.append(data['text'])
+            durations.append(data['duration'])
+            audio_file_paths.append(str(audio_file.absolute()))
+
+    if cfg.probs_cache_file and os.path.exists(cfg.probs_cache_file):
+        logging.info(f"Found a pickle file of probabilities at '{cfg.probs_cache_file}'.")
+        logging.info(f"Loading the cached pickle file of probabilities from '{cfg.probs_cache_file}' ...")
+        with open(cfg.probs_cache_file, 'rb') as probs_file:
+            all_probs = pickle.load(probs_file)
+
+        if len(all_probs) != len(audio_file_paths):
+            raise ValueError(
+                f"The number of samples in the probabilities file '{cfg.probs_cache_file}' does not "
+                f"match the manifest file. You may need to delete the probabilities cached file."
+            )
+    else:
+
+        @contextlib.contextmanager
+        def default_autocast():
+            yield
+
+        if cfg.use_amp:
+            if torch.cuda.is_available() and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+                logging.info("AMP is enabled!\n")
+                autocast = torch.cuda.amp.autocast
+
+            else:
+                autocast = default_autocast
+        else:
+
+            autocast = default_autocast
+
+        # manual calculation of encoder_embeddings
+        with autocast():
+            with torch.no_grad():
+                asr_model.eval()
+                asr_model.encoder.freeze()
+                device = next(asr_model.parameters()).device
+                all_probs = []
+                ctc_logprobs = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
+                        for audio_file in audio_file_paths:
+                            entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
+                            fp.write(json.dumps(entry) + '\n')
+                    config = {
+                        'paths2audio_files': audio_file_paths,
+                        'batch_size': cfg.acoustic_batch_size,
+                        'temp_dir': tmpdir,
+                        'num_workers': cfg.num_workers,
+                        'channel_selector': None,
+                        'augmentor': None,
+                    }
+                    temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
+                    # logging.warning("Getting encoder and CTC decoder outputs...")
+                    for test_batch in tqdm(temporary_datalayer, desc="Getting encoder and CTC decoder outputs...", disable=False):
+                        encoded, encoded_len = asr_model.forward(
+                            input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
+                        )
+                        ctc_dec_outputs = asr_model.ctc_decoder(encoder_output=encoded).cpu()
+                        # logging.warning("-"*100)
+                        # logging.warning(f"encoded.shape is: {encoded.shape}")
+                        # logging.warning(f"ctc_dec_outputs.shape is: {ctc_dec_outputs.shape}")
+                        # raise KeyError
+                        # dump encoder embeddings per file
+                        for idx in range(encoded.shape[0]):
+                            encoded_no_pad = encoded[idx, :, : encoded_len[idx]]
+                            ctc_dec_outputs_no_pad = ctc_dec_outputs[idx, : encoded_len[idx]]
+                            all_probs.append(encoded_no_pad)
+                            ctc_logprobs.append(ctc_dec_outputs_no_pad)
+
+        if cfg.probs_cache_file:
+            logging.info(f"Writing pickle files of probabilities at '{cfg.probs_cache_file}'...")
+            with open(cfg.probs_cache_file, 'wb') as f_dump:
+                pickle.dump(all_probs, f_dump)
+
+################################
+
+    wb_results = {}
+    if cfg.applay_context_biasing:
+        # load context graph:
+        context_transcripts = []
+        for line in open(cfg.context_file).readlines():
+            word = line.strip().lower()
+            context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+
+        context_graph = ContextGraphCTC(blank_id=asr_model.decoder.blank_idx)
+        context_graph.build(context_transcripts)
+
+        # # get CTC logits:
+        # logging.warning("Getting CTC logprobs for CTC based word boosting...")
+        # with autocast():
+        #     with torch.no_grad():
+        #         if isinstance(asr_model, EncDecHybridRNNTCTCModel):
+        #             asr_model.cur_decoder = 'ctc'
+        #         ctc_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
+
+        # run WB search:
+        for idx, logits in tqdm(enumerate(ctc_logprobs), desc=f"CTC based word boosting...", ncols=120, total=len(ctc_logprobs)):
+            # try:
+            wb_result = recognize_wb(
+                logits.numpy(),
+                context_graph,
+                asr_model,
+                beam_threshold=5,        # 5
+                context_score=5,         # 5 (4)
+                keyword_thr=-5,          # -5
+                ctc_ali_token_weight=3.0 # 3.0 (4.0)
+            )
+            # except:
+            #     logging.warning("-------------------------")
+            #     logging.warning(f"audio file is: {audio_file_paths[idx]}")
+            wb_results[audio_file_paths[idx]] = wb_result
+            print(audio_file_paths[idx] + "\n")
+        
+
+    # get RNNT results:
+
+################
+    # confidence config:
+    if cfg.use_confidence:
+        cfg.confidence_cfg = ConfidenceConfig(
+            preserve_frame_confidence=True, # Internally set to true if preserve_token_confidence == True
+            # or preserve_word_confidence == True
+            preserve_token_confidence=False, # Internally set to true if preserve_word_confidence == True
+            preserve_word_confidence=False,
+            aggregation="min", # How to aggregate frame scores to token scores and token scores to word scores
+            exclude_blank=True, # If true, only non-blank emissions contribute to confidence scores
+            method_cfg=ConfidenceMethodConfig( # Config for per-frame scores calculation (before aggregation)
+                name="max_prob", # Or "entropy" (default), which usually works better
+                entropy_type="gibbs", # Used only for name == "entropy". Recommended: "tsallis" (default) or "renyi"
+                alpha=0.5, # Low values (<1) increase sensitivity, high values decrease sensitivity
+                entropy_norm="lin" # How to normalize (map to [0,1]) entropy. Default: "exp"
+            )
+        )
+        # logging.warning("-------------")
+        # logging.warning(f"confidence_cfg is: {cfg.confidence_cfg}")
+        # raise KeyError
+
+
+################################
+
+    # sort all_probs according to length:
+    if cfg.sort_logits:
+        all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
+        all_probs_sorted = []
+        target_transcripts_sorted = []
+        audio_file_paths_sorted = []
+        for pair in all_probs_with_indeces:
+            all_probs_sorted.append(pair[1])
+            target_transcripts_sorted.append(target_transcripts[pair[0]])
+            audio_file_paths_sorted.append(audio_file_paths[pair[0]])
+        all_probs = all_probs_sorted
+        target_transcripts = target_transcripts_sorted
+        audio_file_paths = audio_file_paths_sorted
+
+
+    if cfg.decoding_strategy.startswith("greedy"):
+        asr_model = asr_model.to('cpu')
+        preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")
+        preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
+        candidate_wer, candidate_cer = decoding_step(
+            asr_model,
+            cfg,
+            all_probs=all_probs,
+            target_transcripts=target_transcripts,
+            audio_file_paths=audio_file_paths,
+            durations=durations,
+            beam_batch_size=cfg.beam_batch_size,
+            progress_bar=True,
+            preds_output_file=preds_output_file,
+            preds_output_manifest=preds_output_manifest,
+            wb_results=wb_results,
+        )
+        logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
+
+    # asr_model = asr_model.to('cpu')
+
+    # # 'greedy_batch' decoding_strategy would skip the beam search decoding
+    # if cfg.decoding_strategy in ["beam", "tsd", "alsd", "maes"]:
+    #     if cfg.beam_width is None or cfg.beam_alpha is None:
+    #         raise ValueError("beam_width and beam_alpha are needed to perform beam search decoding.")
+    #     params = {
+    #         'beam_width': cfg.beam_width,
+    #         'beam_alpha': cfg.beam_alpha,
+    #         'maes_prefix_alpha': cfg.maes_prefix_alpha,
+    #         'maes_expansion_gamma': cfg.maes_expansion_gamma,
+    #         'hat_ilm_weight': cfg.hat_ilm_weight,
+    #     }
+    #     hp_grid = ParameterGrid(params)
+    #     hp_grid = list(hp_grid)
+
+    #     best_wer_beam_size, best_cer_beam_size = None, None
+    #     best_wer_alpha, best_cer_alpha = None, None
+    #     best_wer, best_cer = 1e6, 1e6
+
+    #     logging.info(
+    #         f"==============================Starting the {cfg.decoding_strategy} decoding==============================="
+    #     )
+    #     logging.info(f"Grid search size: {len(hp_grid)}")
+    #     logging.info(f"It may take some time...")
+    #     logging.info(f"==============================================================================================")
+
+    #     # context biasing:
+    #     if cfg.context_file:
+    #         context_transcripts = []
+    #         for line in open(cfg.context_file).readlines():
+    #             word = line.strip().lower()
+    #             context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+    #         # for word in cfg.context_str.split('_'):
+    #         #     context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+    #         cfg.decoding.cb_score = cfg.context_score
+    #         cfg.decoding.cb_words = context_transcripts
+
+    #         cfg.decoding.softmax_temperature = cfg.softmax_temperature
+
+    #         # logging.warning(f"{context_transcripts}")
+    #         # raise Exception
+
+    #         # # with bpe dropout:
+    #         # kwl_set = set()
+    #         # context_transcripts = []
+
+    #         # sow_symbol = asr_model.tokenizer.tokens_to_ids(['▁'])[0]
+
+    #         # for line in open(cfg.context_file).readlines():
+    #         #     word = line.strip().lower()
+    #         #     tokenization = asr_model.tokenizer.tokenizer.encode(word) # , out_type=str
+    #         #     kwl_set.add(str(tokenization))
+    #         #     context_transcripts.append(tokenization)
+                
+    #         #     for _ in range(50):
+    #         #         tokenization = asr_model.tokenizer.tokenizer.encode(word, enable_sampling=True, alpha=0.1, nbest_size=-1)
+    #         #         if tokenization[0] != sow_symbol:
+    #         #             tokenization_str = str(tokenization)
+    #         #             if tokenization_str not in kwl_set:
+    #         #                 kwl_set.add(tokenization_str)
+    #         #                 context_transcripts.append(tokenization)
+
+    #         # cfg.decoding.cb_score = cfg.context_score
+    #         # cfg.decoding.cb_words = context_transcripts
+
+        
+        
+    #     if cfg.preds_output_folder and not os.path.exists(cfg.preds_output_folder):
+    #         os.mkdir(cfg.preds_output_folder)
+    #     for hp in hp_grid:
+    #         if cfg.preds_output_folder:
+    #             results_file = f"preds_out_{cfg.decoding_strategy}_bw{hp['beam_width']}"
+    #             if cfg.decoding_strategy == "maes":
+    #                 results_file = f"{results_file}_ma{hp['maes_prefix_alpha']}_mg{hp['maes_expansion_gamma']}"
+    #                 if cfg.kenlm_model_file:
+    #                     results_file = f"{results_file}_ba{hp['beam_alpha']}"
+    #                     if cfg.hat_subtract_ilm:
+    #                         results_file = f"{results_file}_hat_ilmw{hp['hat_ilm_weight']}"
+    #             preds_output_file = os.path.join(cfg.preds_output_folder, f"{results_file}.tsv")
+    #             preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
+    #         else:
+    #             preds_output_file = None
+
+    #         cfg.decoding.beam_size = hp["beam_width"]
+    #         cfg.decoding.ngram_lm_alpha = hp["beam_alpha"]
+    #         cfg.decoding.maes_prefix_alpha = hp["maes_prefix_alpha"]
+    #         cfg.decoding.maes_expansion_gamma = hp["maes_expansion_gamma"]
+    #         cfg.decoding.hat_ilm_weight = hp["hat_ilm_weight"]
+
+    #         candidate_wer, candidate_cer = decoding_step(
+    #             asr_model,
+    #             cfg,
+    #             all_probs=all_probs,
+    #             target_transcripts=target_transcripts,
+    #             audio_file_paths=audio_file_paths,
+    #             durations=durations,
+    #             preds_output_file=preds_output_file,
+    #             preds_output_manifest=preds_output_manifest,
+    #             beam_batch_size=cfg.beam_batch_size,
+    #             progress_bar=True,
+    #         )
+
+    #         if candidate_cer < best_cer:
+    #             best_cer_beam_size = hp["beam_width"]
+    #             best_cer_alpha = hp["beam_alpha"]
+    #             best_cer_ma = hp["maes_prefix_alpha"]
+    #             best_cer_mg = hp["maes_expansion_gamma"]
+    #             best_cer_hat_ilm_weight = hp["hat_ilm_weight"]
+    #             best_cer = candidate_cer
+
+    #         if candidate_wer < best_wer:
+    #             best_wer_beam_size = hp["beam_width"]
+    #             best_wer_alpha = hp["beam_alpha"]
+    #             best_wer_ma = hp["maes_prefix_alpha"]
+    #             best_wer_ga = hp["maes_expansion_gamma"]
+    #             best_wer_hat_ilm_weight = hp["hat_ilm_weight"]
+    #             best_wer = candidate_wer
+
+    #     wer_hat_parameter = ""
+    #     if cfg.hat_subtract_ilm:
+    #         wer_hat_parameter = f"HAT ilm weight = {best_wer_hat_ilm_weight}, "
+    #     logging.info(
+    #         f'Best WER Candidate = {best_wer:.2%} :: Beam size = {best_wer_beam_size}, '
+    #         f'Beam alpha = {best_wer_alpha}, {wer_hat_parameter}'
+    #         f'maes_prefix_alpha = {best_wer_ma}, maes_expansion_gamma = {best_wer_ga} '
+    #     )
+
+    #     cer_hat_parameter = ""
+    #     if cfg.hat_subtract_ilm:
+    #         cer_hat_parameter = f"HAT ilm weight = {best_cer_hat_ilm_weight}"
+    #     logging.info(
+    #         f'Best CER Candidate = {best_cer:.2%} :: Beam size = {best_cer_beam_size}, '
+    #         f'Beam alpha = {best_cer_alpha}, {cer_hat_parameter} '
+    #         f'maes_prefix_alpha = {best_cer_ma}, maes_expansion_gamma = {best_cer_mg}'
+    #     )
+    #     logging.info(f"=================================================================================")
+
+
+if __name__ == '__main__':
+    main()
