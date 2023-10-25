@@ -277,7 +277,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         ),
                         preserve_alignments=self.preserve_alignments,
                         preserve_frame_confidence=self.preserve_frame_confidence,
-                        confidence_measure_cfg=self.confidence_measure_cfg,
+                        confidence_method_cfg=self.confidence_method_cfg,
                     )
                 else:
                     self.decoding = greedy_decode.GreedyTDTInfer(
@@ -291,7 +291,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         ),
                         preserve_alignments=self.preserve_alignments,
                         preserve_frame_confidence=self.preserve_frame_confidence,
-                        confidence_measure_cfg=self.confidence_measure_cfg,
+                        confidence_method_cfg=self.confidence_method_cfg,
                     )
             else:
                 self.decoding = greedy_decode.GreedyMultiblankRNNTInfer(
@@ -304,7 +304,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                     ),
                     preserve_alignments=self.preserve_alignments,
                     preserve_frame_confidence=self.preserve_frame_confidence,
-                    confidence_measure_cfg=self.confidence_measure_cfg,
+                    confidence_method_cfg=self.confidence_method_cfg,
                 )
 
         elif self.cfg.strategy == 'greedy_batch':
@@ -320,7 +320,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         ),
                         preserve_alignments=self.preserve_alignments,
                         preserve_frame_confidence=self.preserve_frame_confidence,
-                        confidence_measure_cfg=self.confidence_measure_cfg,
+                        confidence_method_cfg=self.confidence_method_cfg,
                     )
                 else:
                     self.decoding = greedy_decode.GreedyBatchedTDTInfer(
@@ -334,7 +334,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         ),
                         preserve_alignments=self.preserve_alignments,
                         preserve_frame_confidence=self.preserve_frame_confidence,
-                        confidence_measure_cfg=self.confidence_measure_cfg,
+                        confidence_method_cfg=self.confidence_method_cfg,
                     )
 
             else:
@@ -348,7 +348,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                     ),
                     preserve_alignments=self.preserve_alignments,
                     preserve_frame_confidence=self.preserve_frame_confidence,
-                    confidence_measure_cfg=self.confidence_measure_cfg,
+                    confidence_method_cfg=self.confidence_method_cfg,
                 )
 
         elif self.cfg.strategy == 'beam':

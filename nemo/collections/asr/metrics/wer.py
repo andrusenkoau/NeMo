@@ -389,7 +389,7 @@ class AbstractCTCDecoding(ConfidenceMixin):
                 preserve_alignments=self.preserve_alignments,
                 compute_timestamps=self.compute_timestamps,
                 preserve_frame_confidence=self.preserve_frame_confidence,
-                confidence_measure_cfg=self.confidence_measure_cfg,
+                confidence_method_cfg=self.confidence_method_cfg,
             )
 
         elif self.cfg.strategy == 'beam':

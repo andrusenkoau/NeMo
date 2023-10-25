@@ -155,24 +155,34 @@ class EvalBeamSearchNGramConfig:
 
 
 def merge_alignment_with_wb_hyps(
-    alignment,
+    candidate,
     model,
     wb_result,
 ):
     
+    alignment = candidate.alignments
     alignment_per_frame = []
     for items in alignment:
         current_frame_ali = [x[1].item() for x in items]
+        # logging.warning("-----"*10)
+        # logging.warning(current_frame_ali)
         alignment_per_frame.append(current_frame_ali)
+
+    frame_confidence = []
+    for items in candidate.frame_confidence:
+        # current_frame_confidence = [x for x in items]
+        frame_confidence.append(items)
+
+    assert len(alignment_per_frame) == len(frame_confidence)
 
     # alignment = [x[0][1].item() for x in alignment]
 
     # get words borders
     alignment_tokens = []
     for idx, frame_ali in enumerate(alignment_per_frame):
-        for token in frame_ali:
+        for idy, token in enumerate(frame_ali):
             if token != model.decoder.blank_idx:
-                alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
+                alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0], frame_confidence[idx][idy]])
 
     if not alignment_tokens:
         return " ".join([wb_hyp.word for wb_hyp in wb_result])
@@ -187,23 +197,26 @@ def merge_alignment_with_wb_hyps(
             word = item[1][1:]
             l = item[0]
             r = item[0]
+            word_confidence = [item[2]]
         else:
             if item[1].startswith(slash):
-                word_alignment.append((word, l, r))
+                word_alignment.append((word, l, r, word_confidence))
                 word = item[1][1:]
                 l = item[0]
                 r = item[0]
+                word_confidence = [item[2]]
             else:
                 word += item[1]
                 r = item[0]
-    word_alignment.append((word, l, r))
+                word_confidence.append(item[2])
+    word_alignment.append((word, l, r, word_confidence))
     ref_text = [item[0] for item in word_alignment]
     ref_text = " ".join(ref_text)
-    print(f"before: {ref_text}")
 
     # merge wb_hyps and word alignment:
     for wb_hyp in wb_result:
         new_word_alignment = []
+        rnnt_spot_info = []
         already_pasted = False
         lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
         for item in word_alignment:
@@ -212,13 +225,17 @@ def merge_alignment_with_wb_hyps(
                 if not already_pasted:
                     new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
                     already_pasted = True
+                rnnt_spot_info.append([item[0], item[3]])
             else:
                 new_word_alignment.append(item)
         word_alignment = new_word_alignment
+        print(f"wb_hyp: {wb_hyp.word}")
+        print(f"spot info: {rnnt_spot_info}")
 
     # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
     boosted_text_list = [item[0] for item in new_word_alignment]
     boosted_text = " ".join(boosted_text_list)
+    print(f"before: {ref_text}")
     print(f"after : {boosted_text}")
     
     return boosted_text
@@ -317,7 +334,7 @@ def decoding_step(
                     # make new text by mearging alignment with ctc-wb predictions:
                     print("----")
                     boosted_text = merge_alignment_with_wb_hyps(
-                        candidate.alignments,
+                        candidate,
                         model,
                         wb_results[audio_file_paths[sample_idx + beams_idx]]
                     )
@@ -585,21 +602,20 @@ def main(cfg: EvalBeamSearchNGramConfig):
     if cfg.use_confidence:
         cfg.confidence_cfg = ConfidenceConfig(
             preserve_frame_confidence=True, # Internally set to true if preserve_token_confidence == True
-            # or preserve_word_confidence == True
-            preserve_token_confidence=False, # Internally set to true if preserve_word_confidence == True
-            preserve_word_confidence=False,
-            aggregation="min", # How to aggregate frame scores to token scores and token scores to word scores
-            exclude_blank=True, # If true, only non-blank emissions contribute to confidence scores
-            method_cfg=ConfidenceMethodConfig( # Config for per-frame scores calculation (before aggregation)
-                name="max_prob", # Or "entropy" (default), which usually works better
-                entropy_type="gibbs", # Used only for name == "entropy". Recommended: "tsallis" (default) or "renyi"
-                alpha=0.5, # Low values (<1) increase sensitivity, high values decrease sensitivity
-                entropy_norm="lin" # How to normalize (map to [0,1]) entropy. Default: "exp"
             )
-        )
-        # logging.warning("-------------")
-        # logging.warning(f"confidence_cfg is: {cfg.confidence_cfg}")
-        # raise KeyError
+        # cfg.confidence_cfg = ConfidenceConfig(
+        #     preserve_frame_confidence=True, # Internally set to true if preserve_token_confidence == True
+        #     # or preserve_word_confidence == True
+        #     preserve_token_confidence=False, # Internally set to true if preserve_word_confidence == True
+        #     preserve_word_confidence=False,
+        #     aggregation="min", # How to aggregate frame scores to token scores and token scores to word scores
+        #     exclude_blank=True, # If true, only non-blank emissions contribute to confidence scores
+        #     method_cfg=ConfidenceMethodConfig( # Config for per-frame scores calculation (before aggregation)
+        #         name="max_prob", # Or "entropy" (default), which usually works better
+        #         entropy_type="gibbs", # Used only for name == "entropy". Recommended: "tsallis" (default) or "renyi"
+        #         alpha=0.5, # Low values (<1) increase sensitivity, high values decrease sensitivity
+        #         entropy_norm="lin" # How to normalize (map to [0,1]) entropy. Default: "exp"
+        #     )
 
 
 ################################

@@ -1566,6 +1566,7 @@ class BeamRNNTInferConfig:
     language_model: Optional[Dict[str, Any]] = None
     softmax_temperature: float = 1.0
     preserve_alignments: bool = False
+    preserve_frame_confidence: bool = True
     ngram_lm_model: Optional[str] = None
     ngram_lm_alpha: Optional[float] = 0.0
     hat_subtract_ilm: bool = False
