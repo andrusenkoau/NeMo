@@ -200,22 +200,41 @@ def merge_alignment_with_wb_hyps(
     word_alignment.append((word, l, r))
     ref_text = [item[0] for item in word_alignment]
     ref_text = " ".join(ref_text)
+    print(f"rnnt_word_alignment: {word_alignment}")
 
     # merge wb_hyps and word alignment:
     for wb_hyp in wb_result:
         new_word_alignment = []
         already_pasted = False
-        lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+        # lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+        wb_interval = set(range(wb_hyp.start_frame, wb_hyp.end_frame+1))
         for item in word_alignment:
-            li, ri = item[1], item[2]
-            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+            # li, ri = item[1], item[2]
+            item_interval = set(range(item[1], item[2]+1))
+            intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
+            if intersection_part >= 40:
                 if not already_pasted:
                     new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
                     already_pasted = True
             else:
                 new_word_alignment.append(item)
         word_alignment = new_word_alignment
-        print(f"wb_hyp: {wb_hyp.word}")
+        print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
+
+    # for wb_hyp in wb_result:
+    #     new_word_alignment = []
+    #     already_pasted = False
+    #     lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+    #     for item in word_alignment:
+    #         li, ri = item[1], item[2]
+    #         if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+    #             if not already_pasted:
+    #                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+    #                 already_pasted = True
+    #         else:
+    #             new_word_alignment.append(item)
+    #     word_alignment = new_word_alignment
+    #     print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
 
     # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
     boosted_text_list = [item[0] for item in new_word_alignment]
@@ -503,16 +522,12 @@ def main(cfg: EvalBeamSearchNGramConfig):
                         'augmentor': None,
                     }
                     temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
-                    # logging.warning("Getting encoder and CTC decoder outputs...")
+
                     for test_batch in tqdm(temporary_datalayer, desc="Getting encoder and CTC decoder outputs...", disable=False):
                         encoded, encoded_len = asr_model.forward(
                             input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
                         )
                         ctc_dec_outputs = asr_model.ctc_decoder(encoder_output=encoded).cpu()
-                        # logging.warning("-"*100)
-                        # logging.warning(f"encoded.shape is: {encoded.shape}")
-                        # logging.warning(f"ctc_dec_outputs.shape is: {ctc_dec_outputs.shape}")
-                        # raise KeyError
                         # dump encoder embeddings per file
                         for idx in range(encoded.shape[0]):
                             encoded_no_pad = encoded[idx, :, : encoded_len[idx]]
@@ -549,7 +564,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 beam_threshold=5,        # 5
                 context_score=5,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3 # 3.0 (4.0)
+                ctc_ali_token_weight=3.0 # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")
