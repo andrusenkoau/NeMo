@@ -141,6 +141,7 @@ def filter_wb_hyps(best_hyp_list, word_alignment):
             li, ri = item[1], item[2]
             if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
                 if hyp.score >= item[3]:
+                # if hyp.score >= item[3] and not item[0].startswith(hyp.word):
                     best_hyp_list_new.append(hyp)
                 current_frame = i
                 break
@@ -170,7 +171,17 @@ def filter_wb_hyps(best_hyp_list, word_alignment):
 #     return best_hyp_list_new
 
 
-def recognize_wb(logprobs, context_graph, asr_model, beam_threshold=None, context_score=0.0, keyword_thr=-3, ctc_ali_token_weight=2.0):
+def recognize_wb(
+        logprobs,
+        context_graph,
+        asr_model,
+        beam_threshold=None,
+        context_score=0.0,
+        keyword_thr=-3,
+        ctc_ali_token_weight=2.0,
+        print_results=False
+    ):
+
     start_state = context_graph.root
     active_tokens = []
     next_tokens = []
@@ -231,16 +242,18 @@ def recognize_wb(logprobs, context_graph, asr_model, beam_threshold=None, contex
 
     # find best hyp for spotted keywords:
     best_hyp_list = find_best_hyp(spotted_words)
-    print(f"---spotted words:")
-    for hyp in best_hyp_list:
-        print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
+    if print_results:
+        print(f"---spotted words:")
+        for hyp in best_hyp_list:
+            print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
     
     # filter wb hyps according to greedy ctc predictions
     ctc_word_alignment = get_ctc_word_alignment(logprobs, asr_model, token_weight=ctc_ali_token_weight)
     best_hyp_list_new = filter_wb_hyps(best_hyp_list, ctc_word_alignment)
-    print("---final result is:")
-    for hyp in best_hyp_list_new:
-        print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
+    if print_results:
+        print("---final result is:")
+        for hyp in best_hyp_list_new:
+            print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
 
 
     return best_hyp_list_new
