@@ -203,23 +203,63 @@ def merge_alignment_with_wb_hyps(
     print(f"rnnt_word_alignment: {word_alignment}")
 
     # merge wb_hyps and word alignment:
+
     for wb_hyp in wb_result:
         new_word_alignment = []
-        already_pasted = False
+        already_inserted = False
         # lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
         wb_interval = set(range(wb_hyp.start_frame, wb_hyp.end_frame+1))
         for item in word_alignment:
-            # li, ri = item[1], item[2]
+            li, ri = item[1], item[2]
             item_interval = set(range(item[1], item[2]+1))
-            intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
-            if intersection_part >= 40:
-                if not already_pasted:
+            if wb_hyp.start_frame < li:
+                if not already_inserted:
                     new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
-                    already_pasted = True
-            else:
+                    already_inserted = True
+
+            intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
+            if intersection_part < 30:
                 new_word_alignment.append(item)
+            elif not already_inserted:
+                new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+                already_inserted = True
+        # insert last wb word:
+        if not already_inserted:
+            new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+
+
+
+
+
+
+            # item_interval = set(range(item[1], item[2]+1))
+            # intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
+            # if intersection_part >= 40:
+            #     if not already_inserted:
+            #         new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+            #         already_inserted = True
+            # else:
+            #     new_word_alignment.append(item)
         word_alignment = new_word_alignment
         print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
+
+    # for wb_hyp in wb_result:
+    #     new_word_alignment = []
+    #     already_inserted = False
+    #     # lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+    #     wb_interval = set(range(wb_hyp.start_frame, wb_hyp.end_frame+1))
+    #     for item in word_alignment:
+    #         # li, ri = item[1], item[2]
+    #         item_interval = set(range(item[1], item[2]+1))
+    #         intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
+    #         if intersection_part >= 40:
+    #             if not already_inserted:
+    #                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+    #                 already_inserted = True
+    #         else:
+    #             new_word_alignment.append(item)
+    #     word_alignment = new_word_alignment
+    #     print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
 
     # for wb_hyp in wb_result:
     #     new_word_alignment = []
@@ -564,7 +604,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 beam_threshold=5,        # 5
                 context_score=5,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3.0 # 3.0 (4.0)
+                ctc_ali_token_weight=3.5 # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")
