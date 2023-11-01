@@ -11,6 +11,7 @@ class ContextState:
         self,
         index: int,
         is_end: bool,
+        token_index: int,
     ):
 
         self.index = index
@@ -18,6 +19,7 @@ class ContextState:
         self.is_end = False
         self.word = None
         self.best_token = None
+        self.token_index = token_index
 
 
 class ContextGraphCTC:
@@ -25,7 +27,7 @@ class ContextGraphCTC:
     def __init__(self, blank_id=1024):
 
         self.num_nodes = 0
-        self.root = ContextState(index=self.num_nodes, is_end=False)
+        self.root = ContextState(index=self.num_nodes, is_end=False, token_index=0)
         # self.blank_token = "-"
         self.blank_token = blank_id
         
@@ -39,7 +41,7 @@ class ContextGraphCTC:
                 if token not in prev_node.next:
                     self.num_nodes += 1
                     is_end = i == len(tokens) - 1
-                    node = ContextState(index=self.num_nodes, is_end=is_end)
+                    node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                     node.next[token] = node
                     prev_node.next[token] = node
 
@@ -49,28 +51,12 @@ class ContextGraphCTC:
                             prev_node.next[self.blank_token].next[token] = node
                         else:
                             self.num_nodes += 1
-                            blank_node = ContextState(index=self.num_nodes, is_end=False)    
+                            blank_node = ContextState(index=self.num_nodes, is_end=False, token_index=i)    
                             blank_node.next[self.blank_token] = blank_node
                             blank_node.next[token] = node
                             prev_node.next[self.blank_token] = blank_node
 
                 # two consecutive equal elements:
-                # if token == prev_token:
-                #     if not self.blank_token in prev_node.next:
-                #         self.num_nodes += 1
-                #         is_end = i == len(tokens) - 1
-                #         node = ContextState(index=self.num_nodes, is_end=is_end)
-                #         node.next[token] = node
-    
-                #         # add blank node:
-                #         if self.blank_token in prev_node.next:
-                #             prev_node.next[self.blank_token].next[token] = node
-                #         else:
-                #             self.num_nodes += 1
-                #             blank_node = ContextState(index=self.num_nodes, is_end=False)    
-                #             blank_node.next[self.blank_token] = blank_node
-                #             blank_node.next[token] = node
-                #             prev_node.next[self.blank_token] = blank_node
                 if token == prev_token:
                     if self.blank_token in prev_node.next and token in prev_node.next[self.blank_token].next:
                         prev_node = prev_node.next[self.blank_token].next[token]
@@ -79,13 +65,13 @@ class ContextGraphCTC:
  
                     self.num_nodes += 1
                     is_end = i == len(tokens) - 1
-                    node = ContextState(index=self.num_nodes, is_end=is_end)
+                    node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                     if self.blank_token in prev_node.next:
                         prev_node.next[self.blank_token].next[token] = node
                     else:
-                        self.num_nodes += 1
-                        is_end = i == len(tokens) - 1
-                        node = ContextState(index=self.num_nodes, is_end=is_end)
+                        # self.num_nodes += 1
+                        # is_end = i == len(tokens) - 1
+                        # node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                         node.next[token] = node
     
                         # add blank node:
@@ -93,7 +79,7 @@ class ContextGraphCTC:
                             prev_node.next[self.blank_token].next[token] = node
                         else:
                             self.num_nodes += 1
-                            blank_node = ContextState(index=self.num_nodes, is_end=False)    
+                            blank_node = ContextState(index=self.num_nodes, is_end=False, token_index=i)    
                             blank_node.next[self.blank_token] = blank_node
                             blank_node.next[token] = node
                             prev_node.next[self.blank_token] = blank_node

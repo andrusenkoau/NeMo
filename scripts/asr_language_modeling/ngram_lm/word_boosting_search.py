@@ -5,11 +5,12 @@ from collections import deque
 
 
 class Token:
-    def __init__(self, state, dist=0.0, start_frame=None):
+    def __init__(self, state, dist=0.0, start_frame=None, non_blank_score=0.0):
         self.state = state
         self.dist = dist     
         self.alive = True
         self.start_frame = start_frame
+        self.non_blank_score = non_blank_score
 
 class WBHyp:
     def __init__(self, word, score, start_frame, end_frame, tokenization):
@@ -87,11 +88,14 @@ def get_ctc_word_alignment(logprob, model, token_weight=1.0):
     token_alignment = []
     prev_idx = None
     for i, idx in enumerate(alignment_ctc):
+        token_logprob = 0
         if idx != model.decoder.blank_idx:
             token = model.tokenizer.ids_to_tokens([int(idx)])[0]
             if idx == prev_idx:
-                token_alignment.pop()
-            token_alignment.append((token, i, logprob[i, idx].item()))
+                prev_repited_token = token_alignment.pop()
+                token_logprob += prev_repited_token[2]
+            token_logprob += logprob[i, idx].item()
+            token_alignment.append((token, i, token_logprob))
         prev_idx = idx
     
     # get word alignment
@@ -123,6 +127,54 @@ def get_ctc_word_alignment(logprob, model, token_weight=1.0):
         word_alignment = []
     
     return word_alignment
+
+
+
+# def filter_wb_hyps(best_hyp_list, word_alignment):
+    
+#     # logging.warning("---------------------")
+#     # logging.warning(f"word_alignment is: {word_alignment}")
+#     if not word_alignment:
+#         return best_hyp_list
+
+#     best_hyp_list_new = []
+#     current_word_in_ali = 0
+#     for hyp in best_hyp_list:
+#         print("--------- wb candidat words: --------")
+#         print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
+#         overall_spot_score = 0
+#         overall_spot_word = ""
+#         word_spotted = False
+#         hyp_interval = set(range(hyp.start_frame, hyp.end_frame+1))
+#         print("--------- spot information: --------")
+#         for i in range(current_word_in_ali, len(word_alignment)):
+#             item = word_alignment[i]
+#             item_interval = set(range(item[1], item[2]+1))
+#             intersection_part = 100/len(item_interval) * len(hyp_interval & item_interval)
+#             if intersection_part:
+#                 if not word_spotted:
+#                     overall_spot_score = item[3]
+#                     # current_word_in_ali = i
+#                 else:
+#                     overall_spot_score += intersection_part/100 * item[3]
+#                     # overall_spot_score += 0
+#                 overall_spot_word += f"{item[0]} "
+#                 word_spotted = True
+#                 print(item)
+#             elif word_spotted:
+#                 if hyp.score >= overall_spot_score:
+#                     best_hyp_list_new.append(hyp)
+#                     current_word_in_ali = i
+#                     word_spotted = False
+#                     break
+#         if word_spotted and hyp.score >= overall_spot_score:
+#             best_hyp_list_new.append(hyp)
+
+
+#         print(f"overal spot score: {overall_spot_score:.2f}")
+#         print(f"overal spot word : {overall_spot_word}")
+
+#     return best_hyp_list_new
 
 
 def filter_wb_hyps(best_hyp_list, word_alignment):
@@ -202,10 +254,13 @@ def recognize_wb(
 
                 ### running beam (start):
                 if transition_state != asr_model.decoder.blank_idx:
-                    current_dist = token.dist + logprob_frame[int(transition_state)].item() + context_score
+                    # final_context_score = context_score / (token.state.next[transition_state].token_index+1)
+                    final_context_score = context_score
+                    current_dist = token.dist + \
+                                   logprob_frame[int(transition_state)].item() + \
+                                   final_context_score
                 else:
                     current_dist = token.dist + logprob_frame[int(transition_state)].item()
-                
                 if not best_dist:
                     best_dist = current_dist
                 else:
@@ -215,7 +270,9 @@ def recognize_wb(
                         best_dist = current_dist
                 ### running beam (end)
 
-                new_token = Token(token.state.next[transition_state], current_dist, token.start_frame)
+                new_token = Token(token.state.next[transition_state], current_dist, token.start_frame, token.non_blank_score)
+                # if transition_state != asr_model.decoder.blank_idx:
+                #     new_token.non_blank_score += logprob_frame[int(transition_state)].item() + context_score
 
                 if not new_token.start_frame:
                     new_token.start_frame = frame
@@ -224,6 +281,7 @@ def recognize_wb(
                 if new_token.state.is_end and new_token.dist > keyword_thr:
                     word = asr_model.tokenizer.ids_to_text(new_token.state.word)
                     spotted_words.append(WBHyp(word, new_token.dist, new_token.start_frame, frame, new_token.state.word))
+                    # spotted_words.append(WBHyp(word, new_token.non_blank_score, new_token.start_frame, frame, new_token.state.word))
                     if len(new_token.state.next) == 1:
                         if current_dist is best_dist:
                             best_dist = None

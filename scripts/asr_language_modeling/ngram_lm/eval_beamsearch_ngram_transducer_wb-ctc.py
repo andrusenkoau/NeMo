@@ -604,13 +604,14 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 beam_threshold=5,        # 5
                 context_score=5,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3.5 # 3.0 (4.0)
+                ctc_ali_token_weight=3.0 # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")
             #     logging.warning(f"audio file is: {audio_file_paths[idx]}")
             wb_results[audio_file_paths[idx]] = wb_result
-            # print(audio_file_paths[idx] + "\n")
+            print(f"ref: {target_transcripts[idx]}")
+            print(audio_file_paths[idx] + "\n")
         
 
 
