@@ -93,7 +93,7 @@ from nemo.collections.asr.parts.utils.asr_confidence_utils import (
 
 
 @dataclass
-class EvalBeamSearchNGramConfig:
+class EvalWordBoostingConfig:
     """
     Evaluate an ASR model with beam search decoding and n-gram KenLM language model.
     """
@@ -102,7 +102,6 @@ class EvalBeamSearchNGramConfig:
 
     # File paths
     input_manifest: str = MISSING  # The manifest file of the evaluation set
-    kenlm_model_file: Optional[str] = None  # The path of the KenLM binary model file
     preds_output_folder: Optional[str] = None  # The optional folder where the predictions are stored
     probs_cache_file: Optional[str] = None  # The cache file for storing the logprobs of the model
 
@@ -119,34 +118,18 @@ class EvalBeamSearchNGramConfig:
     # The decoding scheme to be used for evaluation
     decoding_strategy: str = "greedy_batch" # ["greedy_batch", "beam", "tsd", "alsd", "maes"]
 
-    # Beam Search hyperparameters
-    beam_width: List[int] = field(default_factory=lambda: [8])  # The width or list of the widths for the beam search decoding
-    beam_alpha: List[float] = field(default_factory=lambda: [0.2])  # The alpha parameter or list of the alphas for the beam search decoding
 
-    maes_prefix_alpha: List[int] = field(default_factory=lambda: [2])  # The maes_prefix_alpha or list of the maes_prefix_alpha for the maes decoding
-    maes_expansion_gamma: List[float] = field(default_factory=lambda: [2.3])  # The maes_expansion_gamma or list of the maes_expansion_gamma for the maes decoding
-
-    # HAT related parameters (only for internal lm subtraction)
-    hat_subtract_ilm: bool = False
-    hat_ilm_weight: List[float] = field(default_factory=lambda: [0.0])
-
-    # Context Biasing:
+    ### Context Biasing ###:
     applay_context_biasing: bool = True
     context_score: float = 4.0  # per token weight for context biasing words
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
 
     sort_logits: bool = True # do logits sorting before decoding - it reduces computation on puddings
-
-
     softmax_temperature: float = 1.00
-
     preserve_alignments: bool = True
-
 
     decoding: rnnt_beam_decoding.BeamRNNTInferConfig = rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=128)
 
-    use_confidence: bool = True
-    confidence_cfg: ConfidenceConfig = ConfidenceConfig()
 
 
 # fmt: on
@@ -227,56 +210,9 @@ def merge_alignment_with_wb_hyps(
         if not already_inserted:
             new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
 
-
-
-
-
-
-            # item_interval = set(range(item[1], item[2]+1))
-            # intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
-            # if intersection_part >= 40:
-            #     if not already_inserted:
-            #         new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
-            #         already_inserted = True
-            # else:
-            #     new_word_alignment.append(item)
         word_alignment = new_word_alignment
         print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
 
-    # for wb_hyp in wb_result:
-    #     new_word_alignment = []
-    #     already_inserted = False
-    #     # lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
-    #     wb_interval = set(range(wb_hyp.start_frame, wb_hyp.end_frame+1))
-    #     for item in word_alignment:
-    #         # li, ri = item[1], item[2]
-    #         item_interval = set(range(item[1], item[2]+1))
-    #         intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
-    #         if intersection_part >= 40:
-    #             if not already_inserted:
-    #                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
-    #                 already_inserted = True
-    #         else:
-    #             new_word_alignment.append(item)
-    #     word_alignment = new_word_alignment
-    #     print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
-
-    # for wb_hyp in wb_result:
-    #     new_word_alignment = []
-    #     already_pasted = False
-    #     lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
-    #     for item in word_alignment:
-    #         li, ri = item[1], item[2]
-    #         if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
-    #             if not already_pasted:
-    #                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
-    #                 already_pasted = True
-    #         else:
-    #             new_word_alignment.append(item)
-    #     word_alignment = new_word_alignment
-    #     print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
-
-    # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
     boosted_text_list = [item[0] for item in new_word_alignment]
     boosted_text = " ".join(boosted_text_list)
     print(f"before: {ref_text}")
@@ -287,7 +223,7 @@ def merge_alignment_with_wb_hyps(
 
 def decoding_step(
     model: nemo_asr.models.ASRModel,
-    cfg: EvalBeamSearchNGramConfig,
+    cfg: EvalWordBoostingConfig,
     all_probs: List[torch.Tensor],
     target_transcripts: List[str],
     audio_file_paths: List[str],
@@ -303,11 +239,11 @@ def decoding_step(
     # Reset config
     model.change_decoding_strategy(None)
 
-    cfg.decoding.hat_ilm_weight = cfg.decoding.hat_ilm_weight * cfg.hat_subtract_ilm
+    # cfg.decoding.hat_ilm_weight = cfg.decoding.hat_ilm_weight * cfg.hat_subtract_ilm
     # Override the beam search config with current search candidate configuration
     cfg.decoding.return_best_hypothesis = False
-    cfg.decoding.ngram_lm_model = cfg.kenlm_model_file
-    cfg.decoding.hat_subtract_ilm = cfg.hat_subtract_ilm
+    # cfg.decoding.ngram_lm_model = cfg.kenlm_model_file
+    # cfg.decoding.hat_subtract_ilm = cfg.hat_subtract_ilm
 
     # preserve aligmnet:
     model.cfg.decoding.preserve_alignments = cfg.preserve_alignments
@@ -328,15 +264,11 @@ def decoding_step(
 
     if preds_output_file:
         out_file = open(preds_output_file, 'w', encoding='utf_8', newline='\n')
-
     if preds_output_manifest:
         out_manifest = open(preds_output_manifest, 'w', encoding='utf_8', newline='\n')
 
     if progress_bar:
-        if cfg.decoding_strategy.startswith("greedy"):
-            description = "Greedy_batch decoding.."
-        else:
-            description = f"{cfg.decoding_strategy} decoding with bw={cfg.decoding.beam_size}, ba={cfg.decoding.ngram_lm_alpha}, ma={cfg.decoding.maes_prefix_alpha}, mg={cfg.decoding.maes_expansion_gamma}, hat_ilmw={cfg.decoding.hat_ilm_weight}"
+        description = "Greedy_batch decoding.."
         it = tqdm(range(int(np.ceil(len(all_probs) / beam_batch_size))), desc=description, ncols=120)
     else:
         it = range(int(np.ceil(len(all_probs) / beam_batch_size)))
@@ -354,8 +286,7 @@ def decoding_step(
             best_hyp_batch, beams_batch = model.decoding.rnnt_decoder_predictions_tensor(
                 packed_batch, probs_lens, return_hypotheses=True,
             )
-        if cfg.decoding_strategy.startswith("greedy"):
-            beams_batch = [[x] for x in best_hyp_batch]
+        beams_batch = [[x] for x in best_hyp_batch]
 
         for beams_idx, beams in enumerate(beams_batch):
             target = target_transcripts[sample_idx + beams_idx]
@@ -444,12 +375,7 @@ def decoding_step(
         out_file.close()
         logging.info(f"Stored the predictions of {cfg.decoding_strategy} decoding at '{preds_output_file}'.")
 
-    if cfg.decoding.ngram_lm_model:
-        logging.info(
-            f"WER/CER with {cfg.decoding_strategy} decoding and N-gram model = {wer_dist_first / words_count:.2%}/{cer_dist_first / chars_count:.2%}"
-        )
-    else:
-        logging.info(
+    logging.info(
             f"WER/CER with {cfg.decoding_strategy} decoding = {wer_dist_first / words_count:.2%}/{cer_dist_first / chars_count:.2%}"
         )
     logging.info(
@@ -460,12 +386,12 @@ def decoding_step(
     return wer_dist_first / words_count, cer_dist_first / chars_count
 
 
-@hydra_runner(config_path=None, config_name='EvalBeamSearchNGramConfig', schema=EvalBeamSearchNGramConfig)
-def main(cfg: EvalBeamSearchNGramConfig):
+@hydra_runner(config_path=None, config_name='EvalWordBoostingConfig', schema=EvalWordBoostingConfig)
+def main(cfg: EvalWordBoostingConfig):
     if is_dataclass(cfg):
-        cfg = OmegaConf.structured(cfg)  # type: EvalBeamSearchNGramConfig
+        cfg = OmegaConf.structured(cfg)  # type: EvalWordBoostingConfig
 
-    valid_decoding_strategis = ["greedy", "greedy_batch", "beam", "tsd", "alsd", "maes"]
+    valid_decoding_strategis = ["greedy", "greedy_batch"]
     if cfg.decoding_strategy not in valid_decoding_strategis:
         raise ValueError(
             f"Given decoding_strategy={cfg.decoding_strategy} is invalid. Available options are :\n"
@@ -483,20 +409,6 @@ def main(cfg: EvalBeamSearchNGramConfig):
             cfg.nemo_model_file, map_location=torch.device(cfg.device)
         )
 
-    if cfg.kenlm_model_file:
-        if not os.path.exists(cfg.kenlm_model_file):
-            raise FileNotFoundError(f"Could not find the KenLM model file '{cfg.kenlm_model_file}'.")
-        if cfg.decoding_strategy != "maes":
-            raise ValueError(f"Decoding with kenlm model is supported only for maes decoding algorithm.")
-        lm_path = cfg.kenlm_model_file
-    else:
-        lm_path = None
-        cfg.beam_alpha = [0.0]
-    if cfg.hat_subtract_ilm:
-        assert lm_path, "kenlm must be set for hat internal lm subtraction"
-
-    if cfg.decoding_strategy != "maes":
-        cfg.maes_prefix_alpha, cfg.maes_expansion_gamma, cfg.hat_ilm_weight = [0], [0], [0]
 
     target_transcripts = []
     durations = []
@@ -586,10 +498,33 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
     if cfg.applay_context_biasing:
         # load context graph:
+
+        # ## bpe dropout:
+        # kwl_set = set()
+        # context_transcripts = []
+        # sow_symbol = asr_model.tokenizer.tokens_to_ids(['▁'])[0]
+        # for line in open(cfg.context_file).readlines():
+        #     word = line.strip().lower()
+        #     tokenization = asr_model.tokenizer.tokenizer.encode(word) # , out_type=str
+        #     kwl_set.add(str(tokenization))
+        #     context_transcripts.append(tokenization)
+            
+        #     for _ in range(50):
+        #         tokenization = asr_model.tokenizer.tokenizer.encode(word, enable_sampling=True, alpha=0.1, nbest_size=-1)
+        #         if tokenization[0] != sow_symbol:
+        #             tokenization_str = str(tokenization)
+        #             if tokenization_str not in kwl_set:
+        #                 kwl_set.add(tokenization_str)
+        #                 context_transcripts.append(tokenization)
+
+
+        ## no bpe dropout:
         context_transcripts = []
         for line in open(cfg.context_file).readlines():
-            word = line.strip().lower()
-            context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+            word = line.strip().lower().split("-")
+            context_transcripts.append([asr_model.tokenizer.text_to_ids(word[0]),
+                                        asr_model.tokenizer.text_to_ids(word[1])])
+
 
         context_graph = ContextGraphCTC(blank_id=asr_model.decoder.blank_idx)
         context_graph.build(context_transcripts)
@@ -623,33 +558,35 @@ def main(cfg: EvalBeamSearchNGramConfig):
         all_probs_sorted = []
         target_transcripts_sorted = []
         audio_file_paths_sorted = []
+        durations_sorted = []
         for pair in all_probs_with_indeces:
             all_probs_sorted.append(pair[1])
             target_transcripts_sorted.append(target_transcripts[pair[0]])
             audio_file_paths_sorted.append(audio_file_paths[pair[0]])
+            durations_sorted.append(durations[pair[0]])
         all_probs = all_probs_sorted
         target_transcripts = target_transcripts_sorted
         audio_file_paths = audio_file_paths_sorted
+        durations = durations_sorted
 
 
-    if cfg.decoding_strategy.startswith("greedy"):
-        asr_model = asr_model.to('cpu')
-        preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")
-        preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
-        candidate_wer, candidate_cer = decoding_step(
-            asr_model,
-            cfg,
-            all_probs=all_probs,
-            target_transcripts=target_transcripts,
-            audio_file_paths=audio_file_paths,
-            durations=durations,
-            beam_batch_size=cfg.beam_batch_size,
-            progress_bar=True,
-            preds_output_file=preds_output_file,
-            preds_output_manifest=preds_output_manifest,
-            wb_results=wb_results,
-        )
-        logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
+    asr_model = asr_model.to('cpu')
+    preds_output_file = os.path.join(cfg.preds_output_folder, f"recognition_results.tsv")
+    preds_output_manifest = os.path.join(cfg.preds_output_folder, f"recognition_results.json")
+    candidate_wer, candidate_cer = decoding_step(
+        asr_model,
+        cfg,
+        all_probs=all_probs,
+        target_transcripts=target_transcripts,
+        audio_file_paths=audio_file_paths,
+        durations=durations,
+        beam_batch_size=cfg.beam_batch_size,
+        progress_bar=True,
+        preds_output_file=preds_output_file,
+        preds_output_manifest=preds_output_manifest,
+        wb_results=wb_results,
+    )
+    logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
 
 
 if __name__ == '__main__':

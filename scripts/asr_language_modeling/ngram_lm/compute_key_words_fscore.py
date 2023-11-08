@@ -148,7 +148,9 @@ def main():
     #key_words_list = [x for x in args.key_words_list.split('_')]
     key_words_list = []
     for line in open(args.key_words_file).readlines():
-        key_words_list.append(line.strip().lower())
+        item = line.strip().split("-")[1].lower()
+        if item not in key_words_list:
+            key_words_list.append(item)
     compute_fscore(args.input_manifest, key_words_list)
 
 

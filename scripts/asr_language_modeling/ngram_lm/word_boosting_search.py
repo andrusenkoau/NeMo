@@ -24,9 +24,9 @@ class WBHyp:
 def beam_pruning(next_tokens, threshold):
     if not next_tokens:
         return []   
-    alive_tokens = [token for token in next_tokens if token.alive]
-    best_token = alive_tokens[np.argmax([token.dist for token in alive_tokens])]
-    next_tokens = [token for token in alive_tokens if token.dist > best_token.dist - threshold]
+    # alive_tokens = [token for token in next_tokens if token.alive]
+    best_token = next_tokens[np.argmax([token.dist for token in next_tokens])]
+    next_tokens = [token for token in next_tokens if token.dist > best_token.dist - threshold]
     return next_tokens
 
 
@@ -43,27 +43,31 @@ def state_pruning(next_tokens):
             else:
                 token.state.best_token.alive = False
                 token.state.best_token = token
-    next_tokens = [token for token in next_tokens if token.alive]
+    next_tokens_pruned = [token for token in next_tokens if token.alive]
 
     # clean best_tokens in context_graph
     for token in next_tokens:
         token.state.best_token = None
     
-    return next_tokens
+    return next_tokens_pruned
 
 
 def find_best_hyp(spotted_words):
 
     clusters_dict = {}
     for hyp in spotted_words:
-        hl, hr = hyp.start_frame, hyp.end_frame
-        h_cluster_name = f"{hl}_{hr}"
+        # hl, hr = hyp.start_frame, hyp.end_frame
+        hyp_interval = set(range(hyp.start_frame, hyp.end_frame+1))
+        h_cluster_name = f"{hyp.start_frame}_{hyp.end_frame}"
         insert_cluster = True
 
         for cluster in clusters_dict:
             cl, cr = int(cluster.split("_")[0]), int(cluster.split("_")[1])
+            cluster_interval = set(range(cl, cr+1))
+            intersection_part = 100/len(cluster_interval) * len(hyp_interval & cluster_interval)
             # in case of intersection:
-            if cl <= hl <= cr or cl <= hr <= cr or hl <= cl <= hr or hl <= cr <= hr:
+            # TODO -- check if it the same word?
+            if intersection_part >= 20:
                 if hyp.score > clusters_dict[cluster].score:
                     clusters_dict.pop(cluster)
                     insert_cluster = True
@@ -81,8 +85,6 @@ def find_best_hyp(spotted_words):
 def get_ctc_word_alignment(logprob, model, token_weight=1.0):
     
     alignment_ctc = np.argmax(logprob, axis=1)
-    # logging.warning("---------------------")
-    # logging.warning(f"alignment_ctc is: {alignment_ctc}")
 
     # get token alignment
     token_alignment = []
@@ -106,7 +108,10 @@ def get_ctc_word_alignment(logprob, model, token_weight=1.0):
     token_boost = token_weight
     for item in token_alignment:
         if not word:
-            word = item[0][1:]
+            if word.startswith(slash):
+                word = item[0][1:]
+            else:
+                word = item[0][:]
             l = item[1]
             r = item[1]
             score = item[2]+token_boost
@@ -121,60 +126,14 @@ def get_ctc_word_alignment(logprob, model, token_weight=1.0):
                 word += item[0]
                 r = item[1]
                 score += item[2]+token_boost
-    word_alignment.append((word, l, r, score))
+    if word:
+        word_alignment.append((word, l, r, score))
     
     if len(word_alignment) == 1 and not word_alignment[0][0]:
         word_alignment = []
     
     return word_alignment
 
-
-
-# def filter_wb_hyps(best_hyp_list, word_alignment):
-    
-#     # logging.warning("---------------------")
-#     # logging.warning(f"word_alignment is: {word_alignment}")
-#     if not word_alignment:
-#         return best_hyp_list
-
-#     best_hyp_list_new = []
-#     current_word_in_ali = 0
-#     for hyp in best_hyp_list:
-#         print("--------- wb candidat words: --------")
-#         print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
-#         overall_spot_score = 0
-#         overall_spot_word = ""
-#         word_spotted = False
-#         hyp_interval = set(range(hyp.start_frame, hyp.end_frame+1))
-#         print("--------- spot information: --------")
-#         for i in range(current_word_in_ali, len(word_alignment)):
-#             item = word_alignment[i]
-#             item_interval = set(range(item[1], item[2]+1))
-#             intersection_part = 100/len(item_interval) * len(hyp_interval & item_interval)
-#             if intersection_part:
-#                 if not word_spotted:
-#                     overall_spot_score = item[3]
-#                     # current_word_in_ali = i
-#                 else:
-#                     overall_spot_score += intersection_part/100 * item[3]
-#                     # overall_spot_score += 0
-#                 overall_spot_word += f"{item[0]} "
-#                 word_spotted = True
-#                 print(item)
-#             elif word_spotted:
-#                 if hyp.score >= overall_spot_score:
-#                     best_hyp_list_new.append(hyp)
-#                     current_word_in_ali = i
-#                     word_spotted = False
-#                     break
-#         if word_spotted and hyp.score >= overall_spot_score:
-#             best_hyp_list_new.append(hyp)
-
-
-#         print(f"overal spot score: {overall_spot_score:.2f}")
-#         print(f"overal spot word : {overall_spot_word}")
-
-#     return best_hyp_list_new
 
 
 def filter_wb_hyps(best_hyp_list, word_alignment):
@@ -185,20 +144,67 @@ def filter_wb_hyps(best_hyp_list, word_alignment):
         return best_hyp_list
 
     best_hyp_list_new = []
-    current_frame = 0
+    current_word_in_ali = 0
     for hyp in best_hyp_list:
-        lh, rh = hyp.start_frame, hyp.end_frame
-        for i in range(current_frame, len(word_alignment)):
+        print("--------- wb candidat words: --------")
+        print(f"{hyp.word}: [{hyp.start_frame};{hyp.end_frame}], score:{hyp.score:-.2f}")
+        overall_spot_score = 0
+        overall_spot_word = ""
+        word_spotted = False
+        hyp_interval = set(range(hyp.start_frame, hyp.end_frame+1))
+        print("--------- spot information: --------")
+        for i in range(current_word_in_ali, len(word_alignment)):
             item = word_alignment[i]
-            li, ri = item[1], item[2]
-            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
-                if hyp.score >= item[3]:
-                # if hyp.score >= item[3] and not item[0].startswith(hyp.word):
+            item_interval = set(range(item[1], item[2]+1))
+            intersection_part = 100/len(item_interval) * len(hyp_interval & item_interval)
+            if intersection_part:
+                if not word_spotted:
+                    overall_spot_score = item[3]
+                    # current_word_in_ali = i
+                else:
+                    overall_spot_score += intersection_part/100 * item[3]
+                    # overall_spot_score += 0
+                overall_spot_word += f"{item[0]} "
+                word_spotted = True
+                print(item)
+            elif word_spotted:
+                if hyp.score >= overall_spot_score:
                     best_hyp_list_new.append(hyp)
-                current_frame = i
-                break
-    
+                    current_word_in_ali = i
+                    word_spotted = False
+                    break
+        if word_spotted and hyp.score >= overall_spot_score:
+            best_hyp_list_new.append(hyp)
+
+
+        print(f"overal spot score: {overall_spot_score:.2f}")
+        print(f"overal spot word : {overall_spot_word}")
+
     return best_hyp_list_new
+
+
+# def filter_wb_hyps(best_hyp_list, word_alignment):
+    
+#     # logging.warning("---------------------")
+#     # logging.warning(f"word_alignment is: {word_alignment}")
+#     if not word_alignment:
+#         return best_hyp_list
+
+#     best_hyp_list_new = []
+#     current_frame = 0
+#     for hyp in best_hyp_list:
+#         lh, rh = hyp.start_frame, hyp.end_frame
+#         for i in range(current_frame, len(word_alignment)):
+#             item = word_alignment[i]
+#             li, ri = item[1], item[2]
+#             if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+#                 if hyp.score >= item[3]:
+#                 # if hyp.score >= item[3] and not item[0].startswith(hyp.word):
+#                     best_hyp_list_new.append(hyp)
+#                 current_frame = i
+#                 break
+    
+#     return best_hyp_list_new
 
 
 # def filter_wb_hyps(best_hyp_list, word_alignment):

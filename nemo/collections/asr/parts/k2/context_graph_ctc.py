@@ -34,7 +34,8 @@ class ContextGraphCTC:
 
     def build(self, token_ids: List[List[int]]):
 
-        for tokens in token_ids:
+        for tokens_pair in token_ids:
+            tokens = tokens_pair[0]
             prev_node = self.root
             prev_token = None
             for i, token in enumerate(tokens):
@@ -58,6 +59,7 @@ class ContextGraphCTC:
 
                 # two consecutive equal elements:
                 if token == prev_token:
+                    # already have this token in prev_node.next[balnk].next
                     if self.blank_token in prev_node.next and token in prev_node.next[self.blank_token].next:
                         prev_node = prev_node.next[self.blank_token].next[token]
                         prev_token = token
@@ -68,12 +70,9 @@ class ContextGraphCTC:
                     node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                     if self.blank_token in prev_node.next:
                         prev_node.next[self.blank_token].next[token] = node
-                    else:
-                        # self.num_nodes += 1
-                        # is_end = i == len(tokens) - 1
-                        # node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                         node.next[token] = node
-    
+                    else:
+                        node.next[token] = node 
                         # add blank node:
                         if self.blank_token in prev_node.next:
                             prev_node.next[self.blank_token].next[token] = node
@@ -90,7 +89,7 @@ class ContextGraphCTC:
                     prev_node = prev_node.next[self.blank_token].next[token]
                 prev_token = token
             prev_node.is_end = True
-            prev_node.word = tokens
+            prev_node.word = tokens_pair[1]
                 
 
 
