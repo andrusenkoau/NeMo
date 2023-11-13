@@ -142,19 +142,28 @@ def merge_alignment_with_wb_hyps(
 ):
     
     alignment = candidate.alignments
-    alignment_per_frame = []
-    for items in alignment:
-        current_frame_ali = [x[1].item() for x in items]
-        # logging.warning("-----"*10)
-        # logging.warning(current_frame_ali)
-        alignment_per_frame.append(current_frame_ali)
 
-    # get words borders
-    alignment_tokens = []
-    for idx, frame_ali in enumerate(alignment_per_frame):
-        for idy, token in enumerate(frame_ali):
+    alignment_per_frame = []
+    for idx, items in enumerate(alignment):
+        for item in items:
+            token = item[1].item()
             if token != model.decoder.blank_idx:
-                alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
+                alignment_per_frame.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
+    alignment_tokens = alignment_per_frame
+
+    # alignment_per_frame = []
+    # for items in alignment:
+    #     current_frame_ali = [x[1].item() for x in items]
+    #     # logging.warning("-----"*10)
+    #     # logging.warning(current_frame_ali)
+    #     alignment_per_frame.append(current_frame_ali)
+
+    # # get words borders
+    # alignment_tokens = []
+    # for idx, frame_ali in enumerate(alignment_per_frame):
+    #     for idy, token in enumerate(frame_ali):
+    #         if token != model.decoder.blank_idx:
+    #             alignment_tokens.append([idx, model.tokenizer.ids_to_tokens([token])[0]])
 
     if not alignment_tokens:
         for wb_hyp in wb_result:
@@ -502,31 +511,52 @@ def main(cfg: EvalWordBoostingConfig):
         # ## bpe dropout:
         # kwl_set = set()
         # context_transcripts = []
-        # sow_symbol = asr_model.tokenizer.tokens_to_ids(['▁'])[0]
+        # sow_symbol_ids = asr_model.tokenizer.tokens_to_ids(['▁'])[0]
+        # sow_symbol = '▁'
         # for line in open(cfg.context_file).readlines():
         #     word = line.strip().lower()
         #     tokenization = asr_model.tokenizer.tokenizer.encode(word) # , out_type=str
+        #     # tokenization_tokens = asr_model.tokenizer.ids_to_tokens(tokenization)
+        #     # tokenization_tokens = [token.replace(sow_symbol,"") for token in tokenization_tokens]
+        #     # new_word = " ".join(tokenization_tokens)
+        #     # tokenization = asr_model.tokenizer.tokenizer.encode(new_word) # , out_type=str
         #     kwl_set.add(str(tokenization))
-        #     context_transcripts.append(tokenization)
+        #     context_transcripts.append([tokenization, asr_model.tokenizer.text_to_ids(word)])
+        #     # print(f"[BPE]: {word} -- {new_word}")
             
         #     for _ in range(50):
         #         tokenization = asr_model.tokenizer.tokenizer.encode(word, enable_sampling=True, alpha=0.1, nbest_size=-1)
-        #         if tokenization[0] != sow_symbol:
+        #         tokenization_tokens = asr_model.tokenizer.ids_to_tokens(tokenization)
+        #         tokenization_tokens = [token.replace(sow_symbol,"") for token in tokenization_tokens]
+        #         new_word = " ".join(tokenization_tokens)
+        #         tokenization = asr_model.tokenizer.tokenizer.encode(new_word) # , out_type=str
+        #         if tokenization[0] != sow_symbol_ids:
         #             tokenization_str = str(tokenization)
         #             if tokenization_str not in kwl_set:
         #                 kwl_set.add(tokenization_str)
-        #                 context_transcripts.append(tokenization)
+        #                 context_transcripts.append([tokenization, asr_model.tokenizer.text_to_ids(word)])
+        #                 print(f"[BPE dropout]: {word} -- {new_word}")
 
+
+        # ## no bpe dropout:
+        # context_transcripts = []
+        # for line in open(cfg.context_file).readlines():
+        #     word = line.strip().lower()
+        #     context_transcripts.append([asr_model.tokenizer.text_to_ids(word),
+        #                                 asr_model.tokenizer.text_to_ids(word)])
 
         ## no bpe dropout:
         context_transcripts = []
         for line in open(cfg.context_file).readlines():
-            word = line.strip().lower().split("-")
-            context_transcripts.append([asr_model.tokenizer.text_to_ids(word[0]),
-                                        asr_model.tokenizer.text_to_ids(word[1])])
+            item = line.strip().lower().split("-")
+            word = item[0]
+            word_tokenization = [asr_model.tokenizer.text_to_ids(x) for x in item[1:]]
+            context_transcripts.append([word, word_tokenization])
+
 
 
         context_graph = ContextGraphCTC(blank_id=asr_model.decoder.blank_idx)
+        # logging.warning(context_transcripts)
         context_graph.build(context_transcripts)
 
         # run CTC based WB search:
@@ -539,7 +569,7 @@ def main(cfg: EvalWordBoostingConfig):
                 beam_threshold=5,        # 5
                 context_score=5,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3.0 # 3.0 (4.0)
+                ctc_ali_token_weight=3 # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")

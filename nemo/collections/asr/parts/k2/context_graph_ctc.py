@@ -1,7 +1,7 @@
 import os
 import shutil
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 
 class ContextState:
@@ -32,64 +32,64 @@ class ContextGraphCTC:
         self.blank_token = blank_id
         
 
-    def build(self, token_ids: List[List[int]]):
+    def build(self, word_items: List[Union[str, List[List[int]]]]):
 
-        for tokens_pair in token_ids:
-            tokens = tokens_pair[0]
-            prev_node = self.root
-            prev_token = None
-            for i, token in enumerate(tokens):
-                if token not in prev_node.next:
-                    self.num_nodes += 1
-                    is_end = i == len(tokens) - 1
-                    node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
-                    node.next[token] = node
-                    prev_node.next[token] = node
-
-                    # add blank node:
-                    if prev_node is not self.root:
-                        if self.blank_token in prev_node.next:
-                            prev_node.next[self.blank_token].next[token] = node
-                        else:
-                            self.num_nodes += 1
-                            blank_node = ContextState(index=self.num_nodes, is_end=False, token_index=i)    
-                            blank_node.next[self.blank_token] = blank_node
-                            blank_node.next[token] = node
-                            prev_node.next[self.blank_token] = blank_node
-
-                # two consecutive equal elements:
-                if token == prev_token:
-                    # already have this token in prev_node.next[balnk].next
-                    if self.blank_token in prev_node.next and token in prev_node.next[self.blank_token].next:
-                        prev_node = prev_node.next[self.blank_token].next[token]
-                        prev_token = token
-                        continue
- 
-                    self.num_nodes += 1
-                    is_end = i == len(tokens) - 1
-                    node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
-                    if self.blank_token in prev_node.next:
-                        prev_node.next[self.blank_token].next[token] = node
+        for word_item in word_items:
+            for tokens in word_item[1]:
+                prev_node = self.root
+                prev_token = None
+                for i, token in enumerate(tokens):
+                    if token not in prev_node.next:
+                        self.num_nodes += 1
+                        is_end = i == len(tokens) - 1
+                        node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                         node.next[token] = node
-                    else:
-                        node.next[token] = node 
+                        prev_node.next[token] = node
+
                         # add blank node:
+                        if prev_node is not self.root:
+                            if self.blank_token in prev_node.next:
+                                prev_node.next[self.blank_token].next[token] = node
+                            else:
+                                self.num_nodes += 1
+                                blank_node = ContextState(index=self.num_nodes, is_end=False, token_index=i)    
+                                blank_node.next[self.blank_token] = blank_node
+                                blank_node.next[token] = node
+                                prev_node.next[self.blank_token] = blank_node
+
+                    # two consecutive equal elements:
+                    if token == prev_token:
+                        # already have this token in prev_node.next[balnk].next
+                        if self.blank_token in prev_node.next and token in prev_node.next[self.blank_token].next:
+                            prev_node = prev_node.next[self.blank_token].next[token]
+                            prev_token = token
+                            continue
+    
+                        self.num_nodes += 1
+                        is_end = i == len(tokens) - 1
+                        node = ContextState(index=self.num_nodes, is_end=is_end, token_index=i)
                         if self.blank_token in prev_node.next:
                             prev_node.next[self.blank_token].next[token] = node
+                            node.next[token] = node
                         else:
-                            self.num_nodes += 1
-                            blank_node = ContextState(index=self.num_nodes, is_end=False, token_index=i)    
-                            blank_node.next[self.blank_token] = blank_node
-                            blank_node.next[token] = node
-                            prev_node.next[self.blank_token] = blank_node
-                   
-                if prev_node.index != prev_node.next[token].index:
-                    prev_node = prev_node.next[token]
-                else:
-                    prev_node = prev_node.next[self.blank_token].next[token]
-                prev_token = token
-            prev_node.is_end = True
-            prev_node.word = tokens_pair[1]
+                            node.next[token] = node 
+                            # add blank node:
+                            if self.blank_token in prev_node.next:
+                                prev_node.next[self.blank_token].next[token] = node
+                            else:
+                                self.num_nodes += 1
+                                blank_node = ContextState(index=self.num_nodes, is_end=False, token_index=i)    
+                                blank_node.next[self.blank_token] = blank_node
+                                blank_node.next[token] = node
+                                prev_node.next[self.blank_token] = blank_node
+                    
+                    if prev_node.index != prev_node.next[token].index:
+                        prev_node = prev_node.next[token]
+                    else:
+                        prev_node = prev_node.next[self.blank_token].next[token]
+                    prev_token = token
+                prev_node.is_end = True
+                prev_node.word = word_item[0]
                 
 
 

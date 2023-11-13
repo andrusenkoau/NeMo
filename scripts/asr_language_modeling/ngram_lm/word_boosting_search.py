@@ -285,8 +285,9 @@ def recognize_wb(
 
                 # if end of word:
                 if new_token.state.is_end and new_token.dist > keyword_thr:
-                    word = asr_model.tokenizer.ids_to_text(new_token.state.word)
-                    spotted_words.append(WBHyp(word, new_token.dist, new_token.start_frame, frame, new_token.state.word))
+                    # word = asr_model.tokenizer.ids_to_text(new_token.state.word)
+                    word = new_token.state.word
+                    spotted_words.append(WBHyp(word, new_token.dist, new_token.start_frame, frame, asr_model.tokenizer.text_to_ids(new_token.state.word)))
                     # spotted_words.append(WBHyp(word, new_token.non_blank_score, new_token.start_frame, frame, new_token.state.word))
                     if len(new_token.state.next) == 1:
                         if current_dist is best_dist:
