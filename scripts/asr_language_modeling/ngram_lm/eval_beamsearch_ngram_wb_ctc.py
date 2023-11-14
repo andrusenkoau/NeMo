@@ -286,18 +286,110 @@ def beam_search_eval(
     return wer_dist_first / words_count, cer_dist_first / chars_count
 
 
+# def merge_alignment_with_wb_hyps(
+#     alignment,
+#     asr_model,
+#     wb_result,
+# ):
+    
+#     # alignment = [x[0][-1].item() for x in alignment]
+
+#     # get words borders
+#     alignment_tokens = []
+#     prev_token = None
+#     for idx, token in enumerate(alignment):
+#         if token != asr_model.decoder.blank_idx:
+#             if token == prev_token:
+#                 alignment_tokens[-1] = [idx, asr_model.tokenizer.ids_to_tokens([int(token)])[0]]
+#             else:
+#                 alignment_tokens.append([idx, asr_model.tokenizer.ids_to_tokens([int(token)])[0]])
+#         prev_token = token
+
+#     if not alignment_tokens:
+#         return " ".join([wb_hyp.word for wb_hyp in wb_result])
+
+#     # one_more_tokens= [item[1] for item in alignment_tokens]
+#     # one_more_text = asr_model.tokenizer.tokens_to_text(one_more_tokens)
+#     # print(f"hy1: {one_more_text}")
+    
+#     slash = "▁"
+#     word_alignment = []
+#     word = ""
+#     l, r, = None, None
+#     for item in alignment_tokens:
+#         if not word:
+#             word = item[1][1:]
+#             l = item[0]
+#             r = item[0]
+#         else:
+#             if item[1].startswith(slash):
+#                 word_alignment.append((word, l, r))
+#                 word = item[1][1:]
+#                 l = item[0]
+#                 r = item[0]
+#             else:
+#                 word += item[1]
+#                 r = item[0]
+#     word_alignment.append((word, l, r))
+#     ref_text = [item[0] for item in word_alignment]
+#     ref_text = " ".join(ref_text)
+#     print(f"before: {ref_text}")
+
+#     # merge wb_hyps and word alignment:
+#     for wb_hyp in wb_result:
+#         new_word_alignment = []
+#         already_pasted = False
+#         lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+#         for item in word_alignment:
+#             li, ri = item[1], item[2]
+#             if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
+#                 if not already_pasted:
+#                     new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+#                     already_pasted = True
+#             else:
+#                 new_word_alignment.append(item)
+#         word_alignment = new_word_alignment
+
+#     # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
+#     boosted_text_list = [item[0] for item in new_word_alignment]
+#     boosted_text = " ".join(boosted_text_list)
+#     print(f"after : {boosted_text}")
+    
+#     return boosted_text
+
 def merge_alignment_with_wb_hyps(
     alignment,
     asr_model,
     wb_result,
 ):
     
-    # alignment = [x[0][-1].item() for x in alignment]
+
+
+#     alignment_tokens = []
+#     prev_token = None
+#     for idx, token in enumerate(alignment):
+#         if token != asr_model.decoder.blank_idx:
+#             if token == prev_token:
+#                 alignment_tokens[-1] = [idx, asr_model.tokenizer.ids_to_tokens([int(token)])[0]]
+#             else:
+#                 alignment_tokens.append([idx, asr_model.tokenizer.ids_to_tokens([int(token)])[0]])
+#         prev_token = token
+
+#     if not alignment_tokens:
+#         return " ".join([wb_hyp.word for wb_hyp in wb_result])
+
+    # alignment_per_frame = []
+    # for items in alignment:
+    #     current_frame_ali = [x[1].item() for x in items]
+    #     # logging.warning("-----"*10)
+    #     # logging.warning(current_frame_ali)
+    #     alignment_per_frame.append(current_frame_ali)
+    alignment_per_frame = alignment
 
     # get words borders
     alignment_tokens = []
     prev_token = None
-    for idx, token in enumerate(alignment):
+    for idx, token in enumerate(alignment_per_frame):
         if token != asr_model.decoder.blank_idx:
             if token == prev_token:
                 alignment_tokens[-1] = [idx, asr_model.tokenizer.ids_to_tokens([int(token)])[0]]
@@ -306,12 +398,11 @@ def merge_alignment_with_wb_hyps(
         prev_token = token
 
     if not alignment_tokens:
+        for wb_hyp in wb_result:
+            print(f"wb_hyp: {wb_hyp.word}")
         return " ".join([wb_hyp.word for wb_hyp in wb_result])
 
-    # one_more_tokens= [item[1] for item in alignment_tokens]
-    # one_more_text = asr_model.tokenizer.tokens_to_text(one_more_tokens)
-    # print(f"hy1: {one_more_text}")
-    
+
     slash = "▁"
     word_alignment = []
     word = ""
@@ -333,29 +424,43 @@ def merge_alignment_with_wb_hyps(
     word_alignment.append((word, l, r))
     ref_text = [item[0] for item in word_alignment]
     ref_text = " ".join(ref_text)
-    print(f"before: {ref_text}")
+    print(f"rnnt_word_alignment: {word_alignment}")
 
     # merge wb_hyps and word alignment:
+
     for wb_hyp in wb_result:
         new_word_alignment = []
-        already_pasted = False
-        lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+        already_inserted = False
+        # lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
+        wb_interval = set(range(wb_hyp.start_frame, wb_hyp.end_frame+1))
         for item in word_alignment:
             li, ri = item[1], item[2]
-            if li <= lh <= ri or li <= rh <= ri or lh <= li <= rh or lh <= ri <= rh:
-                if not already_pasted:
+            item_interval = set(range(item[1], item[2]+1))
+            if wb_hyp.start_frame < li:
+                if not already_inserted:
                     new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
-                    already_pasted = True
-            else:
-                new_word_alignment.append(item)
-        word_alignment = new_word_alignment
+                    already_inserted = True
 
-    # boosted_text_list = [wb_hyp.word for wb_hyp in new_word_alignment]
+            intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
+            if intersection_part < 30:
+                new_word_alignment.append(item)
+            elif not already_inserted:
+                new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+                already_inserted = True
+        # insert last wb word:
+        if not already_inserted:
+            new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
+
+        word_alignment = new_word_alignment
+        print(f"wb_hyp: {wb_hyp.word:<10} -- ({wb_hyp.start_frame}, {wb_hyp.end_frame})")
+
     boosted_text_list = [item[0] for item in new_word_alignment]
     boosted_text = " ".join(boosted_text_list)
+    print(f"before: {ref_text}")
     print(f"after : {boosted_text}")
     
     return boosted_text
+
 
 
 @hydra_runner(config_path=None, config_name='EvalBeamSearchNGramConfig', schema=EvalBeamSearchNGramConfig)
@@ -451,22 +556,22 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
     wb_results = {}
     if cfg.applay_context_biasing:
-        # load context graph:
+        # # load context graph:
+        # context_transcripts = []
+        # for line in open(cfg.hotwords_file).readlines():
+        #     word = line.strip().lower()
+        #     context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+
         context_transcripts = []
         for line in open(cfg.hotwords_file).readlines():
-            word = line.strip().lower()
-            context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
+            item = line.strip().lower().split("-")
+            word = item[0]
+            word_tokenization = [asr_model.tokenizer.text_to_ids(x) for x in item[1:]]
+            context_transcripts.append([word, word_tokenization])
 
         context_graph = ContextGraphCTC(blank_id=asr_model.decoder.blank_idx)
         context_graph.build(context_transcripts)
 
-        # # get CTC logits:
-        # logging.warning("Getting CTC logprobs for CTC based word boosting...")
-        # with autocast():
-        #     with torch.no_grad():
-        #         if isinstance(asr_model, EncDecHybridRNNTCTCModel):
-        #             asr_model.cur_decoder = 'ctc'
-        #         ctc_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
 
         # run WB search:
         for idx, logits in tqdm(enumerate(all_probs), desc=f"CTC based word boosting...", ncols=120, total=len(all_probs)):
