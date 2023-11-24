@@ -63,6 +63,8 @@ import pickle
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import List, Optional
+import time
+import tempfile
 
 import editdistance
 import numpy as np
@@ -103,6 +105,7 @@ class EvalBeamSearchNGramConfig:
     beam_batch_size: int = 128  # The batch size to be used for beam search decoding
     device: str = "cuda"  # The device to load the model onto to calculate log probabilities
     use_amp: bool = False  # Whether to use AMP if available to calculate log probabilities
+    num_workers: int = 1  # Number of workers for DataLoader
 
     # for hybrid model
     decoder_type: Optional[str] = None # [ctc, rnnt] Decoder type for hybrid ctc-rnnt model
@@ -124,7 +127,7 @@ class EvalBeamSearchNGramConfig:
     hotwords_file: Optional[str] = None  # string with context biasing words (words splitted by space)
 
     # Context Biasing:
-    applay_context_biasing: bool = False
+    apply_context_biasing: bool = True
     context_score: float = 4.0  # per token weight for context biasing words
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
 
@@ -442,7 +445,7 @@ def merge_alignment_with_wb_hyps(
                     already_inserted = True
 
             intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
-            if intersection_part < 30:
+            if intersection_part < 75:
                 new_word_alignment.append(item)
             elif not already_inserted:
                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
@@ -535,13 +538,63 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
             autocast = default_autocast
 
+        # with autocast():
+        #     with torch.no_grad():
+        #         if isinstance(asr_model, EncDecHybridRNNTCTCModel):
+        #             asr_model.cur_decoder = 'ctc'
+        #         all_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
+
         with autocast():
             with torch.no_grad():
-                if isinstance(asr_model, EncDecHybridRNNTCTCModel):
-                    asr_model.cur_decoder = 'ctc'
-                all_logits = asr_model.transcribe(audio_file_paths, batch_size=cfg.acoustic_batch_size, logprobs=True)
+                asr_model.eval()
+                asr_model.encoder.freeze()
+                device = next(asr_model.parameters()).device
+                all_probs = []
+                ctc_logprobs = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
+                        for audio_file in audio_file_paths:
+                            entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
+                            fp.write(json.dumps(entry) + '\n')
+                    config = {
+                        'paths2audio_files': audio_file_paths,
+                        'batch_size': cfg.acoustic_batch_size,
+                        'temp_dir': tmpdir,
+                        'num_workers': cfg.num_workers,
+                        'channel_selector': None,
+                        'augmentor': None,
+                    }
+                    temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
 
-        all_probs = all_logits
+                    for test_batch in tqdm(temporary_datalayer, desc="Getting shared encoder outputs...", disable=False):
+                        # logging.warning(f"******************************************************")
+                        # logging.warning(f"[DEBUG]: test_batch[0].shape is: {test_batch[0].shape}")
+                        processed_signal, processed_signal_length = asr_model.preprocessor(
+                                    input_signal=test_batch[0].to(device), length=test_batch[1].to(device),
+                        )
+                        # logging.warning(f"[DEBUG]: processed_signal.shape is: {processed_signal.shape}")
+                        encoder_output = asr_model.encoder(audio_signal=processed_signal, length=processed_signal_length)
+                        encoded = encoder_output[0]
+                        encoded_len = encoder_output[1]
+                        # logging.warning(f"[DEBUG]: encoded.shape is: {encoded.shape}")
+                        
+                        # encoded, encoded_len = asr_model.forward(
+                        #     input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
+                        # )
+                        
+                        start_dec_time = time.time()
+
+                        ctc_dec_outputs = asr_model.ctc_decoder(encoder_output=encoded).cpu()
+                        # dump encoder embeddings per file
+                        for idx in range(encoded.shape[0]):
+                            # encoded_no_pad = encoded[idx, :, : encoded_len[idx]]
+                            ctc_dec_outputs_no_pad = ctc_dec_outputs[idx, : encoded_len[idx]]
+                            # all_probs.append(encoded_no_pad)
+                            ctc_logprobs.append(ctc_dec_outputs_no_pad)
+
+
+
+        all_probs = ctc_logprobs
         if cfg.probs_cache_file:
             logging.info(f"Writing pickle files of probabilities at '{cfg.probs_cache_file}'...")
             with open(cfg.probs_cache_file, 'wb') as f_dump:
@@ -555,7 +608,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
 ################################
 
     wb_results = {}
-    if cfg.applay_context_biasing:
+    if cfg.apply_context_biasing and cfg.decoding_mode == "greedy":
         # # load context graph:
         # context_transcripts = []
         # for line in open(cfg.hotwords_file).readlines():
@@ -611,7 +664,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         # raise KeyError
     
         # do CTC based word boosting
-        if cfg.applay_context_biasing and wb_results[audio_file_paths[batch_idx]]:
+        if cfg.apply_context_biasing and cfg.decoding_mode == "greedy" and  wb_results[audio_file_paths[batch_idx]]:
             # make new text by mearging alignment with ctc-wb predictions:
             print("----")
             boosted_text = merge_alignment_with_wb_hyps(
@@ -701,10 +754,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
         logging.info(f"==============================================================================================")
 
         # context biasing:
-        if cfg.hotwords_file:
+        if cfg.hotwords_file and cfg.apply_context_biasing:
             hotwords_list = []
             for line in open(cfg.hotwords_file).readlines():
-                word = line.strip().lower()
+                word = line.strip().split("-")[0].lower()
                 hotwords_list.append(word)
             cfg.decoding.pyctcdecode_cfg.hotwords = hotwords_list
             cfg.decoding.pyctcdecode_cfg.hotword_weight = cfg.hotword_weight
@@ -761,6 +814,8 @@ def main(cfg: EvalBeamSearchNGramConfig):
             f'Beam alpha = {best_cer_alpha}, Beam beta = {best_cer_beta}'
         )
         logging.info(f"=================================================================================")
+
+    print(f"[INFO]: Decoding only time (without encoder) is: {int(time.time() - start_dec_time)} sec")
 
 
 if __name__ == '__main__':

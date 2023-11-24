@@ -248,7 +248,7 @@ def recognize_wb(
     blank_thr = np.log(0.80)
 
     for frame in range(logprobs.shape[0]):
-        active_tokens.append(Token(start_state))
+        active_tokens.append(Token(start_state, start_frame=frame))
         logprob_frame = logprobs[frame]
         best_dist = None
         for token in active_tokens:
@@ -280,8 +280,8 @@ def recognize_wb(
                 # if transition_state != asr_model.decoder.blank_idx:
                 #     new_token.non_blank_score += logprob_frame[int(transition_state)].item() + context_score
 
-                if not new_token.start_frame:
-                    new_token.start_frame = frame
+                # if not new_token.start_frame:
+                #     new_token.start_frame = frame
 
                 # if end of word:
                 if new_token.state.is_end and new_token.dist > keyword_thr:

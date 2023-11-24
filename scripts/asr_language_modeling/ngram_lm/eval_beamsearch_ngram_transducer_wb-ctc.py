@@ -64,6 +64,7 @@ import tempfile
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import List, Optional
+import time
 
 import editdistance
 import numpy as np
@@ -120,7 +121,7 @@ class EvalWordBoostingConfig:
 
 
     ### Context Biasing ###:
-    applay_context_biasing: bool = True
+    apply_context_biasing: bool = True
     context_score: float = 4.0  # per token weight for context biasing words
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
 
@@ -197,6 +198,11 @@ def merge_alignment_with_wb_hyps(
     # merge wb_hyps and word alignment:
 
     for wb_hyp in wb_result:
+
+        # extend wb_hyp:
+        if wb_hyp.start_frame > 0:
+            wb_hyp.start_frame -= 1
+
         new_word_alignment = []
         already_inserted = False
         # lh, rh = wb_hyp.start_frame, wb_hyp.end_frame
@@ -210,7 +216,7 @@ def merge_alignment_with_wb_hyps(
                     already_inserted = True
 
             intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
-            if intersection_part < 30:
+            if intersection_part < 75:
                 new_word_alignment.append(item)
             elif not already_inserted:
                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
@@ -308,7 +314,7 @@ def decoding_step(
             for candidate_idx, candidate in enumerate(beams):  # type: (int, rnnt_beam_decoding.rnnt_utils.Hypothesis)
                 
                 ###################################
-                if cfg.applay_context_biasing and wb_results[audio_file_paths[sample_idx + beams_idx]]:
+                if cfg.apply_context_biasing and wb_results[audio_file_paths[sample_idx + beams_idx]]:
                     
                     # make new text by mearging alignment with ctc-wb predictions:
                     print("----")
@@ -488,6 +494,9 @@ def main(cfg: EvalWordBoostingConfig):
                         encoded, encoded_len = asr_model.forward(
                             input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
                         )
+                        
+                        start_dec_time = time.time()
+
                         ctc_dec_outputs = asr_model.ctc_decoder(encoder_output=encoded).cpu()
                         # dump encoder embeddings per file
                         for idx in range(encoded.shape[0]):
@@ -505,7 +514,7 @@ def main(cfg: EvalWordBoostingConfig):
 
     wb_results = {}
 
-    if cfg.applay_context_biasing:
+    if cfg.apply_context_biasing:
         # load context graph:
 
         # ## bpe dropout:
@@ -569,7 +578,7 @@ def main(cfg: EvalWordBoostingConfig):
                 beam_threshold=5,        # 5
                 context_score=5,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3 # 3.0 (4.0)
+                ctc_ali_token_weight=3.0 # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")
@@ -616,7 +625,8 @@ def main(cfg: EvalWordBoostingConfig):
         preds_output_manifest=preds_output_manifest,
         wb_results=wb_results,
     )
-    logging.info(f"Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
+    print(f"[INFO]: Greedy batch WER/CER = {candidate_wer:.2%}/{candidate_cer:.2%}")
+    print(f"[INFO]: Decoding only time (without encoder) is: {int(time.time() - start_dec_time)} sec")
 
 
 if __name__ == '__main__':

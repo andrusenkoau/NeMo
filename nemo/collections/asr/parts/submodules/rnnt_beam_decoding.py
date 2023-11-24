@@ -591,6 +591,7 @@ class BeamRNNTInfer(Typing):
             hi = h[:, i : i + 1, :]  # [1, 1, D]
             hyps = kept_hyps
             kept_hyps = []
+            max_while_loop_iters = 0
 
             while True:
                 max_hyp = max(hyps, key=lambda x: x.score)
@@ -670,6 +671,7 @@ class BeamRNNTInfer(Typing):
                             new_hyp.alignments[-1].append(
                                 (logprobs.clone(), torch.tensor(new_hyp.y_sequence[-1], dtype=torch.int32))
                             )
+                    max_while_loop_iters += 1
 
                 # keep those hypothesis that have scores greater than next search generation
                 hyps_max = float(max(hyps, key=lambda x: x.score).score)
@@ -677,13 +679,15 @@ class BeamRNNTInfer(Typing):
 
                 # If enough hypothesis have scores greater than next search generation,
                 # stop beam search.
-                if len(kept_most_prob) >= beam:
+                if len(kept_most_prob) >= beam or max_while_loop_iters > 1000:
                     if self.preserve_alignments:
                         # convert Ti-th logits into a torch array
                         for kept_h in kept_most_prob:
                             kept_h.alignments.append([])  # blank buffer for next timestep
-
-                    kept_hyps = kept_most_prob
+                    if kept_most_prob:
+                        kept_hyps = kept_most_prob
+                    # if max_while_loop_iters > 10000:
+                    #     logging.warning(f"[DEBUG]: len(kept_most_prob) is: {len(kept_most_prob)}")
                     break
         
         if self.context_graph:
@@ -1566,7 +1570,7 @@ class BeamRNNTInferConfig:
     language_model: Optional[Dict[str, Any]] = None
     softmax_temperature: float = 1.0
     preserve_alignments: bool = False
-    preserve_frame_confidence: bool = True
+    preserve_frame_confidence: bool = False
     ngram_lm_model: Optional[str] = None
     ngram_lm_alpha: Optional[float] = 0.0
     hat_subtract_ilm: bool = False
