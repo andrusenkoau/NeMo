@@ -364,7 +364,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
     asr_model = asr_model.to('cpu')
 
     # save logprobs:
-    torch.save(all_probs, os.path.join(cfg.preds_output_folder, "ctc_logprobs.pt"))
+    # torch.save(all_probs, os.path.join(cfg.preds_output_folder, "ctc_logprobs.pt"))
 
 
     preds_output_manifest = os.path.join(cfg.preds_output_folder, "recognition_results.json")

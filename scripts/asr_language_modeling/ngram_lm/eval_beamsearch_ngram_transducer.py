@@ -64,6 +64,7 @@ import tempfile
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import List, Optional
+import time
 
 import editdistance
 import numpy as np
@@ -120,6 +121,7 @@ class EvalBeamSearchNGramConfig:
     hat_ilm_weight: List[float] = field(default_factory=lambda: [0.0])
 
     # Context Biasing:
+    apply_context_biasing: bool = True
     context_score: float = 1.0  # per token weight for context biasing words
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
 
@@ -384,10 +386,13 @@ def main(cfg: EvalBeamSearchNGramConfig):
                         'augmentor': None,
                     }
                     temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
-                    for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=True):
+                    for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=False):
                         encoded, encoded_len = asr_model.forward(
                             input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
                         )
+                        
+                        start_dec_time = time.time()
+
                         # dump encoder embeddings per file
                         for idx in range(encoded.shape[0]):
                             encoded_no_pad = encoded[idx, :, : encoded_len[idx]]
@@ -397,6 +402,35 @@ def main(cfg: EvalBeamSearchNGramConfig):
             logging.info(f"Writing pickle files of probabilities at '{cfg.probs_cache_file}'...")
             with open(cfg.probs_cache_file, 'wb') as f_dump:
                 pickle.dump(all_probs, f_dump)
+
+
+    # sort all_probs according to length:
+    # all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
+    # all_probs_sorted = []
+    # target_transcripts_sorted = []
+    # audio_file_paths_sorted = []
+    # for pair in all_probs_with_indeces:
+    #     all_probs_sorted.append(pair[1])
+    #     target_transcripts_sorted.append(target_transcripts[pair[0]])
+    #     audio_file_paths_sorted.append(audio_file_paths[pair[0]])
+    # all_probs = all_probs_sorted
+    # target_transcripts = target_transcripts_sorted
+    # audio_file_paths = audio_file_paths_sorted
+    all_probs_with_indeces = (sorted(enumerate(all_probs), key=lambda x: x[1].size()[1], reverse=True))
+    all_probs_sorted = []
+    target_transcripts_sorted = []
+    audio_file_paths_sorted = []
+    durations_sorted = []
+    for pair in all_probs_with_indeces:
+        all_probs_sorted.append(pair[1])
+        target_transcripts_sorted.append(target_transcripts[pair[0]])
+        audio_file_paths_sorted.append(audio_file_paths[pair[0]])
+        durations_sorted.append(durations[pair[0]])
+    all_probs = all_probs_sorted
+    target_transcripts = target_transcripts_sorted
+    audio_file_paths = audio_file_paths_sorted
+    durations = durations_sorted
+
 
     if cfg.decoding_strategy.startswith("greedy"):
         asr_model = asr_model.to('cpu')
@@ -444,10 +478,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
         logging.info(f"==============================================================================================")
 
         # context biasing:
-        if cfg.context_file:
+        if cfg.apply_context_biasing and cfg.context_file:
             context_transcripts = []
             for line in open(cfg.context_file).readlines():
-                word = line.strip().lower()
+                word = line.strip().split("-")[0].lower()
                 context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
             # for word in cfg.context_str.split('_'):
             #     context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
@@ -553,6 +587,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
             f'maes_prefix_alpha = {best_cer_ma}, maes_expansion_gamma = {best_cer_mg}'
         )
         logging.info(f"=================================================================================")
+        print(f"[INFO]: Decoding only time (without encoder) is: {int(time.time() - start_dec_time)} sec")
 
 
 if __name__ == '__main__':
