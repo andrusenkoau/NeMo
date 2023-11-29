@@ -122,8 +122,10 @@ class EvalWordBoostingConfig:
 
     ### Context Biasing ###:
     apply_context_biasing: bool = True
-    context_score: float = 4.0  # per token weight for context biasing words
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
+    context_score: float = 5.0  # per token weight for context biasing words
+    beam_threshold: float = 5.0 # beam pruning threshold for ctc-ws decoding
+    ctc_ali_token_weight: float = 3.0 # weight of greedy CTC token to prevent false accept errors
 
     sort_logits: bool = True # do logits sorting before decoding - it reduces computation on puddings
     softmax_temperature: float = 1.00
@@ -575,10 +577,10 @@ def main(cfg: EvalWordBoostingConfig):
                 logits.numpy(),
                 context_graph,
                 asr_model,
-                beam_threshold=5,        # 5
-                context_score=5,         # 5 (4)
+                beam_threshold=cfg.beam_threshold,        # 5
+                context_score=cfg.context_score,         # 5 (4)
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3.0 # 3.0 (4.0)
+                ctc_ali_token_weight=cfg.ctc_ali_token_weight # 3.0 (4.0)
             )
             # except:
             #     logging.warning("-------------------------")
