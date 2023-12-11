@@ -633,10 +633,10 @@ def main(cfg: EvalBeamSearchNGramConfig):
                 logits.numpy(),
                 context_graph,
                 asr_model,
-                beam_threshold=5,        # 5
-                context_score=5,         # 5
+                beam_threshold=5.0,        # 5
+                context_score=3.0,         # 5
                 keyword_thr=-5,          # -5
-                ctc_ali_token_weight=3.0 # 3.0
+                ctc_ali_token_weight=0.6 # 3.0
             )
             # except:
             #     logging.warning("-------------------------")

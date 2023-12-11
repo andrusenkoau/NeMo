@@ -123,9 +123,9 @@ class EvalWordBoostingConfig:
     ### Context Biasing ###:
     apply_context_biasing: bool = True
     context_file: Optional[str] = None  # string with context biasing words (words splitted by space)
-    context_score: float = 5.0  # per token weight for context biasing words
+    context_score: float = 3.0  # per token weight for context biasing words
     beam_threshold: float = 5.0 # beam pruning threshold for ctc-ws decoding
-    ctc_ali_token_weight: float = 3.0 # weight of greedy CTC token to prevent false accept errors
+    ctc_ali_token_weight: float = 0.6 # weight of greedy CTC token to prevent false accept errors
 
     sort_logits: bool = True # do logits sorting before decoding - it reduces computation on puddings
     softmax_temperature: float = 1.00
@@ -218,7 +218,7 @@ def merge_alignment_with_wb_hyps(
                     already_inserted = True
 
             intersection_part = 100/len(item_interval) * len(wb_interval & item_interval)
-            if intersection_part < 75:
+            if intersection_part <= 50:
                 new_word_alignment.append(item)
             elif not already_inserted:
                 new_word_alignment.append((wb_hyp.word, wb_hyp.start_frame, wb_hyp.end_frame))
