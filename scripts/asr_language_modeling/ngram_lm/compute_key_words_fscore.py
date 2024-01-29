@@ -118,7 +118,7 @@ def main():
     #key_words_list = [x for x in args.key_words_list.split('_')]
     key_words_list = []
     for line in open(args.key_words_file).readlines():
-        item = line.strip().split("-")[0].lower()
+        item = line.strip().split("_")[0].lower()
         # item = line.strip().lower()
         if item not in key_words_list:
             key_words_list.append(item)

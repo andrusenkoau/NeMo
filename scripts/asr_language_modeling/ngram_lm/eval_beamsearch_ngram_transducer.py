@@ -481,7 +481,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         if cfg.apply_context_biasing and cfg.context_file:
             context_transcripts = []
             for line in open(cfg.context_file).readlines():
-                word = line.strip().split("-")[0].lower()
+                word = line.strip().split("_")[0].lower()
                 context_transcripts.append(asr_model.tokenizer.text_to_ids(word))
             # for word in cfg.context_str.split('_'):
             #     context_transcripts.append(asr_model.tokenizer.text_to_ids(word))

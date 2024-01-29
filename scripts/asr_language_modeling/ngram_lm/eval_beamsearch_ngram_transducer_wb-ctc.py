@@ -559,7 +559,7 @@ def main(cfg: EvalWordBoostingConfig):
         ## no bpe dropout:
         context_transcripts = []
         for line in open(cfg.context_file).readlines():
-            item = line.strip().lower().split("-")
+            item = line.strip().lower().split("_")
             word = item[0]
             word_tokenization = [asr_model.tokenizer.text_to_ids(x) for x in item[1:]]
             context_transcripts.append([word, word_tokenization])

@@ -617,7 +617,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
 
         context_transcripts = []
         for line in open(cfg.hotwords_file).readlines():
-            item = line.strip().lower().split("-")
+            item = line.strip().lower().split("_")
             word = item[0]
             word_tokenization = [asr_model.tokenizer.text_to_ids(x) for x in item[1:]]
             context_transcripts.append([word, word_tokenization])
@@ -757,7 +757,7 @@ def main(cfg: EvalBeamSearchNGramConfig):
         if cfg.hotwords_file and cfg.apply_context_biasing:
             hotwords_list = []
             for line in open(cfg.hotwords_file).readlines():
-                word = line.strip().split("-")[0].lower()
+                word = line.strip().split("_")[0].lower()
                 hotwords_list.append(word)
             cfg.decoding.pyctcdecode_cfg.hotwords = hotwords_list
             cfg.decoding.pyctcdecode_cfg.hotword_weight = cfg.hotword_weight
