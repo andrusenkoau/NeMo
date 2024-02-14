@@ -1,7 +1,7 @@
 ---
 title: CTC-WS
 author: [Andrei Andrusenko, Aleksandr Laptev, Vladimir Bataev, Vitaly Lavrukhin, Boris Ginsburg]
-author_gh_user: [Github User 1, Github User 2]
+author_gh_user: [andrusenkoau, GNroy, artbataev, vsl9, borisgin]
 readtime: 10
 date: 2024-02-16
 
@@ -23,8 +23,8 @@ categories:
 Improving the recognition of rare and new words is essential for contextualized Automatic Speech Recognition (ASR) systems. Most context-biasing methods are based on ASR model modifications or decoding in beam-search mode that require model retraining or resource-intensive decoding. This post explains how to use a fast and accurate context-biasing method by CTC-based Word Spotter (CTC-WS) for CTC and Transducer (RNNT) ASR models in NeMo.
 
 <figure markdown>
-  <img src="https://github.com/NVIDIA/NeMo/releases/download/v1.22.0/asset-post-v1.22.0-ctcws.png" alt="CTC-WS" style="width: 50%;"> <!-- Adjust the width as needed -->
-  <figcaption><b>Figure 1.</b> <i> Context-biasing with CTC-based Word Spotter. Detected words (gpu, nvidia, cuda) are compared with words from the greedy CTC results in the overlapping intervals according to the accumulated scores to prevent false accept recognition. </i></figcaption>
+  <img src="https://github.com/NVIDIA/NeMo/releases/download/v1.22.0/asset-post-v1.22.0-ctcws_scheme_2.png" alt="CTC-WS" style="width: 60%;" height="auto"> <!-- Adjust the width as needed -->
+  <figcaption><b>Figure 1.</b> <i> High-level representation of the proposed context-biasing method with CTC-WS in case of CTC model. Detected words (gpu, nvidia, cuda) are compared with words from the greedy CTC results in the overlapping intervals according to the accumulated scores to prevent false accept replacement. </i></figcaption>
 </figure>
 
 <!-- more -->
@@ -41,8 +41,12 @@ Moreover, for models like the Transducer (RNNT) model, which involves multiple c
 
 ## CTC-WS
 
-The NVIDIA NeMo team introduces a novel fast context-biasing technique employing a CTC-based Word Spotter (CTC-WS). This method involves decoding CTC log probabilities using a context graph constructed from words and phrases in the context-biasing list. Detected context-biasing candidates (along with their scores and time intervals) are compared against the scores of words from the greedy CTC decoding results to enhance recognition accuracy and mitigate false acceptances of context-biasing (see Figure 1).
+The NVIDIA NeMo team introduces a novel fast context-biasing technique employing a CTC-based Word Spotter (CTC-WS). This method involves decoding CTC log probabilities using a context graph constructed from words and phrases in the context-biasing list. Detected context-biasing candidates (along with their scores and time intervals) are compared against the scores of words from the greedy CTC decoding results to enhance recognition accuracy and mitigate false acceptances of context-biasing (see Figure 2).
 
+<figure markdown>
+  <img src="https://github.com/NVIDIA/NeMo/releases/download/v1.22.0/asset-post-v1.22.0-ctcws_scheme_1.png" alt="CTC-WS" style="width: 65%;" align="center"> <!-- Adjust the width as needed -->
+  <figcaption><b>Figure 2.</b> <i> Scheme of the context-biasing method with CTC-based Word Spotter. CTC-WS uses CTC log probabilities to detect context-biasing candidates. Obtained candidates are filtered by CTC word alignment and then merged with CTC or RNN-T word alignment to get the final text result. </i></figcaption>
+</figure>
 
 
 Utilizing a Hybrid Transducer-CTC model (a shared encoder trained jointly with CTC and Transducer output heads) enables the integration of the CTC-WS method into the Transducer model. Context-biasing candidates identified by CTC-WS are further refined based on their scores compared to greedy CTC predictions before merging with greedy Transducer results.
