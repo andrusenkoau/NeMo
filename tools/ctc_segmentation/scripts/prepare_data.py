@@ -354,7 +354,9 @@ if __name__ == "__main__":
             asr_model = ASRModel.from_pretrained(model_name=args.model)  # type: ASRModel
             model_name = args.model
 
+        
         vocabulary = asr_model.cfg.decoder.vocabulary
+        #vocabulary = asr_model.tokenizer.tokenizer.get_vocab()
 
         if os.path.isdir(args.in_text):
             text_files = glob(f"{args.in_text}/*.txt")

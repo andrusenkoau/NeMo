@@ -78,6 +78,7 @@ if __name__ == "__main__":
     else:
         try:
             asr_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(args.model)
+            #asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.model)
         except:
             raise ValueError(
                 f"Provide path to the pretrained checkpoint or choose from {nemo_asr.models.EncDecCTCModel.get_available_model_names()}"
@@ -93,6 +94,7 @@ if __name__ == "__main__":
 
     # extract ASR vocabulary and add blank symbol
     vocabulary = ["ε"] + list(asr_model.cfg.decoder.vocabulary)
+    #vocabulary = ["ε"] + list(asr_model.tokenizer.tokenizer.get_vocab())
     logging.debug(f"ASR Model vocabulary: {vocabulary}")
 
     data = Path(args.data)
