@@ -39,6 +39,7 @@ def get_segments(
     window_size: int = 8000,
     log_file: str = "log.log",
     debug: bool = False,
+    use_pc_model: bool = True,
 ) -> None:
     """
     Segments the audio into segments and saves segments timings to a file
@@ -62,23 +63,36 @@ def get_segments(
     logging.basicConfig(handlers=handlers, level=level)
 
     try:
-        with open(transcript_file, "r") as f:
+        
+        # with open(transcript_file, "r") as f:
+        #     text = f.readlines()
+        #     text = [t.strip() for t in text if t.strip()]
+
+
+        # add corresponding normalized original text
+        transcript_file_normalized = transcript_file.replace(".txt", ".pc.txt")
+        if not os.path.exists(transcript_file_normalized):
+            raise ValueError(f"{transcript_file_normalized} not found.")
+
+        # add corresponding original text without pre-processing
+        transcript_file_no_preprocessing = transcript_file.replace(".txt", ".origin.txt")
+        if not os.path.exists(transcript_file_no_preprocessing):
+            raise ValueError(f"{transcript_file_no_preprocessing} not found.")
+
+        # if we are using a PC model, we need to use the original transcript file
+        if not use_pc_model:
+            main_transcript_file = transcript_file
+        else:
+            # raise ValueError("PC model not supported.")
+            main_transcript_file = transcript_file_normalized
+        with open(main_transcript_file, "r") as f:
             text = f.readlines()
             text = [t.strip() for t in text if t.strip()]
 
-        # add corresponding original text without pre-processing
-        transcript_file_no_preprocessing = transcript_file.replace(".txt", "_with_punct.txt")
-        if not os.path.exists(transcript_file_no_preprocessing):
-            raise ValueError(f"{transcript_file_no_preprocessing} not found.")
 
         with open(transcript_file_no_preprocessing, "r") as f:
             text_no_preprocessing = f.readlines()
             text_no_preprocessing = [t.strip() for t in text_no_preprocessing if t.strip()]
-
-        # add corresponding normalized original text
-        transcript_file_normalized = transcript_file.replace(".txt", "_with_punct_normalized.txt")
-        if not os.path.exists(transcript_file_normalized):
-            raise ValueError(f"{transcript_file_normalized} not found.")
 
         with open(transcript_file_normalized, "r") as f:
             text_normalized = f.readlines()
@@ -114,6 +128,12 @@ def get_segments(
 
         timings, char_probs, char_list = cs.ctc_segmentation(config, log_probs, ground_truth_mat)
         _print(ground_truth_mat, vocabulary)
+        
+        if use_pc_model:
+            with open(transcript_file, "r") as f:
+                text = f.readlines()
+                text = [t.strip() for t in text if t.strip()]
+        
         segments = determine_utterance_segments(config, utt_begin_indices, char_probs, timings, text, char_list)
 
         write_output(output_file, path_wav, segments, text, text_no_preprocessing, text_normalized)

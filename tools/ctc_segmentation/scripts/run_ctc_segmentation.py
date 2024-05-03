@@ -77,14 +77,25 @@ if __name__ == "__main__":
         asr_model = nemo_asr.models.EncDecCTCModel.from_pretrained(args.model, strict=False)
     else:
         try:
-            asr_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(args.model)
-            #asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.model)
+            if not args.model == "stt_en_fastconformer_hybrid_large_pc":
+                if args.model == "stt_en_fastconformer_ctc_large":
+                    asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.model)
+                    asr_model.change_attention_model(self_attention_model="rel_pos_local_attn", att_context_size=[64, 64])
+                else:
+                    asr_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(args.model)
+            else:
+                asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.model)
+                asr_model.change_decoding_strategy(decoder_type="ctc")
+                asr_model.change_attention_model(self_attention_model="rel_pos_local_attn", att_context_size=[64, 64])
         except:
             raise ValueError(
                 f"Provide path to the pretrained checkpoint or choose from {nemo_asr.models.EncDecCTCModel.get_available_model_names()}"
             )
 
-    bpe_model = isinstance(asr_model, nemo_asr.models.EncDecCTCModelBPE)
+    if not args.model == "stt_en_fastconformer_hybrid_large_pc":
+        bpe_model = isinstance(asr_model, nemo_asr.models.EncDecCTCModelBPE)
+    else:
+        bpe_model = isinstance(asr_model, nemo_asr.models.EncDecHybridRNNTCTCBPEModel)
 
     # get tokenizer used during training, None for char based models
     if bpe_model:
@@ -93,8 +104,10 @@ if __name__ == "__main__":
         tokenizer = None
 
     # extract ASR vocabulary and add blank symbol
-    vocabulary = ["ε"] + list(asr_model.cfg.decoder.vocabulary)
-    #vocabulary = ["ε"] + list(asr_model.tokenizer.tokenizer.get_vocab())
+    if not args.model == "stt_en_fastconformer_hybrid_large_pc":
+        vocabulary = ["ε"] + list(asr_model.cfg.decoder.vocabulary)
+    else:
+        vocabulary = ["ε"] + list(asr_model.tokenizer.tokenizer.get_vocab())
     logging.debug(f"ASR Model vocabulary: {vocabulary}")
 
     data = Path(args.data)
@@ -138,9 +151,16 @@ if __name__ == "__main__":
             logging.debug(f"len(signal): {len(signal)}, sr: {sample_rate}")
             logging.debug(f"Duration: {original_duration}s, file_name: {path_audio}")
 
-            log_probs = asr_model.transcribe(audio=[str(path_audio)], batch_size=1, return_hypotheses=True)[
-                0
-            ].alignments
+            if not args.model == "stt_en_fastconformer_hybrid_large_pc":
+                log_probs = asr_model.transcribe(audio=[str(path_audio)], batch_size=1, return_hypotheses=True)[
+                    0
+                ].alignments
+            else:
+                log_probs = asr_model.transcribe(audio=[str(path_audio)], batch_size=1, return_hypotheses=True)[0][0].alignments
+            
+            # logging.warning(f"************************************")
+            # logging.warning(f"log_probs: {log_probs.shape}")
+            # raise ValueError("Stop here")
             # move blank values to the first column (ctc-package compatibility)
             blank_col = log_probs[:, -1].reshape((log_probs.shape[0], 1))
             log_probs = np.concatenate((blank_col, log_probs[:, :-1]), axis=1)
@@ -178,6 +198,7 @@ if __name__ == "__main__":
                 args.window_len,
                 log_file=log_file,
                 debug=args.debug,
+                use_pc_model=args.model == "stt_en_fastconformer_hybrid_large_pc",
             )
             for i in tqdm(range(len(all_log_probs)))
         )

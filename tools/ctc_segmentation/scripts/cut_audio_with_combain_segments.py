@@ -46,13 +46,13 @@ parser.add_argument(
     "--max_duration",
     type=int,
     help="Maximum audio duration (seconds). Samples that are longer will be dropped",
-    default=60,
+    default=40,
 )
 parser.add_argument(
     "--max_silence",
     type=float,
     help="Maximum silence duration to combain segments, s",
-    default=0.5,
+    default=1.5,
 )
 
 @dataclass
@@ -108,7 +108,7 @@ def process_alignment(alignment_file: str, manifest: str, clips_dir: str, args):
     
     # set distribution
     population = [1, 2]
-    weights = [0.85, 0.15]
+    weights = [0.80, 0.20]
 
     with open(manifest, "a", encoding="utf8") as f:
         new_segment = None
@@ -128,6 +128,7 @@ def process_alignment(alignment_file: str, manifest: str, clips_dir: str, args):
                                             text_normalized=ref_text_normalized[i].strip(),)
             else:
                 do_merge = choices(population, weights)[0] == 1
+                # do_merge = False
                 if st - new_segment.end_time < args.max_silence and end - new_segment.start_time < args.max_duration and do_merge:
                     new_segment.end_time = end
                     new_segment.text_processed += f" {ref_text_processed[i].strip()}"
@@ -146,8 +147,8 @@ def process_alignment(alignment_file: str, manifest: str, clips_dir: str, args):
                             "audio_filepath": audio_filepath,
                             "duration": duration,
                             "text": new_segment.text_processed,
-                            "text_no_preprocessing": new_segment.text_no_preprocessing,
-                            "text_normalized": new_segment.text_normalized,
+                            "text_pc": new_segment.text_normalized,
+                            "text_origin": new_segment.text_no_preprocessing,
                             "start_abs": float(np.mean(np.abs(segment_samples[:num_samples]))),
                             "end_abs": float(np.mean(np.abs(segment_samples[-num_samples:]))),
                         }

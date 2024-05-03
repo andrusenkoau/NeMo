@@ -17,6 +17,7 @@ import os
 import re
 from glob import glob
 from typing import List, Optional
+import logging
 
 import regex
 from joblib import Parallel, delayed
@@ -242,11 +243,13 @@ def split_text(
 
     vocabulary_symbols = []
     for x in vocabulary:
-        if x != "<unk>":
+        if x != "<unk>" and x not in ".,?!":
             # for BPE models
             vocabulary_symbols.extend([x for x in x.replace("##", "").replace("▁", "")])
     vocabulary_symbols = list(set(vocabulary_symbols))
     vocabulary_symbols += [x.upper() for x in vocabulary_symbols]
+    # logging.warning(f"{vocabulary}")
+    # raise ValueError("Stop here")
 
     # check to make sure there will be no utterances for segmentation with only OOV symbols
     vocab_no_space_with_digits = set(vocabulary_symbols + [str(i) for i in range(10)])
@@ -355,8 +358,10 @@ if __name__ == "__main__":
             model_name = args.model
 
         
-        vocabulary = asr_model.cfg.decoder.vocabulary
-        #vocabulary = asr_model.tokenizer.tokenizer.get_vocab()
+        if not args.model == "stt_en_fastconformer_hybrid_large_pc":
+            vocabulary = asr_model.cfg.decoder.vocabulary
+        else:
+            vocabulary = asr_model.tokenizer.tokenizer.get_vocab()
 
         if os.path.isdir(args.in_text):
             text_files = glob(f"{args.in_text}/*.txt")
