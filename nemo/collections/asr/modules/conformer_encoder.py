@@ -17,6 +17,7 @@ import random
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
+from torch.profiler import profile, record_function
 
 import torch
 import torch.distributed
@@ -527,15 +528,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         audio_signal = torch.transpose(audio_signal, 1, 2)
 
-        if isinstance(self.pre_encode, nn.Linear):
-            audio_signal = self.pre_encode(audio_signal)
-        else:
-            audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
-            length = length.to(torch.int64)
-            # self.streaming_cfg is set by setup_streaming_cfg(), called in the init
-            if self.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
-                audio_signal = audio_signal[:, self.streaming_cfg.drop_extra_pre_encoded :, :]
-                length = (length - self.streaming_cfg.drop_extra_pre_encoded).clamp(min=0)
+        with record_function(f"downsampling_step"):
+            if isinstance(self.pre_encode, nn.Linear):
+                audio_signal = self.pre_encode(audio_signal)
+            else:
+                audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
+                length = length.to(torch.int64)
+                # self.streaming_cfg is set by setup_streaming_cfg(), called in the init
+                if self.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
+                    audio_signal = audio_signal[:, self.streaming_cfg.drop_extra_pre_encoded :, :]
+                    length = (length - self.streaming_cfg.drop_extra_pre_encoded).clamp(min=0)
 
         if self.reduction_position is not None and cache_last_channel is not None:
             raise ValueError("Caching with reduction feature is not supported yet!")
