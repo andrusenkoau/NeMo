@@ -73,7 +73,7 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             }
         )
 
-    def __init__(self, cfg: DictConfig):
+    def __init__(self, cfg: DictConfig, tokenizer):
         super().__init__()
         # Initialize components
         self.cfg = cfg
@@ -85,21 +85,24 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             raise ValueError(
                 "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
             )
-        with open_dict(self.cfg.aux_ctc):
-            if "feat_in" not in self.cfg.aux_ctc.decoder or (
-                not self.cfg.aux_ctc.decoder.feat_in and hasattr(self.encoder, '_feat_out')
-            ):
-                self.cfg.aux_ctc.decoder.feat_in = self.encoder._feat_out
-            if "feat_in" not in self.cfg.aux_ctc.decoder or not self.cfg.aux_ctc.decoder.feat_in:
-                raise ValueError("param feat_in of the decoder's config is not set!")
+        # with open_dict(self.cfg.aux_ctc):
+        #     if "feat_in" not in self.cfg.aux_ctc.decoder or (
+        #         not self.cfg.aux_ctc.decoder.feat_in and hasattr(self.encoder, '_feat_out')
+        #     ):
+        #         self.cfg.aux_ctc.decoder.feat_in = self.encoder._feat_out
+        #     if "feat_in" not in self.cfg.aux_ctc.decoder or not self.cfg.aux_ctc.decoder.feat_in:
+        #         raise ValueError("param feat_in of the decoder's config is not set!")
 
-            if self.cfg.aux_ctc.decoder.num_classes < 1 and self.cfg.aux_ctc.decoder.vocabulary is not None:
-                logging.info(
-                    "\nReplacing placeholder number of classes ({}) with actual number of classes - {}".format(
-                        self.cfg.aux_ctc.decoder.num_classes, len(self.cfg.aux_ctc.decoder.vocabulary)
-                    )
-                )
-                self.cfg.aux_ctc.decoder["num_classes"] = len(self.cfg.aux_ctc.decoder.vocabulary)
+        #     if self.cfg.aux_ctc.decoder.num_classes < 1 and self.cfg.aux_ctc.decoder.vocabulary is not None:
+        #         logging.info(
+        #             "\nReplacing placeholder number of classes ({}) with actual number of classes - {}".format(
+        #                 self.cfg.aux_ctc.decoder.num_classes, len(self.cfg.aux_ctc.decoder.vocabulary)
+        #             )
+        #         )
+        #         self.cfg.aux_ctc.decoder["num_classes"] = len(self.cfg.aux_ctc.decoder.vocabulary)
+
+        self.cfg.aux_ctc.decoder.vocabulary = [1]*len(tokenizer.vocab)
+        self.cfg.aux_ctc.decoder.num_classes = len(tokenizer.vocab)
 
         self.ctc_decoder = self.from_config_dict(self.cfg.aux_ctc.decoder)
         self.ctc_loss_weight = self.cfg.aux_ctc.get("ctc_loss_weight", 0.2)

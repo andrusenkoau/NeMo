@@ -145,9 +145,15 @@ def collate_text_data(
     all_tokens = collate_vectors(fields["input_ids"], max_length=max_length, padding_value=pad_id)
     full_lengths = torch.LongTensor([len(item) for item in fields["input_ids"]])
 
+    # ctc tokens:
+    max_length_ctc = max(fields["ctc_tokens_length"])
+    all_ctc_tokens = collate_vectors(fields["ctc_tokens_ids"], max_length=max_length_ctc, padding_value=pad_id)
+
     assert max_length <= max_seq_length, f"{max_length=} <= {max_seq_length=}"
 
     return {
+        "ctc_tokens": all_ctc_tokens,
+        "ctc_tokens_length": torch.LongTensor([len(item) for item in fields["ctc_tokens_ids"]]),
         "tokens": all_tokens[:, :-1],
         "tokens_length": full_lengths - 1,
         "labels": all_tokens[:, 1:],

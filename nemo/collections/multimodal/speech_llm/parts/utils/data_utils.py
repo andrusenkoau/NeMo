@@ -313,6 +313,10 @@ class TextProcessing:
             pre_pad = []
         answer_text = text[len(context) :]
         answer_ids = pre_pad + self.tokenizer.text_to_ids(answer_text, self.sample_alpha)
+
+        # Labels for ctc head
+        ctc_tokens_ids = answer_ids[1:]
+
         if self.end_string:
             answer_ids += self.tokenizer.text_to_ids(self.end_string)
 
@@ -370,6 +374,7 @@ class TextProcessing:
             logging.warning(f'Input ids length {len(input_ids)} exceed max sequence length {self.max_seq_length}')
             input_ids = input_ids[: self.max_seq_length]
 
+        
         processed_example = {
             'input_ids': (input_ids),
             'answer_start_idx': (answer_start_idx),
@@ -377,6 +382,8 @@ class TextProcessing:
             'context_length': len(context_ids),
             'answer_ids': (answer_ids),
             'context_start_idx': context_start_idx,
+            'ctc_tokens_ids': ctc_tokens_ids,
+            'ctc_tokens_length': len(ctc_tokens_ids),
         }
 
         return processed_example

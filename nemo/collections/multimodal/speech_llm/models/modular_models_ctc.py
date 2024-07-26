@@ -78,10 +78,10 @@ default_inference_config = {'tokens_to_generate': 30}
 class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     """Modularized speech GPT model."""
 
-    def setup_perception_modules(self, cfg):
+    def setup_perception_modules(self, cfg, tokenizer):
         if 'target' in cfg.perception:
             imported_cls = model_utils.import_class_by_path(cfg.perception.target)
-            self.perception = imported_cls(cfg=cfg.perception)
+            self.perception = imported_cls(cfg=cfg.perception, tokenizer=tokenizer)
         else:
             self.perception = (
                 AudioPerceptionModule(cfg=cfg.perception)
@@ -94,7 +94,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         super().__init__(cfg, trainer)
         # handle the case where the batch size from dynamic bucketting is not divisible in lhotse
         self.enforce_divisible_batch = False
-        self.setup_perception_modules(cfg)
+        self.setup_perception_modules(cfg, self.tokenizer)
 
         # print out params in more details
         self.summarize(max_depth=2)
@@ -489,21 +489,40 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 loss_for_ub = self.loss_func(batch['loss_mask'], batch['num_valid_tokens_in_ub'], output_tensor)
                 cp_size = self.cfg.get('context_parallel_size', 1)
 
-                # compute ctc loss
-                ctc_loss = self.perception.ctc_loss(
-                    log_probs=ctc_head_output[0],
-                    targets=batch["tokens"],
-                    input_lengths=ctc_head_output[1],
-                    target_lengths=batch["tokens_length"]
-                )
+                # # compute ctc loss
+                # ctc_loss = self.perception.ctc_loss(
+                #     log_probs=ctc_head_output[0],
+                #     targets=batch["ctc_tokens"],
+                #     input_lengths=ctc_head_output[1],
+                #     target_lengths=batch["ctc_tokens_length"],
+                # )
+                # self.log("auc_ctc_loss", ctc_loss, batch_size=1)
+
+                # loss_for_ub = (1 - self.perception.ctc_loss_weight) * loss_for_ub + self.perception.ctc_loss_weight * ctc_loss
+
+                # logging.warning("*************"*10)
+                # # logging.warning(f"batch: {batch}")
+                # # logging.warning(f"ctc_head_output[0].shape: {ctc_head_output[0].shape}")
+                # logging.warning(f"batch['ctc_tokens']: {batch['ctc_tokens']}")
+                # logging.warning(f"batch['ctc_tokens'][0]: {self.tokenizer.ids_to_tokens(batch['ctc_tokens'][0].tolist())}")
+                # # logging.warning(f"batch['labels']: {batch['labels']}")
+                # # logging.warning(f"ctc_head_output[1]: {ctc_head_output[1]}")
+                # # logging.warning(f"batch['tokens_length']: {batch['tokens_length']}")
+                # logging.warning(f"CTC Loss: {ctc_loss}")
+                # logging.warning(f"loss_for_ub: {loss_for_ub}")
+                # raise NotImplementedError("CTC loss implementation in progress...")
 
                 if self.cfg.data.get(
                     "return_output_tensors", False
                 ):  # TODO: need a better way to check if loss_func is returning more stuff than just loss... (@adithyare)
                     loss_for_ub, q_hs, d_hs, pos_cs, neg_cs, diff_cs = loss_for_ub
+                    # logging.warning("*************"*10)
+                    # logging.warning(f"loss_for_ub loss: {loss_for_ub}")
+                    # raise NotImplementedError("CTC loss implementation in progress...")
+                    # loss_for_ub = (1 - self.perception.ctc_loss_weight) * loss_for_ub + self.perception.ctc_loss_weight * ctc_loss
                     reduced_loss = average_losses_across_data_parallel_group([loss_for_ub])
 
-                    loss_for_ub = (1 - self.perception.ctc_loss_weight) * loss_for_ub + self.perception.ctc_loss_weight * ctc_loss
+                    
 
                     pos_cs = average_losses_across_data_parallel_group([pos_cs])
                     neg_cs = average_losses_across_data_parallel_group([neg_cs])
