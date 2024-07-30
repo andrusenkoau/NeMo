@@ -44,7 +44,7 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
         """initialize the batch data before the inference steps."""
         # Move to GPU.
 
-        audio_feats, audio_feat_lens = self.model.perception(
+        audio_feats, audio_feat_lens, _ = self.model.perception(
             input_signal=audio_signal,
             input_signal_length=audio_length,
             processed_signal=None,
@@ -194,6 +194,7 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
                 context_tokens,
                 _,
                 (speech_encoded, speech_encoded_len, extra_outputs),
+                _,
             ) = self.model.prepare_llm_input(batch)
             self.position_ids = build_position_ids(encoder_input[:, :, 0].transpose(0, 1))
             self.extra_outputs = extra_outputs

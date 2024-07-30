@@ -58,6 +58,10 @@ from nemo.utils import AppState, logging, model_utils
 from nemo.utils.apex_utils import _reconfigure_microbatch_calculator
 from nemo.utils.model_utils import inject_model_parallel_rank
 
+from nemo.collections.asr.losses.ctc import CTCLoss
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.metrics.wer import WER
+
 try:
     from megatron.core import InferenceParams, parallel_state, tensor_parallel
     from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -78,6 +82,40 @@ default_inference_config = {'tokens_to_generate': 30}
 class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     """Modularized speech GPT model."""
 
+    def setup_ctc_head(self, cfg):
+        if 'aux_ctc' not in cfg:
+            raise ValueError(
+                "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
+            )
+        # self.cfg.aux_ctc.decoder.vocabulary = ListConfig(self.tokenizer.vocab)
+        # the error arises from 5303 token "${" in the tokenizer
+        # use dummy vocab for now (temporary fix)
+        self.cfg.aux_ctc.decoder.vocabulary = [1] * len(self.tokenizer.vocab)
+        self.cfg.aux_ctc.decoder.num_classes = len(self.tokenizer.vocab)
+
+        self.ctc_decoder = self.from_config_dict(self.cfg.aux_ctc.decoder)
+        self.ctc_loss_weight = self.cfg.aux_ctc.get("ctc_loss_weight", 0.1)
+
+        self.ctc_loss = CTCLoss(
+            num_classes=self.ctc_decoder.num_classes_with_blank - 1,
+            zero_infinity=True,
+            reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_batch"),
+        )
+
+        ctc_decoding_cfg = self.cfg.aux_ctc.get('decoding', None)
+        if ctc_decoding_cfg is None:
+            ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
+            with open_dict(self.cfg.aux_ctc):
+                self.cfg.aux_ctc.decoding = ctc_decoding_cfg
+
+        self.ctc_decoding = CTCBPEDecoding(self.cfg.aux_ctc.decoding, tokenizer=self.tokenizer)
+        self.ctc_wer = WER(
+            decoding=self.ctc_decoding,
+            use_cer=self.cfg.aux_ctc.get('use_cer', False),
+            dist_sync_on_step=True,
+            log_prediction=self.cfg.get("log_prediction", False),
+        )
+    
     def setup_perception_modules(self, cfg):
         if 'target' in cfg.perception:
             imported_cls = model_utils.import_class_by_path(cfg.perception.target)
@@ -95,6 +133,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         # handle the case where the batch size from dynamic bucketting is not divisible in lhotse
         self.enforce_divisible_batch = False
         self.setup_perception_modules(cfg)
+
+        ### CTC head start:
+        self.setup_ctc_head(cfg)
+        ### CTC head end.
 
         # print out params in more details
         self.summarize(max_depth=2)
@@ -328,7 +370,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         context_start_idx = audio_batch.get("context_start_idx", None)
 
         # [b, t, c]
-        encoded, encoded_len = self.perception(
+        encoded, encoded_len, audio_encoder_outputs = self.perception(
             input_signal=input_signal,
             input_signal_length=input_signal_length,
             processed_signal=None,
@@ -354,7 +396,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             loss_mask, input_length, encoded_len, encoder_max_length, pad_token=0
         )
 
-        return encoder_input, attention_mask, labels, loss_mask, encoder_length
+        return encoder_input, attention_mask, labels, loss_mask, encoder_length, audio_encoder_outputs
 
     def forward(
         self,
@@ -373,7 +415,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 rank_zero_only=False,
             )
 
-        encoder_input, attention_mask, labels, loss_mask, _ = self.prepare_llm_input(audio_batch)
+        encoder_input, attention_mask, labels, loss_mask, _, audio_encoder_outputs = self.prepare_llm_input(audio_batch)
         if self.mcore_gpt:
             output = self.model(
                 input_ids=None,
@@ -392,7 +434,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 checkpoint_activations_all_layers=checkpoint_activations_all_layers,
             )
 
-        return output, loss_mask
+        return output, loss_mask, audio_encoder_outputs
 
     def get_forward_output_only_func(self):
         def fwd_output_only_func(dataloader_iter, model):
@@ -432,6 +474,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             ):
                 attention_mask = None
 
+            # model returns stndard output and audio_encoder_outputs
             output_tensor = model(
                 input_ids=None,
                 position_ids=None,
@@ -478,7 +521,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             if not self.mcore_gpt:
                 batch['checkpoint_activations_all_layers'] = checkpoint_activations_all_layers
 
-            output_tensor, loss_mask = self.forward(
+            # output_tensor, loss_mask, ctc_head_output = self.forward(
+            #     batch, checkpoint_activations_all_layers=checkpoint_activations_all_layers
+            # )
+            output_tensor, loss_mask, audio_encoder_outputs = self.forward(
                 batch, checkpoint_activations_all_layers=checkpoint_activations_all_layers
             )
             batch['loss_mask'] = loss_mask
@@ -487,11 +533,44 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 # Loss for a micro-batch (ub)
                 loss_for_ub = self.loss_func(batch['loss_mask'], batch['num_valid_tokens_in_ub'], output_tensor)
                 cp_size = self.cfg.get('context_parallel_size', 1)
+
+                # compute ctc loss
+
+                ctc_log_probs = self.ctc_decoder(encoder_output=audio_encoder_outputs[0])
+                ctc_input_lengths = audio_encoder_outputs[1]
+
+                ctc_loss = self.ctc_loss(
+                    log_probs=ctc_log_probs,
+                    targets=batch["ctc_tokens"],
+                    input_lengths=ctc_input_lengths,
+                    target_lengths=batch["ctc_tokens_length"],
+                )
+                self.log("aux_ctc_loss", ctc_loss, batch_size=1)
+                self.log("loss_for_ub", loss_for_ub, batch_size=1)
+
+                loss_for_ub = (1 - self.ctc_loss_weight) * loss_for_ub + self.ctc_loss_weight * ctc_loss
+
+                # logging.warning("*************"*10)
+                # # logging.warning(f"batch: {batch}")
+                # # logging.warning(f"ctc_head_output[0].shape: {ctc_head_output[0].shape}")
+                # logging.warning(f"batch['ctc_tokens']: {batch['ctc_tokens']}")
+                # logging.warning(f"batch['ctc_tokens'][0]: {self.tokenizer.ids_to_tokens(batch['ctc_tokens'][0].tolist())}")
+                # logging.warning(f"CTC Loss: {ctc_loss}")
+                # logging.warning(f"loss_for_ub: {loss_for_ub}")
+                # # raise NotImplementedError("CTC loss implementation in progress...")
+
                 if self.cfg.data.get(
                     "return_output_tensors", False
                 ):  # TODO: need a better way to check if loss_func is returning more stuff than just loss... (@adithyare)
                     loss_for_ub, q_hs, d_hs, pos_cs, neg_cs, diff_cs = loss_for_ub
+                    # logging.warning("*************"*10)
+                    # logging.warning(f"loss_for_ub loss: {loss_for_ub}")
+                    # raise NotImplementedError("CTC loss implementation in progress...")
+                    # loss_for_ub = (1 - self.perception.ctc_loss_weight) * loss_for_ub + self.perception.ctc_loss_weight * ctc_loss
                     reduced_loss = average_losses_across_data_parallel_group([loss_for_ub])
+
+                    
+
                     pos_cs = average_losses_across_data_parallel_group([pos_cs])
                     neg_cs = average_losses_across_data_parallel_group([neg_cs])
                     diff_cs = average_losses_across_data_parallel_group([diff_cs])
@@ -527,6 +606,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                     return loss_for_ub * cp_size, {'loss_sum_and_ub_size': loss_sum_and_ub_size_all_gpu}
                 else:
                     reduced_loss = average_losses_across_data_parallel_group([loss_for_ub])
+                    # logging.warning(f"reduced_loss: {reduced_loss}")
                     return loss_for_ub * cp_size, {'avg': reduced_loss}
 
             return output_tensor, loss_func
