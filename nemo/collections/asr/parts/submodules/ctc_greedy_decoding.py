@@ -145,7 +145,7 @@ class GreedyCTCInfer(Typing, ConfidenceMethodMixin):
         self.preserve_frame_confidence = preserve_frame_confidence
 
         # set confidence calculation method
-        self._init_confidence_method(confidence_method_cfg)
+        # self._init_confidence_method(confidence_method_cfg)
 
     @typecheck()
     def forward(
