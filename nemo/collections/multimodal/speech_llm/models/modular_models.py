@@ -550,14 +550,14 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
                 loss_for_ub = (1 - self.ctc_loss_weight) * loss_for_ub + self.ctc_loss_weight * ctc_loss
 
-                # logging.warning("*************"*10)
-                # # logging.warning(f"batch: {batch}")
-                # # logging.warning(f"ctc_head_output[0].shape: {ctc_head_output[0].shape}")
-                # logging.warning(f"batch['ctc_tokens']: {batch['ctc_tokens']}")
-                # logging.warning(f"batch['ctc_tokens'][0]: {self.tokenizer.ids_to_tokens(batch['ctc_tokens'][0].tolist())}")
-                # logging.warning(f"CTC Loss: {ctc_loss}")
-                # logging.warning(f"loss_for_ub: {loss_for_ub}")
-                # # raise NotImplementedError("CTC loss implementation in progress...")
+                logging.warning("*************"*10)
+                # logging.warning(f"batch: {batch}")
+                # logging.warning(f"ctc_head_output[0].shape: {ctc_head_output[0].shape}")
+                logging.warning(f"batch['ctc_tokens']: {batch['ctc_tokens']}")
+                logging.warning(f"batch['ctc_tokens'][0]: {self.tokenizer.asr_tokenizer.ids_to_tokens(batch['ctc_tokens'][0].tolist())}")
+                logging.warning(f"CTC Loss: {ctc_loss}")
+                logging.warning(f"loss_for_ub: {loss_for_ub}")
+                raise NotImplementedError("CTC loss implementation in progress...")
 
                 if self.cfg.data.get(
                     "return_output_tensors", False
@@ -781,7 +781,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     def load_pretrained_audio_weights(
         cls, cfg, model, audio_model, speaker_model: Optional[EncDecSpeakerLabelModel] = None
     ):
-        model.perception.tokenizer = audio_model.tokenizer
+        # model.perception.tokenizer = audio_model.tokenizer
         use_multi_encoder = cfg.model.perception.get("encoders", None) is not None
         if not use_multi_encoder:
             if cfg.model.perception.get("use_multi_layer_feat", False):
@@ -789,6 +789,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             else:
                 model.perception.encoder.load_state_dict(audio_model.encoder.state_dict(), strict=True)
             logging.info(f'Loaded pretrained audio model weights from {cfg.model.pretrained_audio_model}')
+            
+            # load asr tokenizer for ctc head
+            model.tokenizer.asr_tokenizer = audio_model.tokenizer
+            
             if cfg.model.get('use_am_tokenizer', False):
                 model.tokenizer = audio_model.tokenizer
                 logging.info(f'Use AM tokenizer: {audio_model.tokenizer}')

@@ -299,6 +299,7 @@ class TextProcessing:
             text = self.prompt_template.replace(f'{{{self.context_key}}}', original_context).replace(
                 f'{{{self.answer_key}}}', output
             )
+            original_text = text
 
         elif self.separate_prompt_and_response_with_newline:
             text = context + '\n' + output
@@ -315,7 +316,15 @@ class TextProcessing:
         answer_ids = pre_pad + self.tokenizer.text_to_ids(answer_text, self.sample_alpha)
 
         # Labels for ctc head
-        ctc_tokens_ids = answer_ids[1:]
+        #ctc_tokens_ids = answer_ids[1:]
+        # logging.warning("++++"*10)
+        # logging.warning(f"text: {text}")
+        # logging.warning(f"answer_text: {answer_text}")
+        logging.warning(f"output: {output}")
+        # logging.warning(f"original_text: {original_text}")
+        ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(output, "en")
+        logging.warning(f"ctc_tokens_ids: {ctc_tokens_ids}")
+        raise ValueError("stop here")
 
         if self.end_string:
             answer_ids += self.tokenizer.text_to_ids(self.end_string)
