@@ -66,12 +66,19 @@ class CanaryTokenizer(AggregateTokenizer):
     def pad_id(self) -> int:
         return self.special_tokens[CANARY_PAD]
 
+    # def text_to_ids(self, text, lang_id) -> list[int]:
+    #     if lang_id == CANARY_SPECIAL_TOKENIZER:
+    #         return self._tokenize_special_prompt(text)
+    #     if text.endswith(CANARY_EOS):
+    #         return super().text_to_ids(text[: -len(CANARY_EOS)], lang_id) + [self.eos_id]
+    #     return super().text_to_ids(text[-len(CANARY_EOS) :], lang_id)
+
     def text_to_ids(self, text, lang_id) -> list[int]:
         if lang_id == CANARY_SPECIAL_TOKENIZER:
             return self._tokenize_special_prompt(text)
         if text.endswith(CANARY_EOS):
             return super().text_to_ids(text[: -len(CANARY_EOS)], lang_id) + [self.eos_id]
-        return super().text_to_ids(text[-len(CANARY_EOS) :], lang_id)
+        return super().text_to_ids(text, lang_id)
 
     def _tokenize_special_prompt(self, text: str) -> list[int]:
         """
