@@ -90,8 +90,9 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         # self.cfg.aux_ctc.decoder.vocabulary = ListConfig(self.tokenizer.vocab)
         # the error arises from 5303 token "${" in the tokenizer
         # use dummy vocab for now (temporary fix)
-        self.cfg.aux_ctc.decoder.vocabulary = [1] * len(self.tokenizer.vocab)
-        self.cfg.aux_ctc.decoder.num_classes = len(self.tokenizer.vocab)
+        # self.cfg.aux_ctc.decoder.vocabulary = [1] * len(self.tokenizer.asr_tokenizer.vocab)
+        self.cfg.aux_ctc.decoder.vocabulary = self.tokenizer.asr_tokenizer.vocab
+        self.cfg.aux_ctc.decoder.num_classes = len(self.tokenizer.asr_tokenizer.vocab)
 
         self.ctc_decoder = self.from_config_dict(self.cfg.aux_ctc.decoder)
         self.ctc_loss_weight = self.cfg.aux_ctc.get("ctc_loss_weight", 0.1)
@@ -133,10 +134,6 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         # handle the case where the batch size from dynamic bucketting is not divisible in lhotse
         self.enforce_divisible_batch = False
         self.setup_perception_modules(cfg)
-
-        ### CTC head start:
-        self.setup_ctc_head(cfg)
-        ### CTC head end.
 
         # print out params in more details
         self.summarize(max_depth=2)
@@ -550,14 +547,15 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
                 loss_for_ub = (1 - self.ctc_loss_weight) * loss_for_ub + self.ctc_loss_weight * ctc_loss
 
-                logging.warning("*************"*10)
-                # logging.warning(f"batch: {batch}")
-                # logging.warning(f"ctc_head_output[0].shape: {ctc_head_output[0].shape}")
-                logging.warning(f"batch['ctc_tokens']: {batch['ctc_tokens']}")
-                logging.warning(f"batch['ctc_tokens'][0]: {self.tokenizer.asr_tokenizer.ids_to_tokens(batch['ctc_tokens'][0].tolist())}")
-                logging.warning(f"CTC Loss: {ctc_loss}")
-                logging.warning(f"loss_for_ub: {loss_for_ub}")
-                raise NotImplementedError("CTC loss implementation in progress...")
+                # logging.warning("*************"*10)
+                # # logging.warning(f"batch: {batch}")
+                # # logging.warning(f"ctc_head_output[0].shape: {ctc_head_output[0].shape}")
+                # logging.warning(f"batch['ctc_tokens']: {batch['ctc_tokens']}")
+                # logging.warning(f"batch['ctc_tokens'][0]: {self.tokenizer.asr_tokenizer.ids_to_tokens(batch['ctc_tokens'][0].tolist())}")
+                # logging.warning(f"batch['ctc_tokens_length']: {batch['ctc_tokens_length']}")
+                # logging.warning(f"CTC Loss: {ctc_loss}")
+                # logging.warning(f"loss_for_ub: {loss_for_ub}")
+                # raise NotImplementedError("CTC loss implementation in progress...")
 
                 if self.cfg.data.get(
                     "return_output_tensors", False
@@ -865,6 +863,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
         # load audio model weights
         model = cls.load_pretrained_audio_weights(cfg, model, audio_model, speaker_model)
+
+        ### CTC head start:
+        model.setup_ctc_head(cfg.model)
+        ### CTC head end.
 
         if 'inference' in cfg:
             inference_cfg = OmegaConf.to_container(cfg.inference, resolve=True)

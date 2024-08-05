@@ -124,6 +124,7 @@ def collate_text_data(
             for k, v in text_processor._process_example(
                 context=cut.context,
                 output=cut.supervisions[0].text,
+                lang_id=cut.supervisions[0].language,
             ).items()
         }
         for cut in cuts

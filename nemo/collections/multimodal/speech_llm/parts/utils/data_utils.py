@@ -265,7 +265,7 @@ class TextProcessing:
             self.prompt_template = self.prompt_template.encode('utf-8').decode('unicode_escape')
         assert self.truncation_field in ["answer", "context"]
 
-    def _process_example(self, context: str, output: str):
+    def _process_example(self, context: str, output: str, lang_id: str):
         """
         Create an example by concatenating text and answer.
         Truncation is carried out when needed, but it is performed only on the prompt side.
@@ -318,13 +318,11 @@ class TextProcessing:
         # Labels for ctc head
         #ctc_tokens_ids = answer_ids[1:]
         # logging.warning("++++"*10)
-        # logging.warning(f"text: {text}")
-        # logging.warning(f"answer_text: {answer_text}")
-        logging.warning(f"output: {output}")
         # logging.warning(f"original_text: {original_text}")
-        ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(output, "en")
-        logging.warning(f"ctc_tokens_ids: {ctc_tokens_ids}")
-        raise ValueError("stop here")
+        ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(output, lang_id)
+        # logging.warning(f"lang_id: {lang_id}")
+        # logging.warning(f"ctc_tokens_ids: {ctc_tokens_ids}")
+        # raise ValueError("stop here")
 
         if self.end_string:
             answer_ids += self.tokenizer.text_to_ids(self.end_string)
