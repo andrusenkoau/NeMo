@@ -265,6 +265,19 @@ class TextProcessing:
             self.prompt_template = self.prompt_template.encode('utf-8').decode('unicode_escape')
         assert self.truncation_field in ["answer", "context"]
 
+    
+    def _normilize_text(self, text: str):
+        """
+        Normalize text for CTC head training.
+        """
+        text = text.lower()
+        text = text.replace(".", "")
+        text = text.replace("!", "")
+        text = text.replace(",", "")
+        text = text.replace("?", "")
+
+        return text.lower()
+    
     def _process_example(self, context: str, output: str, lang_id: str):
         """
         Create an example by concatenating text and answer.
@@ -319,7 +332,8 @@ class TextProcessing:
         #ctc_tokens_ids = answer_ids[1:]
         # logging.warning("++++"*10)
         # logging.warning(f"original_text: {original_text}")
-        ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(output, lang_id)
+        normalized_text = self._normilize_text(output)
+        ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(normalized_text, lang_id)
         # logging.warning(f"lang_id: {lang_id}")
         # logging.warning(f"ctc_tokens_ids: {ctc_tokens_ids}")
         # raise ValueError("stop here")
