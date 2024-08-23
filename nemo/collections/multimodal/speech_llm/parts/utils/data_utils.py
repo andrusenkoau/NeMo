@@ -333,7 +333,9 @@ class TextProcessing:
         # logging.warning("++++"*10)
         # logging.warning(f"original_text: {original_text}")
         normalized_text = self._normilize_text(output)
-        ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(normalized_text, lang_id)
+        ctc_tokens_ids = []
+        if getattr(self.tokenizer, "asr_tokenizer", None):
+            ctc_tokens_ids = self.tokenizer.asr_tokenizer.text_to_ids(normalized_text, lang_id)
         # logging.warning(f"lang_id: {lang_id}")
         # logging.warning(f"ctc_tokens_ids: {ctc_tokens_ids}")
         # raise ValueError("stop here")
