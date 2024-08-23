@@ -81,39 +81,26 @@ default_inference_config = {'tokens_to_generate': 30}
 
 class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     """Modularized speech GPT model."""
-
-    def setup_ctc_head(self, cfg):
-        if 'aux_ctc' not in cfg:
-            raise ValueError(
-                "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
-            )
-
-        self.ctc_modality_adapter = self.from_config_dict(cfg.aux_ctc.modality_adapter)
-
-        self.cfg.aux_ctc.decoder.vocabulary = self.tokenizer.asr_tokenizer.vocab
-        self.cfg.aux_ctc.decoder.num_classes = len(self.tokenizer.asr_tokenizer.vocab)
-
-        self.ctc_decoder = self.from_config_dict(self.cfg.aux_ctc.decoder)
-        self.ctc_loss_weight = self.cfg.aux_ctc.get("ctc_loss_weight", 0.1)
-
-        self.ctc_loss = CTCLoss(
-            num_classes=self.ctc_decoder.num_classes_with_blank - 1,
+    
+    def setup_ctc_loss_and_wer(self):
+        self.perception.ctc_loss_weight = self.cfg.perception.aux_ctc.get("ctc_loss_weight", 0.1)
+        self.perception.ctc_loss = CTCLoss(
+            num_classes=self.perception.ctc_decoder.num_classes_with_blank - 1,
             zero_infinity=True,
-            reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_batch"),
+            reduction=self.cfg.perception.aux_ctc.get("ctc_reduction", "mean_batch"),
         )
-
-        ctc_decoding_cfg = self.cfg.aux_ctc.get('decoding', None)
+        ctc_decoding_cfg = self.cfg.perception.aux_ctc.get('decoding', None)
         if ctc_decoding_cfg is None:
             ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
-            with open_dict(self.cfg.aux_ctc):
-                self.cfg.aux_ctc.decoding = ctc_decoding_cfg
+            with open_dict(self.cfg.perception.aux_ctc):
+                self.cfg.perception.aux_ctc.decoding = ctc_decoding_cfg
 
-        self.ctc_decoding = CTCBPEDecoding(self.cfg.aux_ctc.decoding, tokenizer=self.tokenizer.asr_tokenizer)
-        self.ctc_wer = WER(
-            decoding=self.ctc_decoding,
-            use_cer=self.cfg.aux_ctc.get('use_cer', False),
+        self.perception.ctc_decoding = CTCBPEDecoding(self.cfg.perception.aux_ctc.decoding, tokenizer=self.tokenizer.asr_tokenizer)
+        self.perception.ctc_wer = WER(
+            decoding=self.perception.ctc_decoding,
+            use_cer=self.cfg.perception.aux_ctc.get('use_cer', False),
             dist_sync_on_step=True,
-            log_prediction=self.cfg.get("log_prediction", False),
+            log_prediction=self.cfg.perception.get("log_prediction", False),
         )
     
     def setup_perception_modules(self, cfg):
@@ -531,13 +518,13 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 cp_size = self.cfg.get('context_parallel_size', 1)
 
                 # compute ctc loss
-                ctc_encoded, ctc_encoded_len = self.ctc_modality_adapter(audio_signal=audio_encoder_outputs[0], length=audio_encoder_outputs[1])
-                ctc_log_probs = self.ctc_decoder(encoder_output=ctc_encoded)
+                ctc_encoded, ctc_encoded_len = self.perception.ctc_modality_adapter(audio_signal=audio_encoder_outputs[0], length=audio_encoder_outputs[1])
+                ctc_log_probs = self.perception.ctc_decoder(encoder_output=ctc_encoded)
                 ctc_input_lengths = ctc_encoded_len
                 # ctc_log_probs = self.ctc_decoder(encoder_output=audio_encoder_outputs[0])
                 # ctc_input_lengths = audio_encoder_outputs[1]
 
-                ctc_loss = self.ctc_loss(
+                ctc_loss = self.perception.ctc_loss(
                     log_probs=ctc_log_probs,
                     targets=batch["ctc_tokens"],
                     input_lengths=ctc_input_lengths,
@@ -546,7 +533,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 self.log("aux_ctc_loss", ctc_loss, batch_size=1)
                 self.log("loss_for_ub", loss_for_ub, batch_size=1)
 
-                loss_for_ub = (1 - self.ctc_loss_weight) * loss_for_ub + self.ctc_loss_weight * ctc_loss
+                loss_for_ub = (1 - self.perception.ctc_loss_weight) * loss_for_ub + self.perception.ctc_loss_weight * ctc_loss
 
                 # if validation_step:
                 #     logging.warning("*************"*100)
@@ -565,14 +552,14 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 #         predictions_labels = self.tokenizer.asr_tokenizer.ids_to_tokens(predictions_labels)
                 #         logging.warning(f"predictions_labels: {predictions_labels}")
 
-                    self.ctc_wer.update(
+                    self.perception.ctc_wer.update(
                         predictions=ctc_log_probs,
                         targets=batch["ctc_tokens"],
                         targets_lengths=batch["ctc_tokens_length"],
                         predictions_lengths=ctc_input_lengths,
                     )
-                    ctc_wer, _, _ = self.ctc_wer.compute()
-                    self.ctc_wer.reset()
+                    ctc_wer, _, _ = self.perception.ctc_wer.compute()
+                    self.perception.ctc_wer.reset()
                     # logging.warning("*************"*10)
                     # logging.warning(f"ctc_wer: {ctc_wer}")
                     self.log("training_batch_wer_from_ctc_head", ctc_wer, batch_size=1)
@@ -894,7 +881,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         model = cls.load_pretrained_audio_weights(cfg, model, audio_model, speaker_model)
 
         ### CTC head:
-        model.setup_ctc_head(cfg.model)
+        model.setup_ctc_loss_and_wer()
 
         if 'inference' in cfg:
             inference_cfg = OmegaConf.to_container(cfg.inference, resolve=True)
@@ -1054,26 +1041,18 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 return_state_dict = {}
 
             state_dict = self.perception.state_dict(prefix="perception.")
-            state_dict_ctc_ma = self.ctc_modality_adapter.state_dict(prefix="ctc_modality_adapter.")
-            state_dict_ctc_dec = self.ctc_decoder.state_dict(prefix="ctc_decoder.")
             if self.cfg.freeze_audio_encoder:
                 state_dict = {k: v for k, v in state_dict.items() if not k.startswith("perception.encoder.")}
 
             return_state_dict.update(state_dict)
             state_dict = self.perception.state_dict(prefix="perception.")
             return_state_dict.update(state_dict)
-            return_state_dict.update(state_dict_ctc_ma)
-            return_state_dict.update(state_dict_ctc_dec)
             return return_state_dict
         elif self.setup_complete and self.trainer.state.fn != "fit":
             # used to save the whole model as a nemo file
             return_state_dict = self.model.state_dict(prefix="model.")
             state_dict = self.perception.state_dict(prefix="perception.")
-            state_dict_ctc_ma = self.ctc_modality_adapter.state_dict(prefix="ctc_modality_adapter.")
-            state_dict_ctc_dec = self.ctc_decoder.state_dict(prefix="ctc_decoder.")
             return_state_dict.update(state_dict)
-            return_state_dict.update(state_dict_ctc_ma)
-            return_state_dict.update(state_dict_ctc_dec)
             return return_state_dict
         else:
             # we want all the params with the same keys as calling self.state_dict()
@@ -1084,13 +1063,9 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             else:
                 return_state_dict = {}
             state_dict = self.perception.state_dict(prefix="perception.")
-            state_dict_ctc_ma = self.ctc_modality_adapter.state_dict(prefix="ctc_modality_adapter.")
-            state_dict_ctc_dec = self.ctc_decoder.state_dict(prefix="ctc_decoder.")
             if self.cfg.freeze_audio_encoder:
                 state_dict = {k: v for k, v in state_dict.items() if not k.startswith("perception.encoder.")}
             return_state_dict.update(state_dict)
-            return_state_dict.update(state_dict_ctc_ma)
-            return_state_dict.update(state_dict_ctc_dec)
             return return_state_dict
 
     def load_state_dict(self, state_dict, strict: bool = True):

@@ -30,9 +30,6 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, L
 from nemo.utils.decorators import experimental
 
 from omegaconf import DictConfig, OmegaConf, open_dict
-# from nemo.collections.asr.losses.ctc import CTCLoss
-# from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
-# from nemo.collections.asr.metrics.wer import WER
 from nemo.utils import logging
 
 __all__ = ["AudioPerceptionModule", "MultiAudioPerceptionModule"]
@@ -75,6 +72,7 @@ class AudioPerceptionModule(NeuralModule, Exportable):
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
+        
         # Initialize components
         self.cfg = cfg
         self.preprocessor = self.from_config_dict(cfg.preprocessor)
@@ -98,6 +96,19 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             self.proj = nn.Linear(cfg.modality_adapter.d_model, cfg.output_dim)
         else:
             self.proj = nn.Identity()
+
+        # init CTC head:
+        if 'aux_ctc' not in cfg:
+            raise ValueError(
+                "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
+            )
+        self.ctc_modality_adapter = self.from_config_dict(cfg.aux_ctc.modality_adapter)
+
+        self.cfg.aux_ctc.decoder.vocabulary = [1]*self.cfg.aux_ctc.decoder.num_classes
+        # self.cfg.aux_ctc.decoder.num_classes = len(ctc_tokenizer.vocab)
+
+        self.ctc_decoder = self.from_config_dict(self.cfg.aux_ctc.decoder)
+
 
     def maybe_preprocess_audio(
         self,
