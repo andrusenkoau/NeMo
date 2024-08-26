@@ -82,13 +82,14 @@ default_inference_config = {'tokens_to_generate': 30}
 class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     """Modularized speech GPT model."""
     
-    def setup_ctc_loss_and_wer(self):
-        self.perception.ctc_loss_weight = self.cfg.perception.aux_ctc.get("ctc_loss_weight", 0.1)
-        self.perception.ctc_loss = CTCLoss(
-            num_classes=self.perception.ctc_decoder.num_classes_with_blank - 1,
-            zero_infinity=True,
-            reduction=self.cfg.perception.aux_ctc.get("ctc_reduction", "mean_batch"),
-        )
+    def setup_ctc_loss_and_wer(self, only_wer: bool = False):
+        if not only_wer:
+            self.perception.ctc_loss_weight = self.cfg.perception.aux_ctc.get("ctc_loss_weight", 0.1)
+            self.perception.ctc_loss = CTCLoss(
+                num_classes=self.perception.ctc_decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction=self.cfg.perception.aux_ctc.get("ctc_reduction", "mean_batch"),
+            )
         ctc_decoding_cfg = self.cfg.perception.aux_ctc.get('decoding', None)
         if ctc_decoding_cfg is None:
             ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
@@ -906,6 +907,15 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             audio_model, _ = cls.get_audio_encoder_models_and_configs(cfg)
             speaker_model, _ = cls.get_speaker_model_and_config(cfg)
             model = cls.load_pretrained_audio_weights(cfg, model, audio_model, speaker_model)
+
+        # load asr tokenizer and setup ctc wer if spechllm has ctc head
+        if hasattr(model.perception, "ctc_decoder"):
+            with open_dict(cfg):
+                cfg.model.perception = model_cfg.perception
+            audio_model, _ = cls.get_audio_encoder_models_and_configs(cfg)
+            model.tokenizer.asr_tokenizer = audio_model.tokenizer
+            model.setup_ctc_loss_and_wer(only_wer=True)
+
         return model
 
     @classmethod
