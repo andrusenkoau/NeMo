@@ -102,7 +102,7 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             raise ValueError(
                 "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
             )
-        self.ctc_modality_adapter = self.from_config_dict(cfg.aux_ctc.modality_adapter)
+        # self.ctc_modality_adapter = self.from_config_dict(cfg.aux_ctc.modality_adapter)
 
         self.cfg.aux_ctc.decoder.vocabulary = [1]*self.cfg.aux_ctc.decoder.num_classes
         # self.cfg.aux_ctc.decoder.num_classes = len(ctc_tokenizer.vocab)

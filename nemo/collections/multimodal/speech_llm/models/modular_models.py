@@ -519,7 +519,8 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 cp_size = self.cfg.get('context_parallel_size', 1)
 
                 # compute ctc loss
-                ctc_encoded, ctc_encoded_len = self.perception.ctc_modality_adapter(audio_signal=audio_encoder_outputs[0], length=audio_encoder_outputs[1])
+                # ctc_encoded, ctc_encoded_len = self.perception.ctc_modality_adapter(audio_signal=audio_encoder_outputs[0], length=audio_encoder_outputs[1])
+                ctc_encoded, ctc_encoded_len = audio_encoder_outputs[0], audio_encoder_outputs[1]
                 ctc_log_probs = self.perception.ctc_decoder(encoder_output=ctc_encoded)
                 ctc_input_lengths = ctc_encoded_len
                 # ctc_log_probs = self.ctc_decoder(encoder_output=audio_encoder_outputs[0])
