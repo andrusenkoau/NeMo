@@ -579,6 +579,7 @@ def sample_sequence_batch(
         maxlen = tokens_to_generate + audio_text_context_lengths.max().item()
         maxlen = inference_strategy.clip_max_len(maxlen)
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
+        force_increase_speech_chunk = False
 
         while context_length < maxlen:
 
@@ -587,7 +588,8 @@ def sample_sequence_batch(
                 logging.warning(f"--- token prediction step: {counter}")
                 logging.warning(f"current token_id: {tokens[0, context_length-1]}")
                 logging.warning(f"current token_text: {token_text}")
-            inference_strategy.token_alignatt.append([token_text, inference_strategy.cur_speech_encoded_len.item() + int(strategy_args['right_context'])])
+            if not force_increase_speech_chunk:
+                inference_strategy.token_alignatt.append([token_text, inference_strategy.cur_speech_encoded_len.item() + int(strategy_args['right_context'])])
             
             batch, tensor_shape = inference_strategy.prepare_batch_at_step(
                 tokens,
@@ -598,8 +600,10 @@ def sample_sequence_batch(
                 audio_text_context_lengths,
                 context_length,
                 compute_attention_mask,
+                force_increase_speech_chunk,
                 **strategy_args,
             )
+            force_increase_speech_chunk = False
             output = inference_strategy.forward_step(batch, tensor_shape)
             if parallel_state.is_pipeline_last_stage():
                 if compute_logprob:
@@ -646,7 +650,15 @@ def sample_sequence_batch(
                 new_tokens = switch(tokens[:, context_length].view(-1), prev, started)
                 # logging.warning(f"tokens: {tokens}")
                 # logging.warning(f"new_tokens: {new_tokens}")
+                # logging.warning(f"new_tokens.item(): {new_tokens.item()}")
+                # logging.warning(f"eod_id: {eod_id}")
                 # logging.warning(f"context_length: {context_length}")
+                
+                # skip eos token if the audio file is not fully processed
+                if new_tokens.item() == eod_id and inference_strategy.part_of_processed_audio.item() < 0.8:
+                    force_increase_speech_chunk = True
+                    counter += 1
+                    continue
 
                 # Replace sampled tokens w/ done token if EOD has already been sampled
                 new_tokens = switch(new_tokens, eod_id, is_done)

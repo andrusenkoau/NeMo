@@ -213,7 +213,12 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
         self.cur_speech_encoded_len = speech_encoded_len
 
         self.audio_signal_is_finished = False
-        if  cur_enc_len * audio_encoder_fs * sample_rate // 1000 >= audio_length:
+        cur_enc_len_in_samples = cur_enc_len * audio_encoder_fs * sample_rate // 1000
+        self.part_of_processed_audio = cur_enc_len_in_samples / self.audio_length
+        # logging.warning(f"cur_enc_len_in_samples: {cur_enc_len_in_samples}")
+        # logging.warning(f"audio_length: {self.audio_length}")
+        # logging.warning(f"self.part_of_processed_audio: {self.part_of_processed_audio}")
+        if  cur_enc_len_in_samples >= audio_length:
             logging.warning(f"audio_signal_is_finished: {cur_enc_len}")
             self.audio_signal_is_finished = True
 
@@ -438,6 +443,7 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
         context_lengths: torch.Tensor,
         curr_context_length: int,
         compute_attention_mask: bool,
+        force_increase_speech_chunk: bool = False,
         **strategy_args,
     ) -> Tuple[List[torch.Tensor], List[int]]:
         # types2use = None
@@ -479,6 +485,14 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
             elif strategy_args['decode_policy'] == 'alignatt':
                 # check alighatt condition by xatt before increasing speech chunk
                 
+                # 0. force to increase speech chunk size -- in the case of eos prediction before the end of the audio signal
+                if force_increase_speech_chunk:
+                    if strategy_args["debug_mode"]:
+                        logging.warning(f"eos prediction at {self.part_of_processed_audio.item():.2f} part of the audio signal, force to increase speech chunk size")
+                    cur_speech_encoded, cur_speech_encoded_len, _ = self.read_next_audio_chunk(**strategy_args)
+                    self.cur_speech_encoded = cur_speech_encoded
+                    self.cur_speech_encoded_len = cur_speech_encoded_len
+
                 # 1. compute xatt of speech and current context tokens
                 apply_xatt = True
                 max_steps_with_same_token = 10 # max number of speech increasing steps with the same token
