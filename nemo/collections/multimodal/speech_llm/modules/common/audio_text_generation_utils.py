@@ -655,7 +655,7 @@ def sample_sequence_batch(
                 # logging.warning(f"context_length: {context_length}")
                 
                 # skip eos token if the audio file is not fully processed
-                if new_tokens.item() == eod_id and inference_strategy.part_of_processed_audio.item() < 0.8:
+                if strategy_args['decode_policy'] == 'alignatt' and new_tokens.item() == eod_id and inference_strategy.part_of_processed_audio.item() < 0.8:
                     force_increase_speech_chunk = True
                     counter += 1
                     continue
