@@ -245,6 +245,8 @@ def compute_alignatt_lagging(batch, predicted_token_ids, metadata, labels_text, 
                 lagging.append(pred_idx * audio_encoder_fs)
             if cur_t == eos_token:
                 break
+        if len(lagging) == 0:
+            lagging.append(0)
         # logging.warning(f"lagging: {lagging}")
         metadata[i]['LAAL'] = compute_laal(lagging, audio_signal_length, target_length_word[i]).tolist()
         metadata[i]['AL'] = compute_al(lagging, audio_signal_length, target_length_word[i]).tolist()
