@@ -199,6 +199,8 @@ def compute_laal(delays, source_length, target_length):
         if d >= source_length:
             break
     LAAL /= tau
+    # logging.warning(f"LAAL------------------------------")
+    # logging.warning(f"LAAL: {LAAL}")
     return LAAL
 
 def compute_waitk_lagging(batch, predicted_token_ids, metadata, labels_text, strategy_args, tokenizer, BOW_PREFIX = "\u2581"):
@@ -230,6 +232,10 @@ def compute_waitk_lagging(batch, predicted_token_ids, metadata, labels_text, str
 
 
 def compute_alignatt_lagging(batch, predicted_token_ids, metadata, labels_text, strategy_args, tokenizer, pred_tokens_alignment, BOW_PREFIX = "\u2581"):
+    # logging.warning(f"len(predicted_token_ids[0]): {len(predicted_token_ids[0])}")
+    # logging.warning(f"len(pred_tokens_alignment): {len(pred_tokens_alignment)}")
+    # logging.warning(f"predicted_token_ids[0]: {predicted_token_ids[0]}")
+    # logging.warning(f"pred_tokens_alignment: {pred_tokens_alignment}")
     assert len(predicted_token_ids[0]) == len(pred_tokens_alignment) # sanity check for alignment length
     target_length_word = [len(a.split()) for a in labels_text]
     for i, tokens in enumerate(predicted_token_ids):
@@ -248,8 +254,18 @@ def compute_alignatt_lagging(batch, predicted_token_ids, metadata, labels_text, 
         if len(lagging) == 0:
             lagging.append(0)
         # logging.warning(f"lagging: {lagging}")
-        metadata[i]['LAAL'] = compute_laal(lagging, audio_signal_length, target_length_word[i]).tolist()
-        metadata[i]['AL'] = compute_al(lagging, audio_signal_length, target_length_word[i]).tolist()
+        laal = compute_laal(lagging, audio_signal_length, target_length_word[i])
+        al = compute_al(lagging, audio_signal_length, target_length_word[i])
+        if isinstance(laal, torch.Tensor):
+            laal = laal.tolist()
+        if isinstance(al, torch.Tensor):
+            al = al.tolist()
+        # logging.warning(f"laal: {laal}")
+        # logging.warning(f"al: {laal}")
+        metadata[i]['LAAL'] = laal
+        metadata[i]['AL'] = al
+        # metadata[i]['LAAL'] = compute_laal(lagging, audio_signal_length, target_length_word[i]).tolist()
+        # metadata[i]['AL'] = compute_al(lagging, audio_signal_length, target_length_word[i]).tolist()
     return metadata
 
 
