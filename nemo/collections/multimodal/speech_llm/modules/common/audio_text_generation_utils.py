@@ -256,9 +256,14 @@ def synced_generate(
             **strategy_args,
         )
 
-    for tokens, lengths, output_logits, full_logits, audio_feat_lens, pred_tokens_alignment in batch_token_iterator:
+    for tokens, lengths, output_logits, full_logits, audio_feat_lens, context_length_new, pred_tokens_alignment in batch_token_iterator:
         context_length += 1
+    # logging.warning(f"((((((((((())))))))))) context_length: {context_length}")
+    # logging.warning(f"((((((((((())))))))))) tokens: {tokens}")
     context_length += audio_feat_lens.min().item()
+    # logging.warning(f"((((((((((())))))))))) context_length: {context_length}")
+    # logging.warning(f"((((((((((())))))))))) context_length_new: {context_length_new}")
+    context_length = context_length_new+1 + audio_feat_lens.min().item()
     if parallel_state.is_pipeline_last_stage():
         src = parallel_state.get_pipeline_model_parallel_last_rank()
         group = parallel_state.get_embedding_group()
@@ -585,9 +590,11 @@ def sample_sequence_batch(
 
             token_text = model.tokenizer.ids_to_tokens([tokens[0, context_length-1].item()])
             if strategy_args["debug_mode"]:
-                logging.warning(f"--- token prediction step: {counter}")
+                logging.warning(f"*** [run prepare_batch_at_step]: {counter} ***")
                 logging.warning(f"current token_id: {tokens[0, context_length-1]}")
-                logging.warning(f"current token_text: {token_text}")
+                logging.warning(f"######## CURRENT TOKEN: {token_text}")
+                logging.warning(f"context_length: {context_length}")
+                logging.warning(f"tokens: {tokens[:, :context_length+5]}")
             if not force_increase_speech_chunk:
                 inference_strategy.token_alignatt.append([token_text, inference_strategy.cur_speech_encoded_len.item() + int(strategy_args['right_context'])])
             
@@ -648,17 +655,54 @@ def sample_sequence_batch(
                 # Clamp the predicted out of vocabulary tokens
                 prev = torch.clamp(prev, max=tokenizer.vocab_size - 1)
                 new_tokens = switch(tokens[:, context_length].view(-1), prev, started)
-                # logging.warning(f"tokens: {tokens}")
+                # logging.warning(f"tokens: {tokens[:, context_length-5:context_length+5]}")
                 # logging.warning(f"new_tokens: {new_tokens}")
+                # logging.warning(f"prev: {prev}")
                 # logging.warning(f"new_tokens.item(): {new_tokens.item()}")
                 # logging.warning(f"eod_id: {eod_id}")
                 # logging.warning(f"context_length: {context_length}")
                 
                 # skip eos token if the audio file is not fully processed
+                next_tokens_text = model.tokenizer.ids_to_tokens([new_tokens.item()])[0]
+                # logging.warning(f"____next_tokens_text: {next_tokens_text}")
+                eos_punct = ['.', '!', '?']
+
+                # if strategy_args['decode_policy'] == 'alignatt' and \
+                #     (new_tokens.item() == eod_id or next_tokens_text in eos_punct) and \
+                #         inference_strategy.part_of_processed_audio.item() < 0.8:
+                #     logging.warning(f"!!!!!! the case when we have eos too erlier, need to do two steps back, use previous token: {token_text} ________")
+
                 if strategy_args['decode_policy'] == 'alignatt' and new_tokens.item() == eod_id and inference_strategy.part_of_processed_audio.item() < 0.8:
+                    if token_text[0] in eos_punct:
+                        # the case when we have prediction of "./!/?" + eos too erlier, need to do two steps back
+                        if strategy_args["debug_mode"]:
+                            logging.warning(f"_________the case when we have . + eos too erlier, need to do two steps back________")
+                        tokens[:, context_length-1] = eod_id
+                        context_length -= 1
+                        _ = inference_strategy.token_alignatt.pop()
                     force_increase_speech_chunk = True
                     counter += 1
                     continue
+                    
+                # prevent halucinations:
+                if strategy_args['decode_policy'] == 'alignatt' and context_length > 6 and \
+                    tokens[0, context_length-1] == tokens[0, context_length-3] and \
+                    tokens[0, context_length-2] == tokens[0, context_length-4] and \
+                    tokens[0, context_length-3] == tokens[0, context_length-5] and \
+                    tokens[0, context_length-4] == tokens[0, context_length-6]:
+                    if strategy_args["debug_mode"]:
+                        logging.warning(f"_________the case when we have halucinations________")
+                    tokens[:, context_length-5:context_length-1] = eod_id
+                    is_done = torch.ones([batch_size]).byte().cuda()                   
+
+                if strategy_args['decode_policy'] == 'alignatt' and context_length > 6 and \
+                    tokens[0, context_length-1] == tokens[0, context_length-4] and \
+                    tokens[0, context_length-2] == tokens[0, context_length-5] and \
+                    tokens[0, context_length-3] == tokens[0, context_length-6]:
+                    if strategy_args["debug_mode"]:
+                        logging.warning(f"_________the case when we have halucinations________")
+                    tokens[:, context_length-3:context_length] = eod_id
+                    is_done = torch.ones([batch_size]).byte().cuda()  
 
                 # Replace sampled tokens w/ done token if EOD has already been sampled
                 new_tokens = switch(new_tokens, eod_id, is_done)
@@ -709,11 +753,11 @@ def sample_sequence_batch(
                 torch.distributed.broadcast(done, src, group)
                 if compute_logprob:
                     if all_probs:
-                        yield tokens, lengths, output_logits, full_logits, audio_feat_lens, inference_strategy.token_alignatt
+                        yield tokens, lengths, output_logits, full_logits, audio_feat_lens, context_length, inference_strategy.token_alignatt
                     else:
-                        yield tokens, lengths, output_logits, None, audio_feat_lens, inference_strategy.token_alignatt
+                        yield tokens, lengths, output_logits, None, audio_feat_lens, context_length, inference_strategy.token_alignatt
                 else:
-                    yield tokens, lengths, None, None, audio_feat_lens, inference_strategy.token_alignatt
+                    yield tokens, lengths, None, None, audio_feat_lens, context_length, inference_strategy.token_alignatt
 
             else:
                 if parallel_state.is_pipeline_first_stage():
@@ -734,6 +778,7 @@ def sample_sequence_batch(
             context_length += 1
             counter += 1
             if done:
-                for item in inference_strategy.token_alignatt:
-                    logging.warning(f"{item[0][0]:<10} - {item[1]:<4}f - {item[1]*80} ms")
+                if strategy_args["debug_mode"]:
+                    for item in inference_strategy.token_alignatt:
+                        logging.warning(f"{item[0][0]:<10} - {item[1]:<4}f - {item[1]*80} ms")
                 break

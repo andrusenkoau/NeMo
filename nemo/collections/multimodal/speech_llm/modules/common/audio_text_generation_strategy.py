@@ -171,7 +171,7 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
 
 class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
     
-    def read_next_audio_chunk(self, **strategy_args):
+    def read_next_audio_chunk(self, double_pre_decision_ratio=False, **strategy_args):
         
         if strategy_args["debug_mode"]:
             logging.warning("\n" + "*******"*10)
@@ -188,6 +188,8 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
         audio_encoder_fs = strategy_args.get('audio_encoder_fs', 80)
 
         # read audio chunk
+        if double_pre_decision_ratio:
+            self.speech_chunk_step += 1
         cur_enc_len = pre_decision_ratio * (self.speech_chunk_step + strategy_args['alignatt_waitk'])
         self.speech_chunk_step += 1
         cur_src_len = (cur_enc_len + right_context) * audio_encoder_fs * sample_rate // 1000
@@ -225,12 +227,23 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
         return speech_encoded, speech_encoded_len, cur_enc_len
 
 
-    def align_att_iteration(self, tokens2use, embeddings2use, **strategy_args):
+    def align_att_iteration(self, tokens2use, embeddings2use, curr_context_length=None, **strategy_args):
         # 1. compute xatt of speech and current context tokens
         apply_xatt = True
-        max_steps_with_same_token = 20 # max number of speech increasing steps with the same token
+        max_steps_with_same_token = 10 # max number of speech increasing steps with the same token
         step_count = 0
         decoder_mems_list = self.extra_outputs.get('decoder_mems_list', None)
+        if strategy_args["debug_mode"]:
+            logging.warning(f"________________________")    
+            logging.warning(f"decoder_mems_list.shape: {decoder_mems_list.shape}")
+            # logging.warning(f"decoder_mems_list[]: {decoder_mems_list.shape}")
+            if curr_context_length:
+                logging.warning(f"curr_context_length - 1: {curr_context_length - 1}")
+        if decoder_mems_list is not None and curr_context_length:
+                decoder_mems_list = decoder_mems_list[:, :, : curr_context_length - 1]
+        if strategy_args["debug_mode"]:
+            logging.warning(f"decoder_mems_list.shape: {decoder_mems_list.shape}")
+            logging.warning(f"________________________")  
         exclude_sink_frames = strategy_args.get('exclude_sink_frames', 2)
 
         while apply_xatt and step_count < max_steps_with_same_token:
@@ -247,19 +260,20 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
             xatt_scores = self.extra_outputs_tmp['xatt_scores_list'][strategy_args['xatt_layer']]
             xatt_scores = torch.mean(xatt_scores, 1) # mean by attention heads
             # most_attended_idx = torch.argmax(xatt_scores, dim=-1)
-            most_attended_idx = torch.argmax(xatt_scores[:,:,exclude_sink_frames:], dim=-1)+exclude_sink_frames
+            min_exclude_sink_frames = min(exclude_sink_frames, xatt_scores.shape[-1]-1)
+            most_attended_idx = torch.argmax(xatt_scores[:,:,min_exclude_sink_frames:], dim=-1)+min_exclude_sink_frames
             sum_of_last_xatt = torch.sum(xatt_scores[:,:, -strategy_args['alignatt_thr']:])
 
             # alternative serach for the most attended frame by smoothing the attention scores
-            average_pooling_xatt_scores = self.pool2d(xatt_scores[:,:,exclude_sink_frames:])
-            most_attended_idx_pool = torch.argmax(average_pooling_xatt_scores, dim=-1)+exclude_sink_frames
+            average_pooling_xatt_scores = self.pool2d(xatt_scores[:,:,min_exclude_sink_frames:])
+            most_attended_idx_pool = torch.argmax(average_pooling_xatt_scores, dim=-1)+min_exclude_sink_frames
 
             if strategy_args.get("debug_mode"):
                 logging.warning(f"self.cur_speech_encoded_len: {self.cur_speech_encoded_len.item()}")
                 logging.warning(f"=== most_attended_idx: {most_attended_idx[0].item()}")
                 logging.warning(f"=== most_attended_idx_pool: {most_attended_idx_pool[0].item()}") 
                 logging.warning(f"with value: {xatt_scores[:,:, most_attended_idx].item():.4f}")
-                logging.warning(f"xatt_scores: {xatt_scores}")
+                logging.warning(f"xatt_scores: {xatt_scores[:,:,-8:]}")
                 logging.warning(f"+++sum_of_last_xatt: {sum_of_last_xatt}")
             # # alignatt policy
             if self.audio_signal_is_finished or \
@@ -415,7 +429,7 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
             input_lengths=context_lengths - 1,
             return_mems=True,
         )
-        encoder_input = self.align_att_iteration(context_tokens[:, context_length-1: context_length], input_embeds[:, context_length - 1 : context_length], **strategy_args)
+        encoder_input = self.align_att_iteration(context_tokens[:, context_length-1: context_length], input_embeds[:, context_length - 1 : context_length], None, **strategy_args)
         # combain all the embeddings
         encoder_input = torch.cat([encoder_input_prev, encoder_input, input_embeds[:, context_length:]], dim=1)
         # logging.warning(f"encoder_input.shape: {encoder_input.shape}")
@@ -495,6 +509,7 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
             # take last predicted token
             tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, -1)
             # logging.warning(f"tokens2use: {tokens2use}")
+            # logging.warning(f"tokens2use.squeeze(-1) != self.model.tokenizer.eos_id: {tokens2use.squeeze(-1) != self.model.tokenizer.eos_id}")
             positions2use = self.position_ids[:, curr_context_length - 1].view(micro_batch_size, -1)
             embeddings2use = self.model._get_text_embeddings(tokens2use, positions2use).transpose(0, 1)
             started = context_lengths <= curr_context_length
@@ -504,6 +519,7 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
             decoder_mems_list = self.extra_outputs.get('decoder_mems_list', None)
             if decoder_mems_list is not None:
                 decoder_mems_list = decoder_mems_list[:, :, : curr_context_length - 1]
+
             if  strategy_args['decode_policy'] == 'waitk':
                 # for now only support sharing the same text context for a batch
                 assert torch.equal(context_lengths, torch.ones_like(context_lengths) * context_lengths[0])
@@ -517,12 +533,12 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
                 if force_increase_speech_chunk:
                     if strategy_args["debug_mode"]:
                         logging.warning(f"eos prediction at {self.part_of_processed_audio.item():.2f} part of the audio signal, force to increase speech chunk size")
-                    cur_speech_encoded, cur_speech_encoded_len, _ = self.read_next_audio_chunk(**strategy_args)
+                    cur_speech_encoded, cur_speech_encoded_len, _ = self.read_next_audio_chunk(double_pre_decision_ratio=True, **strategy_args)
                     self.cur_speech_encoded = cur_speech_encoded
                     self.cur_speech_encoded_len = cur_speech_encoded_len
 
                 # 1. compute xatt of speech and current context tokens
-                embeddings2use = self.align_att_iteration(tokens2use, embeddings2use, **strategy_args)
+                embeddings2use = self.align_att_iteration(tokens2use, embeddings2use, curr_context_length, **strategy_args)
 
                 """Prepare batch for each of the inference steps"""
                 setkey_value_array = torch.tensor(
