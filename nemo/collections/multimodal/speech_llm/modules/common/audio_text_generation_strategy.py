@@ -221,7 +221,7 @@ class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
         # logging.warning(f"audio_length: {self.audio_length}")
         # logging.warning(f"self.part_of_processed_audio: {self.part_of_processed_audio}")
         if  cur_enc_len_in_samples >= audio_length:
-            logging.warning(f"audio_signal_is_finished: {cur_enc_len}")
+            # logging.warning(f"audio_signal_is_finished: {cur_enc_len}")
             self.audio_signal_is_finished = True
 
         return speech_encoded, speech_encoded_len, cur_enc_len

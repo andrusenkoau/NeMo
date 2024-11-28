@@ -685,6 +685,14 @@ def sample_sequence_batch(
                     continue
                     
                 # prevent halucinations:
+                if strategy_args['decode_policy'] == 'alignatt' and len(inference_strategy.token_alignatt) > 100:
+                    if strategy_args["debug_mode"]:
+                        logging.warning(f"_________the case when we have halucinations (predict more tokens than threshold)________")
+                    tokens[:, context_length] = eod_id
+                    is_done = torch.ones([batch_size]).byte().cuda() 
+
+                inference_strategy.token_alignatt
+
                 if strategy_args['decode_policy'] == 'alignatt' and context_length > 6 and \
                     tokens[0, context_length-1] == tokens[0, context_length-3] and \
                     tokens[0, context_length-2] == tokens[0, context_length-4] and \
