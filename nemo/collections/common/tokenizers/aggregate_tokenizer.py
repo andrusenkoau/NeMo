@@ -254,7 +254,7 @@ class TokenizerWrapper:
         else:
             self._impl = self._call_parser
 
-    def __call__(self, text: str, lang: str | None = None):
+    def __call__(self, text: str, lang: str | None = None):     
         return self._impl(text, lang)
 
     def _call_agg_tokenizer(self, text: str, lang: str | None = None):
@@ -263,6 +263,11 @@ class TokenizerWrapper:
 
     def _call_tokenizer(self, text: str, lang: str | None = None):
         return self._tokenizer.text_to_ids(text)
+
+        # if torch.is_grad_enabled():
+        #     return self._tokenizer.text_to_ids(text, sample_alpha=0.1)
+        # else:
+        #     return self._tokenizer.text_to_ids(text)
 
     def _call_parser(self, text: str, lang: str | None = None):
         return self._tokenizer(text)
