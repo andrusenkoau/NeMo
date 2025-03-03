@@ -320,9 +320,9 @@ class Block(nn.Module):
         if self.config.use_nGPT == 1:
             softmax_scale = sqrt_head_dim
         y = flash_attn_func(
-            q,
-            k,
-            v,
+            q.to(torch.bfloat16),
+            k.to(torch.bfloat16),
+            v.to(torch.bfloat16),
             dropout_p=0.0,
             softmax_scale=softmax_scale,
             causal=False,
