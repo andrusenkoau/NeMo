@@ -275,7 +275,7 @@ class Block(nn.Module):
 
         # 1d convolution:
         if self.config.conv_layer:
-            self.conv_1d = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=3, stride=1, padding=2, dilation=2)
+            self.conv_1d = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=5, stride=1, padding=4, dilation=2)
             # normalization:
             self.conv_alpha_init_value = 0.05
             self.conv_alpha_init_scaling = config.base_scale
