@@ -133,6 +133,9 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
         use_bias=False,
         dropout=0.1,
         use_nGPT=True,
+        macaron_style=False,
+        fc_factor=0.5,
+        ff_expansion_factor=2,
     ):
         super().__init__()
         self._feat_out = d_model
@@ -164,6 +167,8 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
                 use_nGPT=use_nGPT,
                 dropout=dropout,
                 bias=use_bias,
+                macaron_style=macaron_style,
+                ff_expansion_factor=ff_expansion_factor,
             )
         )
 
@@ -251,14 +256,20 @@ class Block(nn.Module):
         super().__init__()
         self.config = config
 
+        # first FF block
+        if self.config.macaron_style:
+            self.c_fc_1 = nn.Linear(config.n_embd, 2 * self.config.ff_expansion_factor * config.n_embd, bias=config.bias)
+            self.mlp_c_proj_1 = nn.Linear(self.config.ff_expansion_factor * config.n_embd, config.n_embd, bias=config.bias)
+
         self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        self.c_fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+        # second FF block
+        self.c_fc_2 = nn.Linear(config.n_embd, 2 * self.config.ff_expansion_factor * config.n_embd, bias=config.bias)
         self.silu = nn.SiLU()
-        self.mlp_c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.mlp_c_proj_2 = nn.Linear(self.config.ff_expansion_factor * config.n_embd, config.n_embd, bias=config.bias)
 
         if config.use_nGPT == 0:
             self.rmsnorm_att = RMSNorm(config.n_embd)
@@ -271,25 +282,68 @@ class Block(nn.Module):
                 self.attn_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
             )
 
-            self.mlp_alpha_init_value = 0.05
-            self.mlp_alpha_init_scaling = config.base_scale
-            self.mlp_alpha = torch.nn.Parameter(
-                self.mlp_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
-            )
-
             self.sqk_init_value = 1.0
             self.sqk_init_scaling = config.base_scale
             self.sqk = torch.nn.Parameter(self.sqk_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
-            self.suv_init_value = 1.0
-            self.suv_init_scaling = 1.0
-            self.suv = torch.nn.Parameter(
-                self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float32)
+            # first FF block normalization
+            if self.config.macaron_style:
+                self.mlp_1_alpha_init_value = 0.05
+                self.mlp_1_alpha_init_scaling = config.base_scale
+                self.mlp_1_alpha = torch.nn.Parameter(
+                    self.mlp_1_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
+                )
+                self.suv_1_init_value = 1.0
+                self.suv_1_init_scaling = 1.0
+                self.suv_1 = torch.nn.Parameter(
+                    self.suv_1_init_scaling * torch.ones(2 * self.config.ff_expansion_factor * config.n_embd, dtype=torch.float32)
+                )
+            
+            # second FF block normalization
+            self.mlp_2_alpha_init_value = 0.05
+            self.mlp_2_alpha_init_scaling = config.base_scale
+            self.mlp_2_alpha = torch.nn.Parameter(
+                self.mlp_2_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
+            )
+
+            self.suv_2_init_value = 1.0
+            self.suv_2_init_scaling = 1.0
+            self.suv_2 = torch.nn.Parameter(
+                self.suv_2_init_scaling * torch.ones(2 * self.config.ff_expansion_factor * config.n_embd, dtype=torch.float32)
             )
 
     def forward(self, h, mask):
         B, T, C = h.size()
 
+        
+        if self.config.macaron_style:
+            # first FF block
+            hin = h
+            if self.config.use_nGPT == 0:
+                hin = self.rmsnorm_mlp(h)
+            uv = self.c_fc_1(hin)
+            if self.config.use_nGPT == 1:
+                suv = self.suv_1 * ((self.suv_1_init_value / self.suv_1_init_scaling) * (self.config.n_embd**0.5))
+                uv = suv * uv
+            u, v = torch.chunk(uv, 2, dim=-1)
+            x_mlp = u * self.silu(v)
+            h_mlp = self.mlp_c_proj_1(x_mlp)
+
+            if self.config.use_nGPT == 0:
+                h = h + h_mlp
+            if self.config.use_nGPT == 1:
+                lr = self.mlp_1_alpha * (self.mlp_1_alpha_init_value / self.mlp_1_alpha_init_scaling)
+                lr = torch.abs(lr)
+
+                A_norm = justnorm(h)  # normally, normalization is not needed
+                B_norm = justnorm(h_mlp)
+
+                # res = (1.0 - lr) * A_norm + lr * B_norm
+                # TODO add fc_factor
+                res = A_norm + lr * (B_norm - A_norm)
+                h = justnorm(res)
+        
+        # MHA block:
         hin = h
         if self.config.use_nGPT == 0:
             hin = self.rmsnorm_att(h)
@@ -348,21 +402,22 @@ class Block(nn.Module):
             res = A_norm + lr * (B_norm - A_norm)
             h = justnorm(res)
 
+        # second FF block
         hin = h
         if self.config.use_nGPT == 0:
             hin = self.rmsnorm_mlp(h)
-        uv = self.c_fc(hin)
+        uv = self.c_fc_2(hin)
         if self.config.use_nGPT == 1:
-            suv = self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.config.n_embd**0.5))
+            suv = self.suv_2 * ((self.suv_2_init_value / self.suv_2_init_scaling) * (self.config.n_embd**0.5))
             uv = suv * uv
         u, v = torch.chunk(uv, 2, dim=-1)
         x_mlp = u * self.silu(v)
-        h_mlp = self.mlp_c_proj(x_mlp)
+        h_mlp = self.mlp_c_proj_2(x_mlp)
 
         if self.config.use_nGPT == 0:
             h = h + h_mlp
         if self.config.use_nGPT == 1:
-            lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+            lr = self.mlp_2_alpha * (self.mlp_2_alpha_init_value / self.mlp_2_alpha_init_scaling)
             lr = torch.abs(lr)
 
             A_norm = justnorm(h)  # normally, normalization is not needed
@@ -384,6 +439,8 @@ class GPTConfig:
     use_nGPT: int = 0
     dropout: float = 0.0
     bias: bool = False
+    macaron_style: bool = False
+    ff_expansion_factor: int = 2
 
 
 class RMSNorm(torch.nn.Module):
