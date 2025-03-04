@@ -564,8 +564,11 @@ class GPT(nn.Module):
             block.value.weight.data.copy_(justnorm_fp32(block.value.weight.data, 1))  # n_proj, n_embd
             block.att_c_proj.weight.data.copy_(justnorm_fp32(block.att_c_proj.weight.data, 0))  # n_embd, n_proj
 
-            block.c_fc.weight.data.copy_(justnorm_fp32(block.c_fc.weight.data, 1))  # n_proj, n_embd
-            block.mlp_c_proj.weight.data.copy_(justnorm_fp32(block.mlp_c_proj.weight.data, 0))  # n_embd, n_proj
+            block.c_fc_1.weight.data.copy_(justnorm_fp32(block.c_fc_1.weight.data, 1))  # n_proj, n_embd
+            block.mlp_c_proj_1.weight.data.copy_(justnorm_fp32(block.mlp_c_proj_1.weight.data, 0))  # n_embd, n_proj
+
+            block.c_fc_2.weight.data.copy_(justnorm_fp32(block.c_fc_2.weight.data, 1))  # n_proj, n_embd
+            block.mlp_c_proj_2.weight.data.copy_(justnorm_fp32(block.mlp_c_proj_2.weight.data, 0))  # n_embd, n_proj
 
 
 class NGPTHead(NeuralModule):
