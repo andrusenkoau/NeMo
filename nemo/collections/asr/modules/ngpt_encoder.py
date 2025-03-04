@@ -136,6 +136,7 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
         macaron_style=False,
         fc_factor=0.5,
         ff_expansion_factor=2,
+        conv_layer=False,
     ):
         super().__init__()
         self._feat_out = d_model
@@ -169,6 +170,7 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
                 bias=use_bias,
                 macaron_style=macaron_style,
                 ff_expansion_factor=ff_expansion_factor,
+                conv_layer=conv_layer,
             )
         )
 
@@ -271,6 +273,16 @@ class Block(nn.Module):
         self.silu = nn.SiLU()
         self.mlp_c_proj_2 = nn.Linear(self.config.ff_expansion_factor * config.n_embd, config.n_embd, bias=config.bias)
 
+        # 1d convolution:
+        if self.config.conv_layer:
+            self.conv_1d = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=3, stride=1, padding=2, dilation=2)
+            # normalization:
+            self.conv_alpha_init_value = 0.05
+            self.conv_alpha_init_scaling = config.base_scale
+            self.conv_alpha = torch.nn.Parameter(
+                self.conv_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
+            )
+        
         if config.use_nGPT == 0:
             self.rmsnorm_att = RMSNorm(config.n_embd)
             self.rmsnorm_mlp = RMSNorm(config.n_embd)
@@ -402,6 +414,27 @@ class Block(nn.Module):
             res = A_norm + lr * (B_norm - A_norm)
             h = justnorm(res)
 
+        # conv block
+        if self.config.conv_layer:
+            hin = h
+            hin = hin.transpose(1, 2)
+            h_conv = self.conv_1d(hin)
+            h_conv = self.silu(h_conv)
+            h_conv = h_conv.transpose(1, 2)
+            if self.config.use_nGPT == 0:
+                h = h + h_conv
+            if self.config.use_nGPT == 1:
+                lr = self.conv_alpha * (self.conv_alpha_init_value / self.conv_alpha_init_scaling)
+                lr = torch.abs(lr)
+
+                A_norm = justnorm(h)  # normally, normalization is not needed
+                B_norm = justnorm(h_conv)
+
+                # res = (1.0 - lr) * A_norm + lr * B_norm
+                res = A_norm + lr * (B_norm - A_norm)
+                h = justnorm(res)
+
+        
         # second FF block
         hin = h
         if self.config.use_nGPT == 0:
@@ -441,6 +474,7 @@ class GPTConfig:
     bias: bool = False
     macaron_style: bool = False
     ff_expansion_factor: int = 2
+    conv_layer: bool = False
 
 
 class RMSNorm(torch.nn.Module):

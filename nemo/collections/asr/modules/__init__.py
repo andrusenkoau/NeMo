@@ -52,3 +52,4 @@ from nemo.collections.asr.modules.ssl_modules import (
     RandomBlockMasking,
     RandomProjectionVectorQuantizer,
 )
+from nemo.collections.asr.modules.ngpt_encoder import NGPTEncoder
