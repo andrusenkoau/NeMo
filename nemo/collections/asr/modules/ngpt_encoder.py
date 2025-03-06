@@ -65,7 +65,8 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
             A tuple of input examples.
         """
         dev = next(self.parameters()).device
-        input_example = torch.randn(max_batch, self._feat_in, max_dim, device=dev)
+        input_example = torch.randn(max_batch, 80, max_dim, device=dev)
+        # input_example = torch.randn(max_batch, self._feat_in, max_dim, device=dev)
         input_example_length = torch.randint(max_dim // 4, max_dim, (max_batch,), device=dev, dtype=torch.int64)
         all_input_example = tuple([input_example, input_example_length])
         return all_input_example
@@ -140,6 +141,8 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
     ):
         super().__init__()
         self._feat_out = d_model
+        assert d_model % n_heads == 0, "n_embd should be divisible by n_heads"
+        
         if subsampling == "ngpt-frame-stack":
             self.pre_encode = NGPTStackingSubsampling(
                 subsampling_factor=subsampling_factor,
@@ -252,6 +255,84 @@ def justnorm_fp32(x, idim: int = -1):
     return justnorm(x, idim=idim, fp32=True)
 
 
+
+class Conv1dDilation(nn.Module):
+    def __init__(self, d_model, base_scale, kernel_size=5, dropout=0.0):
+        super(Conv1dDilation, self).__init__()
+        padding = (kernel_size - 1) // 2 * 2
+        self.conv_1d_dilation = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=kernel_size, stride=1, padding=padding, dilation=2)
+        self.activation = nn.SiLU()
+        # normalization:
+        self.conv_alpha_init_value = 0.05
+        self.conv_alpha_init_scaling = base_scale
+        self.conv_alpha = torch.nn.Parameter(
+            self.conv_alpha_init_scaling * torch.ones(d_model, dtype=torch.float32)
+        )
+
+    def forward(self, h):
+        hin = h
+        hin = hin.transpose(1, 2)
+        h_conv = self.conv_1d_dilation(hin)
+        h_conv = self.activation(h_conv)
+        h_conv = h_conv.transpose(1, 2)
+        lr = self.conv_alpha * (self.conv_alpha_init_value / self.conv_alpha_init_scaling)
+        lr = torch.abs(lr)
+
+        A_norm = justnorm(h)  # normally, normalization is not needed
+        B_norm = justnorm(h_conv)
+
+        res = A_norm + lr * (B_norm - A_norm)
+        h = justnorm(res)
+
+        return h
+
+
+
+
+class GatedFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, base_scale, dropout=0.0, use_bias=True):
+        super(GatedFeedForward, self).__init__()
+        self.d_model = d_model
+        self.c_fc =  nn.Linear(d_model, 2 * d_ff, bias=use_bias)
+        self.activation = nn.SiLU()
+        self.mlp_c_proj = nn.Linear(d_ff, d_model, bias=use_bias)
+
+        # normalizarion
+        self.mlp_alpha_init_value = 0.05
+        self.mlp_alpha_init_scaling = base_scale
+        self.mlp_alpha = torch.nn.Parameter(
+            self.mlp_alpha_init_scaling * torch.ones(d_model, dtype=torch.float32)
+        )
+        self.suv_init_value = 1.0
+        self.suv_init_scaling = 1.0
+        self.suv = torch.nn.Parameter(
+            self.suv_init_scaling * torch.ones(2 * d_ff, dtype=torch.float32)
+        )
+    
+    def forward(self, h):
+        hin = h
+        uv = self.c_fc(hin)
+        suv = self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.d_model**0.5))
+        uv = suv * uv
+        u, v = torch.chunk(uv, 2, dim=-1)
+        x_mlp = u * self.activation(v)
+        h_mlp = self.mlp_c_proj(x_mlp)
+
+        lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+        lr = torch.abs(lr)
+
+        A_norm = justnorm(h)  # normally, normalization is not needed
+        B_norm = justnorm(h_mlp)
+
+        # res = (1.0 - lr) * A_norm + lr * B_norm
+        # TODO add fc_factor
+        res = A_norm + lr * (B_norm - A_norm)
+        h = justnorm(res)
+
+        return h
+
+
+
 class Block(nn.Module):
 
     def __init__(self, config, iblock):
@@ -260,28 +341,32 @@ class Block(nn.Module):
 
         # first FF block
         if self.config.macaron_style:
-            self.c_fc_1 = nn.Linear(config.n_embd, 2 * self.config.ff_expansion_factor * config.n_embd, bias=config.bias)
-            self.mlp_c_proj_1 = nn.Linear(self.config.ff_expansion_factor * config.n_embd, config.n_embd, bias=config.bias)
+            self.ff_1 = GatedFeedForward(
+                config.n_embd,
+                self.config.ff_expansion_factor * config.n_embd,
+                config.base_scale,
+                dropout=config.dropout,
+                use_bias=config.bias
+            )
 
+        # attention block
         self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         # second FF block
-        self.c_fc_2 = nn.Linear(config.n_embd, 2 * self.config.ff_expansion_factor * config.n_embd, bias=config.bias)
-        self.silu = nn.SiLU()
-        self.mlp_c_proj_2 = nn.Linear(self.config.ff_expansion_factor * config.n_embd, config.n_embd, bias=config.bias)
+        self.ff_2 = GatedFeedForward(
+            config.n_embd,
+            self.config.ff_expansion_factor * config.n_embd,
+            config.base_scale,
+            dropout=config.dropout,
+            use_bias=config.bias
+        )
 
         # 1d convolution:
         if self.config.conv_layer:
-            self.conv_1d = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=5, stride=1, padding=4, dilation=2)
-            # normalization:
-            self.conv_alpha_init_value = 0.05
-            self.conv_alpha_init_scaling = config.base_scale
-            self.conv_alpha = torch.nn.Parameter(
-                self.conv_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
-            )
+            self.conv_1d = Conv1dDilation(config.n_embd, config.base_scale, kernel_size=5)
         
         if config.use_nGPT == 0:
             self.rmsnorm_att = RMSNorm(config.n_embd)
@@ -298,31 +383,6 @@ class Block(nn.Module):
             self.sqk_init_scaling = config.base_scale
             self.sqk = torch.nn.Parameter(self.sqk_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
-            # first FF block normalization
-            if self.config.macaron_style:
-                self.mlp_1_alpha_init_value = 0.05
-                self.mlp_1_alpha_init_scaling = config.base_scale
-                self.mlp_1_alpha = torch.nn.Parameter(
-                    self.mlp_1_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
-                )
-                self.suv_1_init_value = 1.0
-                self.suv_1_init_scaling = 1.0
-                self.suv_1 = torch.nn.Parameter(
-                    self.suv_1_init_scaling * torch.ones(2 * self.config.ff_expansion_factor * config.n_embd, dtype=torch.float32)
-                )
-            
-            # second FF block normalization
-            self.mlp_2_alpha_init_value = 0.05
-            self.mlp_2_alpha_init_scaling = config.base_scale
-            self.mlp_2_alpha = torch.nn.Parameter(
-                self.mlp_2_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32)
-            )
-
-            self.suv_2_init_value = 1.0
-            self.suv_2_init_scaling = 1.0
-            self.suv_2 = torch.nn.Parameter(
-                self.suv_2_init_scaling * torch.ones(2 * self.config.ff_expansion_factor * config.n_embd, dtype=torch.float32)
-            )
 
     def forward(self, h, mask):
         B, T, C = h.size()
@@ -330,30 +390,7 @@ class Block(nn.Module):
         
         if self.config.macaron_style:
             # first FF block
-            hin = h
-            if self.config.use_nGPT == 0:
-                hin = self.rmsnorm_mlp(h)
-            uv = self.c_fc_1(hin)
-            if self.config.use_nGPT == 1:
-                suv = self.suv_1 * ((self.suv_1_init_value / self.suv_1_init_scaling) * (self.config.n_embd**0.5))
-                uv = suv * uv
-            u, v = torch.chunk(uv, 2, dim=-1)
-            x_mlp = u * self.silu(v)
-            h_mlp = self.mlp_c_proj_1(x_mlp)
-
-            if self.config.use_nGPT == 0:
-                h = h + h_mlp
-            if self.config.use_nGPT == 1:
-                lr = self.mlp_1_alpha * (self.mlp_1_alpha_init_value / self.mlp_1_alpha_init_scaling)
-                lr = torch.abs(lr)
-
-                A_norm = justnorm(h)  # normally, normalization is not needed
-                B_norm = justnorm(h_mlp)
-
-                # res = (1.0 - lr) * A_norm + lr * B_norm
-                # TODO add fc_factor
-                res = A_norm + lr * (B_norm - A_norm)
-                h = justnorm(res)
+            h = self.ff_1(h)
         
         # MHA block:
         hin = h
@@ -416,49 +453,10 @@ class Block(nn.Module):
 
         # conv block
         if self.config.conv_layer:
-            hin = h
-            hin = hin.transpose(1, 2)
-            h_conv = self.conv_1d(hin)
-            h_conv = self.silu(h_conv)
-            h_conv = h_conv.transpose(1, 2)
-            if self.config.use_nGPT == 0:
-                h = h + h_conv
-            if self.config.use_nGPT == 1:
-                lr = self.conv_alpha * (self.conv_alpha_init_value / self.conv_alpha_init_scaling)
-                lr = torch.abs(lr)
-
-                A_norm = justnorm(h)  # normally, normalization is not needed
-                B_norm = justnorm(h_conv)
-
-                # res = (1.0 - lr) * A_norm + lr * B_norm
-                res = A_norm + lr * (B_norm - A_norm)
-                h = justnorm(res)
-
+            h = self.conv_1d(h)
         
         # second FF block
-        hin = h
-        if self.config.use_nGPT == 0:
-            hin = self.rmsnorm_mlp(h)
-        uv = self.c_fc_2(hin)
-        if self.config.use_nGPT == 1:
-            suv = self.suv_2 * ((self.suv_2_init_value / self.suv_2_init_scaling) * (self.config.n_embd**0.5))
-            uv = suv * uv
-        u, v = torch.chunk(uv, 2, dim=-1)
-        x_mlp = u * self.silu(v)
-        h_mlp = self.mlp_c_proj_2(x_mlp)
-
-        if self.config.use_nGPT == 0:
-            h = h + h_mlp
-        if self.config.use_nGPT == 1:
-            lr = self.mlp_2_alpha * (self.mlp_2_alpha_init_value / self.mlp_2_alpha_init_scaling)
-            lr = torch.abs(lr)
-
-            A_norm = justnorm(h)  # normally, normalization is not needed
-            B_norm = justnorm(h_mlp)
-
-            # res = (1.0 - lr) * A_norm + lr * B_norm
-            res = A_norm + lr * (B_norm - A_norm)
-            h = justnorm(res)
+        h = self.ff_2(h)
 
         return h
 
@@ -598,11 +596,12 @@ class GPT(nn.Module):
             block.value.weight.data.copy_(justnorm_fp32(block.value.weight.data, 1))  # n_proj, n_embd
             block.att_c_proj.weight.data.copy_(justnorm_fp32(block.att_c_proj.weight.data, 0))  # n_embd, n_proj
 
-            block.c_fc_1.weight.data.copy_(justnorm_fp32(block.c_fc_1.weight.data, 1))  # n_proj, n_embd
-            block.mlp_c_proj_1.weight.data.copy_(justnorm_fp32(block.mlp_c_proj_1.weight.data, 0))  # n_embd, n_proj
+            if self.config.macaron_style:
+                block.ff_1.c_fc.weight.data.copy_(justnorm_fp32(block.ff_1.c_fc.weight.data, 1))  # n_proj, n_embd
+                block.ff_1.mlp_c_proj.weight.data.copy_(justnorm_fp32(block.ff_1.mlp_c_proj.weight.data, 0))  # n_embd, n_proj
 
-            block.c_fc_2.weight.data.copy_(justnorm_fp32(block.c_fc_2.weight.data, 1))  # n_proj, n_embd
-            block.mlp_c_proj_2.weight.data.copy_(justnorm_fp32(block.mlp_c_proj_2.weight.data, 0))  # n_embd, n_proj
+            block.ff_2.c_fc.weight.data.copy_(justnorm_fp32(block.ff_2.c_fc.weight.data, 1))  # n_proj, n_embd
+            block.ff_2.mlp_c_proj.weight.data.copy_(justnorm_fp32(block.ff_2.mlp_c_proj.weight.data, 0))  # n_embd, n_proj
 
 
 class NGPTHead(NeuralModule):
