@@ -288,6 +288,46 @@ class Conv1dDilation(nn.Module):
 
 
 
+class ConformerFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, base_scale, dropout=0.0, use_bias=True):
+        super(ConformerFeedForward, self).__init__()
+        self.d_model = d_model
+        self.c_fc =  nn.Linear(d_model, d_ff, bias=use_bias)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(p=dropout)
+        self.mlp_c_proj = nn.Linear(d_ff, d_model, bias=use_bias)
+
+        # normalizarion
+        self.mlp_alpha_init_value = 0.05
+        self.mlp_alpha_init_scaling = base_scale
+        self.mlp_alpha = torch.nn.Parameter(
+            self.mlp_alpha_init_scaling * torch.ones(d_model, dtype=torch.float32)
+        )
+        self.suv_init_value = 1.0
+        self.suv_init_scaling = 1.0
+        self.suv = torch.nn.Parameter(
+            self.suv_init_scaling * torch.ones(2 * d_ff, dtype=torch.float32)
+        )
+    
+    def forward(self, h):
+        hin = h
+        uv = self.c_fc(hin)
+        suv = self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.d_model**0.5))
+        uv = suv * uv
+        x_mlp = self.activation(v)
+        x_mlp = self.dropout(x_mlp)
+        h_mlp = self.mlp_c_proj(x_mlp)
+
+        lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+        lr = torch.abs(lr)
+        A_norm = justnorm(h)  # normally, normalization is not needed
+        B_norm = justnorm(h_mlp)
+        # TODO add fc_factor
+        res = A_norm + lr * (B_norm - A_norm)
+        h = justnorm(res)
+
+        return h
+
 
 class GatedFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, base_scale, dropout=0.0, use_bias=True):
