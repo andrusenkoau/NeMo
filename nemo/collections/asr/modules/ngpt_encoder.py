@@ -383,13 +383,22 @@ class Block(nn.Module):
 
         # first FF block
         if self.config.macaron_style:
-            self.ff_1 = GatedFeedForward(
-                config.n_embd,
-                self.config.ff_expansion_factor * config.n_embd,
-                config.base_scale,
-                dropout=0.1,
-                use_bias=config.bias
-            )
+            if config.standard_ff:
+                self.ff_1 = ConformerFeedForward(
+                    config.n_embd,
+                    self.config.ff_expansion_factor * config.n_embd,
+                    config.base_scale,
+                    dropout=config.dropout,
+                    use_bias=config.bias
+                )
+            else:
+                self.ff_1 = GatedFeedForward(
+                    config.n_embd,
+                    self.config.ff_expansion_factor * config.n_embd,
+                    config.base_scale,
+                    dropout=0.1,
+                    use_bias=config.bias
+                )
 
         # attention block
         self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
