@@ -138,6 +138,7 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
         fc_factor=0.5,
         ff_expansion_factor=2,
         conv_layer=False,
+        standard_ff=False,
     ):
         super().__init__()
         self._feat_out = d_model
@@ -174,6 +175,7 @@ class NGPTEncoder(NeuralModule, Exportable, AccessMixin):
                 macaron_style=macaron_style,
                 ff_expansion_factor=ff_expansion_factor,
                 conv_layer=conv_layer,
+                standard_ff=standard_ff,
             )
         )
 
@@ -306,7 +308,7 @@ class ConformerFeedForward(nn.Module):
         self.suv_init_value = 1.0
         self.suv_init_scaling = 1.0
         self.suv = torch.nn.Parameter(
-            self.suv_init_scaling * torch.ones(2 * d_ff, dtype=torch.float32)
+            self.suv_init_scaling * torch.ones(d_ff, dtype=torch.float32)
         )
     
     def forward(self, h):
@@ -314,7 +316,7 @@ class ConformerFeedForward(nn.Module):
         uv = self.c_fc(hin)
         suv = self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.d_model**0.5))
         uv = suv * uv
-        x_mlp = self.activation(v)
+        x_mlp = self.activation(uv)
         x_mlp = self.dropout(x_mlp)
         h_mlp = self.mlp_c_proj(x_mlp)
 
@@ -385,7 +387,7 @@ class Block(nn.Module):
                 config.n_embd,
                 self.config.ff_expansion_factor * config.n_embd,
                 config.base_scale,
-                dropout=config.dropout,
+                dropout=0.1,
                 use_bias=config.bias
             )
 
@@ -396,13 +398,22 @@ class Block(nn.Module):
         self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         # second FF block
-        self.ff_2 = GatedFeedForward(
-            config.n_embd,
-            self.config.ff_expansion_factor * config.n_embd,
-            config.base_scale,
-            dropout=config.dropout,
-            use_bias=config.bias
-        )
+        if config.standard_ff:
+            self.ff_2 = ConformerFeedForward(
+                config.n_embd,
+                self.config.ff_expansion_factor * config.n_embd,
+                config.base_scale,
+                dropout=config.dropout,
+                use_bias=config.bias
+            )
+        else:
+            self.ff_2 = GatedFeedForward(
+                config.n_embd,
+                self.config.ff_expansion_factor * config.n_embd,
+                config.base_scale,
+                dropout=config.dropout,
+                use_bias=config.bias
+            )
 
         # 1d convolution:
         if self.config.conv_layer:
@@ -513,6 +524,7 @@ class GPTConfig:
     macaron_style: bool = False
     ff_expansion_factor: int = 2
     conv_layer: bool = False
+    standard_ff: bool = True
 
 
 class RMSNorm(torch.nn.Module):
