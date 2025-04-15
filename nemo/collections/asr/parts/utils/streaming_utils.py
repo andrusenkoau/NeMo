@@ -1384,6 +1384,7 @@ class CacheAwareStreamingAudioBuffer:
         self.streams_length = None
         self.step = 0
         self.pad_and_drop_preencoded = pad_and_drop_preencoded
+        self.right_context = 7
 
         self.online_normalization = online_normalization
         if not isinstance(model.encoder, StreamingEncoder):
@@ -1550,6 +1551,14 @@ class CacheAwareStreamingAudioBuffer:
 
     def append_processed_signal(self, processed_signal, stream_id=-1):
         processed_signal_length = torch.tensor(processed_signal.size(-1), device=processed_signal.device)
+        
+        # pad the processed signal to the right context
+        # import pdb; pdb.set_trace()
+        if self.right_context > 0:
+            processed_signal = torch.nn.functional.pad(
+                processed_signal, pad=(0, self.right_context * self.sampling_frames[-1]), mode="constant", value=0
+            )
+        
         if stream_id >= 0 and (self.streams_length is not None and stream_id >= len(self.streams_length)):
             raise ValueError("Not valid stream_id!")
         if self.buffer is None:
@@ -1566,12 +1575,12 @@ class CacheAwareStreamingAudioBuffer:
                     (self.streams_length, torch.tensor([0], device=self.streams_length.device)), dim=-1
                 )
                 stream_id = len(self.streams_length) - 1
-            needed_len = self.streams_length[stream_id] + processed_signal_length
+            needed_len = self.streams_length[stream_id] + processed_signal_length + self.right_context * self.sampling_frames[-1]
             if needed_len > self.buffer.size(-1):
                 self.buffer = torch.nn.functional.pad(self.buffer, pad=(0, needed_len - self.buffer.size(-1)))
 
             self.buffer[
-                stream_id, :, self.streams_length[stream_id] : self.streams_length[stream_id] + processed_signal_length
+                stream_id, :, self.streams_length[stream_id] : self.streams_length[stream_id] + processed_signal_length + self.right_context * self.sampling_frames[-1]
             ] = processed_signal
             self.streams_length[stream_id] = self.streams_length[stream_id] + processed_signal.size(-1)
 
@@ -1690,6 +1699,7 @@ class ChunkedStreamingAudioBuffer(CacheAwareStreamingAudioBuffer):
         audio_signal_length = torch.tensor(audio_signal_len.size(-1), device=audio_signal_len.device)
         if stream_id >= 0 and (self.streams_length is not None and stream_id >= len(self.streams_length)):
             raise ValueError("Not valid stream_id!")
+        
         if self.buffer is None:
             if stream_id >= 0:
                 raise ValueError("stream_id can not be specified when there is no stream.")

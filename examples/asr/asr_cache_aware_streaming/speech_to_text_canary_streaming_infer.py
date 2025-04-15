@@ -280,7 +280,7 @@ def perform_streaming(
         # import pdb; pdb.set_trace()
         
         canary_data.step_num = step_num
-        canary_data.is_last_speech_chunk = streaming_buffer.streams_length - streaming_buffer.sampling_frames[1] <= streaming_buffer.buffer_idx
+        canary_data.is_last_speech_chunk = streaming_buffer.streams_length + cfg.right_context - streaming_buffer.sampling_frames[1] <= streaming_buffer.buffer_idx
         
         with torch.inference_mode():
             with autocast:
