@@ -21,7 +21,7 @@ from tempfile import NamedTemporaryFile
 from typing import List, Optional, Tuple, Union
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 from tqdm.auto import tqdm
 
 import nemo.collections.asr as nemo_asr
@@ -32,6 +32,8 @@ from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchASR, Fram
 from nemo.collections.common.metrics.punct_er import OccurancePunctuationErrorRate
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging, model_utils
+from copy import deepcopy
+from normalizer.data_utils import normalizer
 
 
 def get_buffered_pred_feat_rnnt(
@@ -475,6 +477,11 @@ def write_transcription(
                         item['pred_lang_chars'] = transcription.langs_chars
                     if not cfg.decoding.beam.return_best_hypothesis:
                         item['beams'] = beams[idx]
+                
+                if cfg.normalize:     
+                    item=deepcopy(item)
+                    item[cfg.gt_text_attr_name] = normalizer(item['text'])
+                    item['pred_text'] = normalizer(item['pred_text'])
                 f.write(json.dumps(item) + "\n")
         else:
             with open(cfg.dataset_manifest, 'r', encoding='utf-8') as fr:
@@ -504,8 +511,13 @@ def write_transcription(
 
                         if not cfg.decoding.beam.return_best_hypothesis:
                             item['beams'] = beams[idx]
+            
+                    if cfg.normalize:     
+                        item=deepcopy(item)
+                        item['pred_text'] = normalizer(item['pred_text'])
+                        item['text'] = normalizer(item['text'])
                     f.write(json.dumps(item) + "\n")
-
+    
     return cfg.output_filename, pred_text_attr_name
 
 

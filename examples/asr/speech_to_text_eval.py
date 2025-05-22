@@ -80,6 +80,7 @@ from nemo.collections.asr.parts.utils.transcribe_utils import (
 from nemo.collections.common.metrics.punct_er import DatasetPunctuationErrorRate
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+from normalizer.data_utils import normalizer
 
 
 @dataclass
@@ -124,7 +125,7 @@ def main(cfg: EvaluationConfig):
 
     if not os.path.exists(cfg.dataset_manifest):
         raise FileNotFoundError(f"The dataset manifest file could not be found at path : {cfg.dataset_manifest}")
-
+    
     if not cfg.only_score_manifest:
         # Transcribe speech into an output directory
         transcription_cfg = transcribe_speech.main(cfg)  # type: EvaluationConfig
@@ -138,7 +139,7 @@ def main(cfg: EvaluationConfig):
     else:
         cfg.output_filename = cfg.dataset_manifest
         transcription_cfg = cfg
-
+        
     ground_truth_text = []
     predicted_text = []
     invalid_manifest = False
@@ -149,11 +150,13 @@ def main(cfg: EvaluationConfig):
             if "pred_text" not in data:
                 invalid_manifest = True
                 break
-
-            ground_truth_text.append(data[cfg.gt_text_attr_name])
-
-            predicted_text.append(data["pred_text"])
-
+            
+            gt_text = data[cfg.gt_text_attr_name]
+            pred_text = data["pred_text"]
+            
+            ground_truth_text.append(gt_text)
+            predicted_text.append(pred_text)
+            
     pc = PunctuationCapitalization(cfg.text_processing.punctuation_marks)
     if cfg.text_processing.separate_punctuation:
         ground_truth_text = pc.separate_punctuation(ground_truth_text)
@@ -213,7 +216,7 @@ def main(cfg: EvaluationConfig):
         logging.info(f'Got {metric_name} of {metric_value}. Tolerance was {cfg.tolerance}')
 
     logging.info(f"Dataset WER/CER {wer:.2%}/{cer:.2%}")
-
+    
     if cfg.use_punct_er:
         dper_obj.print()
         dper_obj.reset()
