@@ -218,8 +218,9 @@ class ContextGraph:
                 node_next = {}
                 if token not in node.next:
                     if i > 0:
-                        token_score = context_score + np.log(5*i)+1 # assign a larger score for all tokens after the first one
-                        # token_score = np.log10(i/(max_depth+1))/2
+                        token_score = context_score + np.log(10*i) # assign a larger score for all tokens after the first one
+                        # token_score = np.log10(i/(max_depth+1))/2 # for negative weight distribution (doesn't work well)
+                        # token_score = token_score
                     else:
                         token_score = context_score
                     self.num_nodes += 1

@@ -141,6 +141,8 @@ class SuffixTreeStorage:
                 backoff_weight = 0.0
             else:
                 backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
+                # backoff_weight = self.unk_score - tbranch.next_node.token_score
+            # backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
 
             # state order
             self.states[next_state] = (
@@ -177,14 +179,21 @@ class SuffixTreeStorage:
             # TODO: do we need to increase arc weigth in the case of the final node (end of phrase)?
             if tbranch.next_node.is_end:
                 backoff_weight = 0.0
+                # backoff_weight = tbranch.next_node.fail.node_score
             else:
                 backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
+                # backoff_weight = self.unk_score * (tbranch.next_node.level - tbranch.next_node.fail.level-1) - tbranch.next_node.token_score
+            
 
             arc_id = self.num_arcs
             next_state = self.num_states
             self.num_arcs += 1
             self.num_states += 1
-            self.arcs[arc_id] = (from_state, next_state, ilabel, tbranch.next_node.token_score)
+            token_score = tbranch.next_node.token_score
+            # if tbranch.next_node.is_end:
+            #     token_score = tbranch.next_node.node_score
+            # self.arcs[arc_id] = (from_state, next_state, ilabel, tbranch.next_node.token_score)
+            self.arcs[arc_id] = (from_state, next_state, ilabel, token_score)
 
             self.states[next_state] = (
                 0,
