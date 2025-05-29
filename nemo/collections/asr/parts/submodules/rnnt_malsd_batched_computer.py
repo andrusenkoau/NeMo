@@ -321,7 +321,7 @@ class ModifiedALSDBatchedRNNTComputer(WithOptionalCudaGraphs, ConfidenceMethodMi
             logging.warning(f"self.ngram_lm_alpha: {self.ngram_lm_alpha}")
         else:
             self.BOS = True
-            self.ngram_lm_batch = None
+            # self.ngram_lm_batch = None
         ################################################################################################################
 
 
