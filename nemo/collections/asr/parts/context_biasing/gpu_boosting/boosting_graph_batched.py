@@ -144,6 +144,8 @@ class SuffixTreeStorage:
                 # backoff_weight = self.unk_score - tbranch.next_node.token_score
             # backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
 
+            # backoff_weight = 0.0
+
             # state order
             self.states[next_state] = (
                 0,
@@ -177,12 +179,14 @@ class SuffixTreeStorage:
             backoff_state = self._node_cache[tbranch.next_node.fail.id]
 
             # TODO: do we need to increase arc weigth in the case of the final node (end of phrase)?
-            if tbranch.next_node.is_end:
+            if tbranch.next_node.is_end and not self.icefall_weights:
                 backoff_weight = 0.0
                 # backoff_weight = tbranch.next_node.fail.node_score
             else:
                 backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
                 # backoff_weight = self.unk_score * (tbranch.next_node.level - tbranch.next_node.fail.level-1) - tbranch.next_node.token_score
+
+            # backoff_weight = 0.0
             
 
             arc_id = self.num_arcs
@@ -190,8 +194,8 @@ class SuffixTreeStorage:
             self.num_arcs += 1
             self.num_states += 1
             token_score = tbranch.next_node.token_score
-            # if tbranch.next_node.is_end:
-            #     token_score = tbranch.next_node.node_score
+            if self.icefall_weights and tbranch.next_node.is_end:
+                token_score += tbranch.next_node.node_score
             # self.arcs[arc_id] = (from_state, next_state, ilabel, tbranch.next_node.token_score)
             self.arcs[arc_id] = (from_state, next_state, ilabel, token_score)
 
@@ -404,6 +408,7 @@ class GPUBoostingTreeModel(NGramGPULanguageModel):
         unk_score: float = True,
         eos_id: Optional[int] = None,
         use_triton: bool | None = None,
+        icefall_weights: bool | None = None,
     ) -> "GPUBoostingTreeModel":
         """
         Constructor from Icefall context graph (dict-based tree).
@@ -436,6 +441,7 @@ class GPUBoostingTreeModel(NGramGPULanguageModel):
             max_order=max(order2cnt)+1,
         )
 
+        suffix_tree_np.icefall_weights = icefall_weights
         # convert cb_tree to np suffix tree
         tbranch_cur_order_i = 0
         cur_order = 1

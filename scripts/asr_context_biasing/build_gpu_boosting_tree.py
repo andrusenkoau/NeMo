@@ -51,6 +51,7 @@ class BuildWordBoostingTreeConfig:
     score_per_phrase: float = 0.0  # Custom score for each phrase in the context graph.
 
     use_triton: bool = False  # Whether to use Triton for inference.
+    icefall_weights: bool = False # Whether to use icefall weights for the context-biasing graph.
 
     # alternative transcription generation
     use_bpe_dropout: bool = False # Whether to use BPE dropout for generating alternative transcriptions.
@@ -120,15 +121,28 @@ def main(cfg: BuildWordBoostingTreeConfig):
             phrases.append(phrase)
 
     context_graph = ContextGraph(context_score=cfg.context_score)
-    context_graph.build(token_ids=contexts, scores=scores, phrases=phrases)
+    context_graph.build(token_ids=contexts, scores=scores, phrases=phrases, icefall_weights=cfg.icefall_weights)
 
     # 4. convert icefall context-biasing graph to gpu boosting tree
     vocab_size = len(asr_model.tokenizer.vocab)
     # import ipdb; ipdb.set_trace()
     if not is_aggregate_tokenizer:
-        gpu_boosting_model = GPUBoostingTreeModel.from_cb_tree(context_graph, vocab_size=vocab_size, unk_score=cfg.unk_score, use_triton=cfg.use_triton)
+        gpu_boosting_model = GPUBoostingTreeModel.from_cb_tree(
+            context_graph,
+            vocab_size=vocab_size,
+            unk_score=cfg.unk_score,
+            use_triton=cfg.use_triton,
+            icefall_weights=cfg.icefall_weights
+        )
     else:
-        gpu_boosting_model = GPUBoostingTreeModel.from_cb_tree(context_graph, vocab_size=vocab_size, unk_score=cfg.unk_score, eos_id=asr_model.tokenizer.eos_id, use_triton=cfg.use_triton)
+        gpu_boosting_model = GPUBoostingTreeModel.from_cb_tree(
+            context_graph,
+            vocab_size=vocab_size,
+            unk_score=cfg.unk_score,
+            eos_id=asr_model.tokenizer.eos_id,
+            use_triton=cfg.use_triton,
+            icefall_weights=cfg.icefall_weights
+        )
 
     # 5. save gpu boosting tree to nemo file
     gpu_boosting_model.save_to(cfg.path_to_save_btree)

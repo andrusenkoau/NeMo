@@ -163,6 +163,7 @@ class ContextGraph:
         phrases: Optional[List[str]] = None,
         scores: Optional[List[float]] = None,
         ac_thresholds: Optional[List[float]] = None,
+        icefall_weights: Optional[bool] = False,
     ):
         """Build the ContextGraph from a list of token list.
         It first build a trie from the given token lists, then fill the fail arc
@@ -217,7 +218,7 @@ class ContextGraph:
             for i, token in enumerate(tokens):
                 node_next = {}
                 if token not in node.next:
-                    if i > 0:
+                    if i > 0 and not icefall_weights:
                         token_score = context_score + np.log(10*i) # assign a larger score for all tokens after the first one
                         # token_score = np.log10(i/(max_depth+1))/2 # for negative weight distribution (doesn't work well)
                         # token_score = token_score
