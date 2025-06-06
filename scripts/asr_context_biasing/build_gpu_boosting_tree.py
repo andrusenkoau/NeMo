@@ -156,13 +156,13 @@ def main(cfg: BuildWordBoostingTreeConfig):
 
         sentences = [
             "hello world",
-            "i like nvidia",
             "nvlink",
             "nvlinks two",
             "nvlinz",
             "gpu boosting",
             "lot of gpus",
             "omniverse cloud now",
+            "acupuncture",
         ]
         if not is_aggregate_tokenizer:
             sentences_ids = [asr_model.tokenizer.text_to_ids(sentence) for sentence in sentences]

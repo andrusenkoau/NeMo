@@ -1722,7 +1722,7 @@ class BeamRNNTInferConfig:
     btree_alpha: Optional[float]  = 0.0
     hat_subtract_ilm: bool = False
     hat_ilm_weight: float = 0.0
-    max_symbols_per_step: Optional[int] = 10
+    max_symbols: Optional[int] = 10
     blank_lm_score_mode: Optional[str | BlankLMScoreMode] = BlankLMScoreMode.LM_WEIGHTED_FULL
     pruning_mode: Optional[str | PruningMode] = PruningMode.LATE
     allow_cuda_graphs: Optional[bool] = True

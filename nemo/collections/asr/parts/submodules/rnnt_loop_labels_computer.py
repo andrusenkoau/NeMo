@@ -429,7 +429,7 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                 .squeeze(1)
             )
 
-            logits = logits.log_softmax(dim=-1)
+            # logits = logits.log_softmax(dim=-1)
 
             scores, labels = logits.max(-1)
 
@@ -986,6 +986,8 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             .squeeze(1)
             .squeeze(1)
         )
+
+        # logits = logits.log_softmax(dim=-1)
         # same as: scores, labels = logits.max(-1)
         torch.max(logits, dim=-1, out=(self.state.scores, self.state.labels))
         if self.ngram_lm_batch is not None:
