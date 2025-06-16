@@ -162,7 +162,8 @@ class SuffixTreeStorage:
             if ilabel not in added_symbols:
                 if self.eos_id is not None and ilabel == self.eos_id:
                     # TODO: add separate score for EOS token
-                    self.arcs[ilabel] = (self.start_state, self.start_state, ilabel, self.unk_score)
+                    # self.arcs[ilabel] = (self.start_state, self.start_state, ilabel, self.unk_score)
+                    self.arcs[ilabel] = (self.start_state, self.start_state, ilabel, 1.0)
                 else:
                     self.arcs[ilabel] = (self.start_state, self.start_state, ilabel, self.unk_score)
                 self.num_arcs += 1
@@ -180,9 +181,11 @@ class SuffixTreeStorage:
 
             # TODO: do we need to increase arc weigth in the case of the final node (end of phrase)?
             if tbranch.next_node.is_end and not self.icefall_weights:
-                backoff_weight = 0.0
-                # backoff_weight = tbranch.next_node.fail.node_score
+                # backoff_weight = 0.0
+                # backoff_state = self._node_cache[0]
+                backoff_weight = tbranch.next_node.fail.node_score
             else:
+                # backoff_state = self._node_cache[tbranch.next_node.fail.id]
                 backoff_weight = tbranch.next_node.fail.node_score - tbranch.next_node.node_score
                 # backoff_weight = self.unk_score * (tbranch.next_node.level - tbranch.next_node.fail.level-1) - tbranch.next_node.token_score
 

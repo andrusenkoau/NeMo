@@ -219,7 +219,8 @@ class ContextGraph:
                 node_next = {}
                 if token not in node.next:
                     if i > 0 and not icefall_weights:
-                        token_score = context_score + np.log(10*i) # assign a larger score for all tokens after the first one
+                        # token_score = context_score + np.log(10*i) # assign a larger score for all tokens after the first one
+                        token_score = context_score*1 + np.log(i+1)
                         # token_score = np.log(5*i) # assign a larger score for all tokens after the first one
                         # token_score = np.log10(i/(max_depth+1))/2 # for negative weight distribution (doesn't work well)
                         # token_score = token_score
