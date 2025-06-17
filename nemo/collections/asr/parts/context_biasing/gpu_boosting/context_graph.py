@@ -91,7 +91,7 @@ class ContextGraph:
     beam search.
     """
 
-    def __init__(self, context_score: float, ac_threshold: float = 1.0):
+    def __init__(self, context_score: float, depth_scaling: float = 1.0, ac_threshold: float = 1.0):
         """Initialize a ContextGraph with the given ``context_score``.
 
         A root node will be created (**NOTE:** the token of root is hardcoded to -1).
@@ -108,6 +108,7 @@ class ContextGraph:
             is used only when applying the graph to keywords spotting system.
         """
         self.context_score = context_score
+        self.depth_scaling = depth_scaling
         self.ac_threshold = ac_threshold
         self.num_nodes = 0
         self.root = ContextState(
@@ -219,11 +220,7 @@ class ContextGraph:
                 node_next = {}
                 if token not in node.next:
                     if i > 0 and not icefall_weights:
-                        # token_score = context_score + np.log(10*i) # assign a larger score for all tokens after the first one
-                        token_score = context_score*2 + np.log(i+1)
-                        # token_score = np.log(5*i) # assign a larger score for all tokens after the first one
-                        # token_score = np.log10(i/(max_depth+1))/2 # for negative weight distribution (doesn't work well)
-                        # token_score = token_score
+                        token_score = context_score * self.depth_scaling + np.log(i+1) # depth scaling is used to give a larger score for all tokens after the first one
                     else:
                         token_score = context_score
                     self.num_nodes += 1

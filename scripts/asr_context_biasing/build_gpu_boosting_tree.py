@@ -43,23 +43,24 @@ class BuildWordBoostingTreeConfig:
     """
 
     asr_model_nemo_file: str = MISSING  # The path to '.nemo' file of the ASR model, or name of a pretrained NeMo model
-    context_biasing_list: str = MISSING  # The path to the context-biasing list file.
-    path_to_save_btree: str = MISSING  # The path to save the GPU-accelerated word boosting graph.
+    context_biasing_list: str = MISSING  # The path to the context-biasing list file
+    path_to_save_btree: str = MISSING  # The path to save the GPU-accelerated word boosting graph
 
-    context_score: float = 1.0  # The score for each arc transition in the context graph.
+    context_score: float = 1.0  # The score for each arc transition in the context graph
+    depth_scaling: float = 1.0  # The scaling factor for the depth of the context graph
     unk_score: float = 0.5  # The score for unknown tokens (tokens that are not in the beginning of context-biasing phrases)
-    score_per_phrase: float = 0.0  # Custom score for each phrase in the context graph.
+    score_per_phrase: float = 0.0  # Custom score for each phrase in the context graph
 
     use_triton: bool = False  # Whether to use Triton for inference.
-    icefall_weights: bool = False # Whether to use icefall weights for the context-biasing graph.
+    icefall_weights: bool = False # Whether to use icefall weights for the context-biasing graph
 
     # alternative transcription generation
-    use_bpe_dropout: bool = False # Whether to use BPE dropout for generating alternative transcriptions.
-    num_of_transcriptions: int = 5  # The number of alternative transcriptions to generate for each context-biasing phrase.
-    bpe_alpha: float = 0.3  # The alpha parameter for BPE dropout.
+    use_bpe_dropout: bool = False # Whether to use BPE dropout for generating alternative transcriptions
+    num_of_transcriptions: int = 5  # The number of alternative transcriptions to generate for each context-biasing phrase
+    bpe_alpha: float = 0.3  # The alpha parameter for BPE dropout
 
 
-    test_btree_model: bool = False  # Whether to test the GPU-accelerated word boosting graph after building it.
+    test_btree_model: bool = False  # Whether to test the GPU-accelerated word boosting graph after building it
 
 
 
@@ -120,7 +121,7 @@ def main(cfg: BuildWordBoostingTreeConfig):
             scores.append(round(cfg.score_per_phrase / len(phrase), 2))
             phrases.append(phrase)
 
-    context_graph = ContextGraph(context_score=cfg.context_score)
+    context_graph = ContextGraph(context_score=cfg.context_score, depth_scaling=cfg.depth_scaling)
     context_graph.build(token_ids=contexts, scores=scores, phrases=phrases, icefall_weights=cfg.icefall_weights)
 
     # 4. convert icefall context-biasing graph to gpu boosting tree
