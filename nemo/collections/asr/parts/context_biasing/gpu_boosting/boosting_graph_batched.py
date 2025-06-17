@@ -623,10 +623,10 @@ class GPUBoostingTreeModel(NGramGPULanguageModel):
             # raise NotImplementedError("Pytorch implementation is not available yet")
             scores, next_states = self._advance_pytorch(states=states)
 
-        # replace weight corresponding to eos_id with final state weight
-        # if eos_id is not None:
-        #     scores[:, eos_id] = self.get_final(states=states)
-        #     next_states[:, eos_id] = states
+        # replace weight corresponding to eos_id with maximum state weight
+        if eos_id is not None:
+            scores[:, eos_id] = torch.max(scores, dim=1).values
+            next_states[:, eos_id] = states
         return scores, next_states
 
     def _advance_pytorch(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
