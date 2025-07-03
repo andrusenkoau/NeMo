@@ -638,16 +638,16 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             if self.loop_labels:
 
                 # load fusion models from paths (ngram_lm_model and boosting_tree_model)
-                self.fusion_models, self.fusion_models_alphas = [], []
+                fusion_models, fusion_models_alpha = [], []
                 if ngram_lm_model is not None:
-                    self.fusion_models.append(NGramGPULanguageModel.from_file(lm_path=ngram_lm_model, vocab_size=self._blank_index))
-                    self.fusion_models_alphas.append(ngram_lm_alpha)
+                    fusion_models.append(NGramGPULanguageModel.from_file(lm_path=ngram_lm_model, vocab_size=self._blank_index))
+                    fusion_models_alpha.append(ngram_lm_alpha)
                 if boosting_tree_model is not None:
-                    self.fusion_models.append(GPUBoostingTreeModel.from_file(lm_path=boosting_tree_model, vocab_size=self._blank_index))
-                    self.fusion_models_alphas.append(boosting_tree_alpha)
-                if not self.fusion_models:
-                    self.fusion_models = None
-                    self.fusion_models_alphas = None
+                    fusion_models.append(GPUBoostingTreeModel.from_file(lm_path=boosting_tree_model, vocab_size=self._blank_index))
+                    fusion_models_alpha.append(boosting_tree_alpha)
+                if not fusion_models:
+                    fusion_models = None
+                    fusion_models_alpha = None
 
                 # Label-Looping algorithm (default, faster)
                 self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
@@ -660,8 +660,8 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                     preserve_frame_confidence=preserve_frame_confidence,
                     confidence_method_cfg=confidence_method_cfg,
                     allow_cuda_graphs=self.use_cuda_graph_decoder,
-                    fusion_models=self.fusion_models,
-                    fusion_models_alphas=self.fusion_models_alphas,
+                    fusion_models=fusion_models,
+                    fusion_models_alpha=fusion_models_alpha,
                 )
             else:
                 # Frame-Looping algorithm
