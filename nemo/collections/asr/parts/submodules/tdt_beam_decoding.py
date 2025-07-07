@@ -38,6 +38,8 @@ from nemo.collections.asr.parts.submodules.rnnt_beam_decoding import pack_hypoth
 from nemo.collections.asr.parts.submodules.tdt_malsd_batched_computer import ModifiedALSDBatchedTDTComputer
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceMethodMixin
 from nemo.collections.asr.parts.utils.batched_beam_decoding_utils import BlankLMScoreMode, PruningMode
+from nemo.collections.asr.parts.submodules.ngram_lm import NGramGPULanguageModel
+from nemo.collections.asr.parts.context_biasing import GPUBoostingTreeModel
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses, is_prefix
 from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
@@ -852,6 +854,8 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin):
         preserve_alignments: bool = False,
         ngram_lm_model: Optional[str | Path] = None,
         ngram_lm_alpha: float = 0.0,
+        boosting_tree_model: Optional[str] = None,
+        boosting_tree_alpha: float = 0.0,
         blank_lm_score_mode: Optional[str | BlankLMScoreMode] = BlankLMScoreMode.NO_SCORE,
         pruning_mode: Optional[str | PruningMode] = PruningMode.EARLY,
         allow_cuda_graphs: Optional[bool] = True,
@@ -869,6 +873,8 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin):
             preserve_alignments: if alignments are needed
             ngram_lm_model: path to the NGPU-LM n-gram LM model: .arpa or .nemo formats
             ngram_lm_alpha: weight for the n-gram LM scores
+            boosting_tree_model: path to the Boosting Tree model: .nemo formats
+            boosting_tree_alpha: weight for the Boosting Tree scores
             blank_lm_score_mode: mode for scoring blank symbol with LM
             pruning_mode: mode for pruning hypotheses with LM
             allow_cuda_graphs: whether to allow CUDA graphs
@@ -890,6 +896,18 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin):
         self.max_symbols = max_symbols_per_step
         self.preserve_alignments = preserve_alignments
 
+        # load fusion models from paths (ngram_lm_model and boosting_tree_model)
+        fusion_models, fusion_models_alpha = [], []
+        if ngram_lm_model is not None:
+            fusion_models.append(NGramGPULanguageModel.from_file(lm_path=ngram_lm_model, vocab_size=self._blank_index))
+            fusion_models_alpha.append(ngram_lm_alpha)
+        if boosting_tree_model is not None:
+            fusion_models.append(GPUBoostingTreeModel.from_file(lm_path=boosting_tree_model, vocab_size=self._blank_index))
+            fusion_models_alpha.append(boosting_tree_alpha)
+        if not fusion_models:
+            fusion_models = None
+            fusion_models_alpha = None
+
         if search_type == "malsd_batch":
             # Depending on availability of `blank_as_pad` support
             # switch between more efficient batch decoding technique
@@ -901,9 +919,9 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin):
                 blank_index=self._blank_index,
                 max_symbols_per_step=self.max_symbols,
                 preserve_alignments=preserve_alignments,
-                ngram_lm_model=ngram_lm_model,
-                ngram_lm_alpha=ngram_lm_alpha,
-                blank_lm_score_mode=blank_lm_score_mode,
+                fusion_models=fusion_models,
+                fusion_models_alpha=fusion_models_alpha,
+                blank_fusion_score_mode=blank_lm_score_mode,
                 pruning_mode=pruning_mode,
                 allow_cuda_graphs=allow_cuda_graphs,
             )

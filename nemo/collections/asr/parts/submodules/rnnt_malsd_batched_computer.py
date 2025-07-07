@@ -419,8 +419,7 @@ class ModifiedALSDBatchedRNNTComputer(WithOptionalCudaGraphs, ConfidenceMethodMi
         last_timesteps = (encoder_output_length - 1)[:, None].expand_as(batch_beam_indices)
         active_mask = time_indices <= last_timesteps
 
-        # setup N-gram LM if available
-
+        # setup fusion models if available
         if self.fusion_models is not None:
             fusion_states_list = []
             fusion_states_candidates_list = []

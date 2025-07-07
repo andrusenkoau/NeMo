@@ -600,6 +600,7 @@ class GreedyBatchedRNNTLabelLoopingComputer(
         )
         torch.where(mask, state_after_sos.labels, state.labels, out=state.labels)
         torch.where(mask, state_after_sos.decoded_lengths, state.decoded_lengths, out=state.decoded_lengths)
+        # TODO: add fusion states
         if self.ngram_lm_batch is not None:
             torch.where(mask, state_after_sos.lm_states, state.lm_states, out=state.lm_states)
         return state
@@ -620,6 +621,7 @@ class GreedyBatchedRNNTLabelLoopingComputer(
                     predictor_output=state.predictor_outputs[i],
                     label=state.labels[i],
                     decoded_length=state.decoded_lengths[i],
+                    # TODO: add fusion states
                     lm_state=state.lm_states[i] if state.lm_states is not None else None,
                     time_jump=None,
                 )
