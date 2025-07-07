@@ -324,7 +324,7 @@ class GreedyBatchedRNNTLabelLoopingComputer(
                 labels.unsqueeze(1), state, add_sos=False, batch_size=batch_size
             )
             decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
-            # ngram lm
+            # fusion models
             if self.fusion_models is not None:
                 batch_fusion_states_list = []
                 for fusion_model in self.fusion_models:

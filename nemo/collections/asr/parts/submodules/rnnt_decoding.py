@@ -386,6 +386,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         use_cuda_graph_decoder=self.cfg.greedy.get('use_cuda_graph_decoder', True),
                         ngram_lm_model=self.cfg.greedy.get('ngram_lm_model', None),
                         ngram_lm_alpha=self.cfg.greedy.get('ngram_lm_alpha', 0),
+                        boosting_tree_model=self.cfg.greedy.get('boosting_tree_model', None),
+                        boosting_tree_alpha=self.cfg.greedy.get('boosting_tree_alpha', 0),
                     )
 
             else:
@@ -528,6 +530,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         preserve_alignments=self.preserve_alignments,
                         ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
                         ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
+                        boosting_tree_model=self.cfg.beam.get('boosting_tree_model', None),
+                        boosting_tree_alpha=self.cfg.beam.get('boosting_tree_alpha', 0.0),
                         blank_lm_score_mode=self.cfg.beam.get(
                             'blank_lm_score_mode', BlankLMScoreMode.LM_WEIGHTED_FULL
                         ),

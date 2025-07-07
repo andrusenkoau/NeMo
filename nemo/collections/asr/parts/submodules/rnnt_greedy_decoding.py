@@ -2807,6 +2807,8 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                                 (currently recommended only for inference)
         ngram_lm_model: optional n-gram language model (LM) file to use for decoding
         ngram_lm_alpha: LM weight
+        boosting_tree_model: optional boosting tree model file to use for decoding
+        boosting_tree_alpha: boosting tree weight
     """
 
     def __init__(
@@ -2824,6 +2826,8 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         use_cuda_graph_decoder: bool = True,
         ngram_lm_model: Optional[str | Path] = None,
         ngram_lm_alpha: float = 0.0,
+        boosting_tree_model: Optional[str | Path] = None,
+        boosting_tree_alpha: float = 0.0,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -2841,6 +2845,18 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         # Depending on availability of `blank_as_pad` support
         # switch between more efficient batch decoding technique
         self.decoding_computer = None
+        # load fusion models from paths (ngram_lm_model and boosting_tree_model)
+        fusion_models, fusion_models_alpha = [], []
+        if ngram_lm_model is not None:
+            fusion_models.append(NGramGPULanguageModel.from_file(lm_path=ngram_lm_model, vocab_size=self._blank_index))
+            fusion_models_alpha.append(ngram_lm_alpha)
+        if boosting_tree_model is not None:
+            fusion_models.append(GPUBoostingTreeModel.from_file(lm_path=boosting_tree_model, vocab_size=self._blank_index))
+            fusion_models_alpha.append(boosting_tree_alpha)
+        if not fusion_models:
+            fusion_models = None
+            fusion_models_alpha = None
+
         if self.decoder.blank_as_pad:
             # batched "loop frames" is not implemented for TDT
             self.decoding_computer = GreedyBatchedTDTLabelLoopingComputer(
@@ -2855,12 +2871,8 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                 include_duration_confidence=include_duration_confidence,
                 confidence_method_cfg=confidence_method_cfg,
                 allow_cuda_graphs=use_cuda_graph_decoder,
-                ngram_lm_model=(
-                    NGramGPULanguageModel.from_file(lm_path=ngram_lm_model, vocab_size=self._blank_index)
-                    if ngram_lm_model is not None
-                    else None
-                ),
-                ngram_lm_alpha=ngram_lm_alpha,
+                fusion_models=fusion_models,
+                fusion_models_alpha=fusion_models_alpha,
             )
             self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
         else:
