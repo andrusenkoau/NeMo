@@ -2334,6 +2334,7 @@ class StreamingBatchedAudioBuffer:
         added_chunk_length = audio_batch.shape[1]
 
         # concat new chunk with buffer, remove extra samples
+        # TODO: check if it is possible to replace torch.cat with something more efficient
         self.samples = torch.cat((self.samples, audio_batch), dim=1)
         extra_samples_in_buffer = self.context_size.add_frames_get_removed_(
             added_chunk_length, is_last_chunk=is_last_chunk, expected_context=self.expected_context

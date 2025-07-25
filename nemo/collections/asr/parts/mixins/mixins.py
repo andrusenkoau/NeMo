@@ -918,9 +918,9 @@ class ASRModuleMixin(ASRAdapterModelMixin):
                     canary_data.decoder_mems_list = decoder_mems_list
 
                     if cfg.debug_mode:
-                        import pdb
+                        import ipdb
 
-                        pdb.set_trace()
+                        ipdb.set_trace()
 
             # alignatt decoding policy
             elif cfg.decoding_policy == "alignatt":
@@ -991,6 +991,7 @@ class ASRModuleMixin(ASRAdapterModelMixin):
                         most_attended_idxs = most_attended_idxs.squeeze(-1)
 
                     # aligatt condition (True -- continue decoding, False -- wait for more speech)
+                    # TODO: do we need to take into account the acctual len of each speech element?
                     alignatt_condition = (
                         canary_data.encoded_speech.shape[1] - (most_attended_idxs + 1) >= cfg.alignatt_thr
                     )
@@ -1014,9 +1015,9 @@ class ASRModuleMixin(ASRAdapterModelMixin):
                         logging.warning(f"[current_context_lengths]  : {canary_data.current_context_lengths}")
                         logging.warning(f"[predicted tokens]         : {text_token}")
                         logging.warning(f"[predicted tokens id]: {next_tokens}")
-                        import pdb
+                        import ipdb
 
-                        pdb.set_trace()
+                        ipdb.set_trace()
 
                     # increase speech chunk if no active samples in the inner loop
                     if not torch.any(canary_data.active_samples_inner_loop):
@@ -1025,7 +1026,7 @@ class ASRModuleMixin(ASRAdapterModelMixin):
                         break
 
                     # compute eos tokens mask
-                    # TODO add a case of "." + EOS prediction. It is the important case for AST tasl with PC support
+                    # TODO add a case of "." + EOS prediction. It is the important case for AST task with PC support
                     is_eos_tokens = next_tokens == self.tokenizer.eos
                     # rearange active samples (inner loop) depends on eos prediction
                     canary_data.active_samples_inner_loop *= torch.logical_not(is_eos_tokens)
@@ -1075,7 +1076,7 @@ class ASRModuleMixin(ASRAdapterModelMixin):
                         canary_data.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
                     # zero out decoder_mems_list for non active samples
-                    # TODO it does not work if first token was EOS
+                    # TODO it does not work correctly if first token was EOS
                     if torch.any(torch.logical_not(canary_data.active_samples_inner_loop)):
                         for j in range(len(decoder_mems_list)):
                             decoder_mems_list[j][:, -1] *= canary_data.active_samples_inner_loop.unsqueeze(-1)
@@ -1108,9 +1109,9 @@ class ASRModuleMixin(ASRAdapterModelMixin):
                         logging.warning(f"[predicted tokens id]: {next_tokens}")
 
                     if cfg.debug_mode:
-                        import pdb
+                        import ipdb
 
-                        pdb.set_trace()
+                        ipdb.set_trace()
 
             else:
                 raise ValueError("Canary streaming decoding supports only alignatt or waitk decodong policy")
