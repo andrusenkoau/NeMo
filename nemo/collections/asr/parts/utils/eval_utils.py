@@ -320,7 +320,7 @@ def cal_write_text_metric(
 
     with open(output_manifest_w_wer, 'w') as fout:
         for sample in samples:
-            json.dump(sample, fout)
+            json.dump(sample, fout, ensure_ascii=False)
             fout.write('\n')
             fout.flush()
 

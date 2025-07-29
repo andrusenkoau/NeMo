@@ -535,6 +535,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
     logging.info(f"Finished writing predictions to {output_filename}!")
 
+    # raise ValueError("Stop here")
     # calculate WER for ASR task
     if cfg.calculate_wer:
         output_manifest_w_wer, total_res, _ = cal_write_wer(
@@ -563,7 +564,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
     # compute decoding latency
     if cfg.calculate_latency:
-        
         if cfg.decoding.streaming_policy == "waitk":
             laal_list = decoding_computer.compute_waitk_lagging(
                 records, predicted_token_ids, context_encoder_frames, BOW_PREFIX="\u2581"
@@ -572,7 +572,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             laal_list = decoding_computer.compute_alignatt_lagging(
                 records, predicted_token_ids, tokens_frame_alignment, context_encoder_frames, BOW_PREFIX="\u2581"
             ) 
-
         laal = sum(laal_list) / len(laal_list)
         logging.info(f"Decoding latency (LAAL): {laal:.2f} seconds")
 

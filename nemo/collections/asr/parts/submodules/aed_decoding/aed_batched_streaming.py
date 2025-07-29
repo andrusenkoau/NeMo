@@ -67,8 +67,8 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         ):
             # need to wait for more speech
             if self.debug_mode:
-                logging.warning(f"!!! need more initial speech according to the waitk policy !!!")
-                logging.warning(f"[encoded_speech.shape]: {encoded_speech.shape}")
+                logging.info(f"!!! need more initial speech according to the waitk policy !!!")
+                logging.info(f"[encoded_speech.shape]: {encoded_speech.shape}")
 
         # wait-k streaming decoding policy
         elif self.decoding_cfg.streaming_policy == "waitk":
@@ -130,20 +130,20 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 )
 
                 if self.debug_mode:
-                    logging.warning(f"-------------" * 5)
-                    logging.warning(f"decoding step (i)        : {i}")
-                    logging.warning(f"start_from               : {start_from}")
-                    logging.warning(f"max_generation_length    : {max_generation_length}")
-                    logging.warning(f"[encoded_speech.shape]   : {encoded_speech.shape}")
-                    logging.warning(f"[is_last_chunk_batch]   : {self.state.is_last_chunk_batch}")
-                    logging.warning(f"[active_samples]         : {self.state.active_samples}")
-                    logging.warning(f"[current_context_lengths]: {self.state.current_context_lengths}")
-                    logging.warning(f"[predicted token]        : {text_tokens}")
-                    logging.warning(f"[predicted token id]     : {next_tokens}")
+                    logging.info(f"-------------" * 5)
+                    logging.info(f"decoding step (i)        : {i}")
+                    logging.info(f"start_from               : {start_from}")
+                    logging.info(f"max_generation_length    : {max_generation_length}")
+                    logging.info(f"[encoded_speech.shape]   : {encoded_speech.shape}")
+                    logging.info(f"[is_last_chunk_batch]   : {self.state.is_last_chunk_batch}")
+                    logging.info(f"[active_samples]         : {self.state.active_samples}")
+                    logging.info(f"[current_context_lengths]: {self.state.current_context_lengths}")
+                    logging.info(f"[predicted token]        : {text_tokens}")
+                    logging.info(f"[predicted token id]     : {next_tokens}")
 
                 if not torch.any(active_samples_inner_loop):
                     if self.debug_mode:
-                        logging.warning(f"!#! no active samples in inner loop, do next upper step !#!")
+                        logging.info(f"!#! no active samples in inner loop, do next upper step !#!")
                     break
 
                 # write predicted tokens to the tgt tensor
@@ -166,7 +166,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 2],
                 )
                 if torch.any(hallucination_mask):
-                    logging.warning(f"!!! hallucination detected !!!")
+                    logging.info(f"!!! hallucination detected !!!")
                     self.state.active_samples *= torch.logical_not(hallucination_mask)
                     active_samples_inner_loop *= torch.logical_not(hallucination_mask)
 
@@ -180,7 +180,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     self.state.current_context_lengths == self.decoding_cfg.max_generation_length - 1
                 )
                 if torch.any(samples_with_max_context_length * self.state.active_samples):
-                    logging.warning(f"!!! maximum context length reached !!!")
+                    logging.info(f"!!! maximum context length reached !!!")
                     self.state.active_samples *= torch.logical_not(samples_with_max_context_length)
                     active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
@@ -274,24 +274,24 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.active_samples_inner_loop *= alignatt_condition
 
                 if self.debug_mode:
-                    logging.warning(f"-------------" * 5)
-                    logging.warning(f"self.state.decoding_step   : {self.state.decoding_step}")
-                    logging.warning(f"decoding step i            : {i}")
-                    logging.warning(f"[encoded_speech.shape]     : {encoded_speech.shape}")
-                    logging.warning(f"[positional_indexes]       : {positional_indexes}")
-                    logging.warning(f"[most_attended_idxs]       : {most_attended_idxs}")
-                    logging.warning(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
-                    logging.warning(f"[active_samples]           : {self.state.active_samples}")
-                    logging.warning(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
-                    logging.warning(f"[current_context_lengths]  : {self.state.current_context_lengths}")
-                    logging.warning(f"[predicted tokens]         : {text_token}")
-                    logging.warning(f"[predicted tokens id]      : {next_tokens}")
+                    logging.info(f"-------------" * 5)
+                    logging.info(f"self.state.decoding_step   : {self.state.decoding_step}")
+                    logging.info(f"decoding step i            : {i}")
+                    logging.info(f"[encoded_speech.shape]     : {encoded_speech.shape}")
+                    logging.info(f"[positional_indexes]       : {positional_indexes}")
+                    logging.info(f"[most_attended_idxs]       : {most_attended_idxs}")
+                    logging.info(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
+                    logging.info(f"[active_samples]           : {self.state.active_samples}")
+                    logging.info(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
+                    logging.info(f"[current_context_lengths]  : {self.state.current_context_lengths}")
+                    logging.info(f"[predicted tokens]         : {text_token}")
+                    logging.info(f"[predicted tokens id]      : {next_tokens}")
                     import ipdb; ipdb.set_trace()
 
                 # increase speech chunk if no active samples in the inner loop
                 if not torch.any(self.state.active_samples_inner_loop):
                     if self.debug_mode:
-                        logging.warning(f"!#! no active samples in inner loop, do next upper step !#!")
+                        logging.info(f"!#! no active samples in inner loop, do next upper step !#!")
                     break
 
                 # compute eos tokens mask
@@ -305,7 +305,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
                 if not torch.any(self.state.active_samples_inner_loop):
                     if self.debug_mode:
-                        logging.warning(f"!#! no active samples in inner loop, do next upper step !#!")
+                        logging.info(f"!#! no active samples in inner loop, do next upper step !#!")
                     break
 
                 # write predicted tokens to the tgt tensor
@@ -331,7 +331,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 2],
                 )
                 if torch.any(hallucination_mask):
-                    logging.warning(f"!!! hallucination detected !!!")
+                    logging.info(f"!!! hallucination detected !!!")
                     self.state.active_samples *= torch.logical_not(hallucination_mask)
                     self.state.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
 
@@ -340,7 +340,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     self.state.current_context_lengths == self.state.max_generation_length - 1
                 )
                 if torch.any(samples_with_max_context_length * self.state.active_samples):
-                    logging.warning(f"!!! maximum context length reached !!!")
+                    logging.info(f"!!! maximum context length reached !!!")
                     self.state.active_samples *= torch.logical_not(samples_with_max_context_length)
                     self.state.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
@@ -364,18 +364,18 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.active_samples_inner_loop *= torch.logical_not(disable_samples_mask)
 
                 if self.debug_mode:
-                    logging.warning(f"-------------" * 5)
-                    logging.warning(f"self.state.decoding_step   : {self.state.decoding_step}")
-                    logging.warning(f"decoding step i            : {i}")
-                    logging.warning(f"[encoded_speech.shape]     : {encoded_speech.shape}")
-                    logging.warning(f"[positional_indexes]       : {positional_indexes}")
-                    logging.warning(f"[most_attended_idxs]       : {most_attended_idxs}")
-                    logging.warning(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
-                    logging.warning(f"[active_samples]           : {self.state.active_samples}")
-                    logging.warning(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
-                    logging.warning(f"[current_context_lengths]  : {self.state.current_context_lengths}")
-                    logging.warning(f"[predicted tokens]         : {text_token}")
-                    logging.warning(f"[predicted tokens id]: {next_tokens}")
+                    logging.info(f"-------------" * 5)
+                    logging.info(f"self.state.decoding_step   : {self.state.decoding_step}")
+                    logging.info(f"decoding step i            : {i}")
+                    logging.info(f"[encoded_speech.shape]     : {encoded_speech.shape}")
+                    logging.info(f"[positional_indexes]       : {positional_indexes}")
+                    logging.info(f"[most_attended_idxs]       : {most_attended_idxs}")
+                    logging.info(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
+                    logging.info(f"[active_samples]           : {self.state.active_samples}")
+                    logging.info(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
+                    logging.info(f"[current_context_lengths]  : {self.state.current_context_lengths}")
+                    logging.info(f"[predicted tokens]         : {text_token}")
+                    logging.info(f"[predicted tokens id]: {next_tokens}")
 
                 if self.debug_mode:
                     import ipdb; ipdb.set_trace()
