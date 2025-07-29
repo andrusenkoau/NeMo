@@ -61,14 +61,13 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import tempfile
+import json
 
-from nemo.collections.asr.models import EncDecHybridRNNTCTCModel, EncDecRNNTModel
 from nemo.collections.asr.parts.submodules.aed_decoding.aed_batched_streaming import AEDStreamingState
 from nemo.collections.asr.parts.submodules.multitask_decoding import AEDStreamingDecodingConfig, MultiTaskDecodingConfig
 from nemo.collections.asr.parts.submodules.aed_decoding.aed_batched_streaming import GreedyBatchedStreamingAEDComputer
-from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
+from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer, cal_write_text_metric
 from nemo.collections.asr.parts.utils.manifest_utils import filepath_to_absolute, read_manifest
-from nemo.collections.asr.parts.utils.rnnt_utils import BatchedHyps, batched_hyps_to_hypotheses, Hypothesis
 from nemo.collections.asr.models.aed_multitask_models import parse_multitask_prompt
 from nemo.collections.asr.parts.utils.transcribe_utils import prepare_audio_data
 from nemo.collections.common.data.utils import move_data_to_device
@@ -125,6 +124,7 @@ class TranscriptionConfig:
     )
     matmul_precision: str = "high"  # Literal["highest", "high", "medium"]
     audio_type: str = "wav"
+    sort_input_manifest: bool = True
 
     # Recompute model transcription, even if the output folder exists with scores.
     overwrite_transcripts: bool = True
@@ -134,6 +134,7 @@ class TranscriptionConfig:
 
     # Config for word / character error rate calculation
     calculate_wer: bool = True
+    calculate_bleu: bool = True
     clean_groundtruth_text: bool = False
     langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
@@ -192,6 +193,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
     cfg = OmegaConf.structured(cfg)
 
+    # TODO: check decoding policy 
+    
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
 
@@ -300,6 +303,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         # fix relative paths
         for record in records:
             record["audio_filepath"] = str(filepath_to_absolute(record["audio_filepath"], manifest_dir))
+        # sort the samples by duration to reduce batched decoding time (could be 2 times faster than default random order)
+        if cfg.sort_input_manifest:
+            records = sorted(records, key=lambda x: x['duration'], reverse=True)
     else:
         assert filepaths is not None
         records = [{"audio_filepath": audio_file} for audio_file in filepaths]
@@ -411,15 +417,16 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 device=device,
             )
             rest_audio_lengths = audio_batch_lengths.clone()
+            is_last_window_batch = torch.zeros_like(rest_audio_lengths)
 
             encoder_output_len_prev = None
 
             # iterate over audio samples
-            while left_sample < audio_batch.shape[1]:
+            # while left_sample < audio_batch.shape[1]:   
+            while torch.any(torch.logical_not(is_last_window_batch)):
                 # add samples to buffer
                 chunk_length = min(right_sample, audio_batch.shape[1]) - left_sample # M + R context
                 is_last_chunk_batch = chunk_length >= rest_audio_lengths
-                is_last_window_batch = context_samples.chunk >= rest_audio_lengths + context_samples.right
                 is_last_chunk = right_sample >= audio_batch.shape[1]
                 chunk_lengths_batch = torch.where(
                     is_last_chunk_batch,
@@ -427,19 +434,22 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     torch.full_like(rest_audio_lengths, fill_value=chunk_length),
                 )
                 
-                logging.warning(f"*** new encoder step ***")
-                logging.warning(f"chunk_length: {chunk_length}")
-                logging.warning(f"chunk_lengths_batch: {chunk_lengths_batch}")
-                logging.warning(f"is_last_chunk_batch: {is_last_chunk_batch}")
-                logging.warning(f"is_last_window_batch: {is_last_window_batch}")
-                logging.warning(f"rest_audio_lengths: {rest_audio_lengths}")
+                # is_last_window_batch = context_samples.chunk >= rest_audio_lengths - chunk_lengths_batch + context_samples.right
+                is_last_window_batch = context_samples.chunk >= rest_audio_lengths
+
+                if cfg.debug_mode:
+                    logging.warning(f"*** new encoder step ***")
+                    logging.warning(f"chunk_length: {chunk_length}")
+                    logging.warning(f"chunk_lengths_batch: {chunk_lengths_batch}")
+                    logging.warning(f"is_last_chunk_batch: {is_last_chunk_batch}")
+                    logging.warning(f"is_last_window_batch: {is_last_window_batch}")
+                    logging.warning(f"rest_audio_lengths: {rest_audio_lengths}")
 
                 buffer.add_audio_batch_(
                     audio_batch[:, left_sample:right_sample],
                     audio_lengths=chunk_lengths_batch,
                     is_last_chunk=is_last_chunk,
                     is_last_chunk_batch=torch.zeros_like(is_last_chunk_batch),
-                    # is_last_chunk_batch=is_last_chunk_batch,
                 )
 
                 model_state.is_last_chunk_batch = is_last_window_batch
@@ -448,64 +458,42 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 processed_signal, processed_signal_length = asr_model.preprocessor(
                     input_signal=buffer.samples, length=buffer.context_size_batch.total()
                 )
-                logging.warning(f"processed_signal: {processed_signal.shape}")
-                logging.warning(f"processed_signal_length: {processed_signal_length}")
+                if cfg.debug_mode:
+                    logging.warning(f"processed_signal: {processed_signal.shape}")
+                    logging.warning(f"processed_signal_length: {processed_signal_length}")
                 # get encoder output using full buffer [left-chunk-right]
                 encoder_output, encoder_output_len_with_context = asr_model.encoder(
                     audio_signal=processed_signal, length=processed_signal_length
                 )
 
-                # encoder_output, encoder_output_len = asr_model(
-                #     input_signal=buffer.samples,
-                #     input_signal_length=buffer.context_size_batch.total(),
-                # )
                 encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
-                logging.warning(f"encoder_output: {encoder_output.shape}")
-                logging.warning(f"encoder_output_len_with_context: {encoder_output_len_with_context}")
+                if cfg.debug_mode:
+                    logging.warning(f"encoder_output: {encoder_output.shape}")
+                    logging.warning(f"encoder_output_len_with_context: {encoder_output_len_with_context}")
                 # remove extra context from encoder_output (leave only frames corresponding to the chunk)
                 encoder_context = buffer.context_size.subsample(factor=encoder_frame2audio_samples)
-                encoder_context_batch = buffer.context_size_batch.subsample(factor=encoder_frame2audio_samples)
-                # remove left context
-                # encoder_output = encoder_output[:, encoder_context.left :]
-                # remove left and right context
-                # encoder_output = encoder_output[:, encoder_context.left : -encoder_context.right-1]
                 encoder_output = encoder_output[:, : -encoder_context.right-1]
-                # encoder_output_len = torch.clamp(encoder_output_len, min=encoder_output_len_prev, max=encoder_output.size(1))
-                encoder_output_len = torch.clamp(
-                    encoder_output_len_with_context,
-                    min=encoder_output_len_prev if encoder_output_len_prev is not None else None,
-                    max=torch.full((batch_size,), encoder_output.size(1), dtype=torch.long, device=encoder_output.device)
-                )
+                encoder_output_len = torch.clamp(encoder_output_len_with_context, max=encoder_output.size(1))
 
-                encoder_output_len_prev = torch.where(is_last_chunk_batch, encoder_output_len_with_context, torch.zeros_like(encoder_output_len_with_context))
-
-                # if encoder_output_len_prev is None:
-                #     encoder_output_len_prev = encoder_output_len_with_context
-                # else:
-                #     encoder_output_len_prev = encoder_output_len
-
-                logging.warning(f"encoder_output: {encoder_output.shape}")
-                logging.warning(f"encoder_output_len: {encoder_output_len}")
-                # import ipdb; ipdb.set_trace()
+                if cfg.debug_mode:
+                    logging.warning(f"encoder_output: {encoder_output.shape}")
+                    logging.warning(f"encoder_output_len: {encoder_output_len}")
+                
                 # decode only chunk frames (controlled by encoder_context_batch.chunk)
                 chunk_batched_hyps, _, model_state = decoding_computer(
                     encoder_output=encoder_output,
                     encoder_output_len=encoder_output_len,
                     prev_batched_state=model_state,
                 )
-                # import ipdb; ipdb.set_trace()
-                # # merge hyps with previous hyps
-                # if current_batched_hyps is None:
-                #     current_batched_hyps = chunk_batched_hyps
-                # else:
-                #     current_batched_hyps.merge_(chunk_batched_hyps)
 
                 # move to next sample
                 rest_audio_lengths -= chunk_lengths_batch
-                # rest_audio_lengths -= torch.where(is_last_chunk_batch, chunk_lengths_batch, context_samples.chunk)
-                logging.warning(f"rest_audio_lengths: {rest_audio_lengths}")
                 left_sample = right_sample
                 right_sample = min(right_sample + context_samples.chunk, audio_batch.shape[1])  # add next chunk
+                
+                if cfg.debug_mode:
+                    logging.warning(f"rest_audio_lengths: {rest_audio_lengths}")
+                    import ipdb; ipdb.set_trace()
 
             final_streaming_tran = []
             pred_out_stream = []
@@ -516,27 +504,43 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 pred_out_stream.append(transcription_idx)
                 transcription = asr_model.tokenizer.ids_to_text(transcription_idx.tolist()).strip()
                 final_streaming_tran.append(transcription)
+                # TODO: remove this
                 logging.warning(f"[pred_text] {i}: {transcription}")
-
-                # all_hyps.append(Hypothesis(text=transcription, score=0.0, y_sequence=transcription_idx))
                 all_hyps.append(transcription)
-            # import ipdb; ipdb.set_trace()
 
-            #all_hyps.extend(batched_hyps_to_hypotheses(current_batched_hyps, None, batch_size=batch_size))
+            # compute decoding latency
+            batch_samples = samples[-current_batch_size:]
+            for i in range(streaming_buffer.streams_length.size(-1)):
+                batch_samples[i]["audio_length_ms"] = int(streaming_buffer.streams_length[i].item()) * 10
 
-    # # convert text
-    # for hyp in all_hyps:
-    #     hyp.text = asr_model.tokenizer.ids_to_text(hyp.y_sequence.tolist())
+            if cfg.decoding_policy == "waitk":
+                laal_list = compute_waitk_lagging(
+                    cfg, batch_samples, predicted_token_ids, canary_data, asr_model, BOW_PREFIX="\u2581"
+                )
+            elif cfg.decoding_policy == "alignatt":
+                laal_list = compute_alignatt_lagging(
+                    batch_samples, predicted_token_ids, canary_data, asr_model, BOW_PREFIX="\u2581"
+                )        
+
+
+
+    # write predictions to outputfile
     logging.setLevel(logging.INFO)
-    output_filename, pred_text_attr_name = write_transcription(
-        all_hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, timestamps=False
-    )
+    output_filename = cfg.output_filename
+    Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_filename, "w") as out_f:
+        for i, record in enumerate(records):
+            record["pred_text"] = all_hyps[i]
+            out_f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
     logging.info(f"Finished writing predictions to {output_filename}!")
 
+    # calculate WER for ASR task
     if cfg.calculate_wer:
         output_manifest_w_wer, total_res, _ = cal_write_wer(
             pred_manifest=output_filename,
-            pred_text_attr_name=pred_text_attr_name,
+            pred_text_attr_name="pred_text",
             clean_groundtruth_text=cfg.clean_groundtruth_text,
             langid=cfg.langid,
             use_cer=cfg.use_cer,
@@ -544,6 +548,18 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         )
         if output_manifest_w_wer:
             logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
+            logging.info(f"{total_res}")
+
+    # calculate BLEU for AST task
+    if cfg.calculate_bleu:
+        output_manifest_w_bleu, total_res, _ = cal_write_text_metric(
+            pred_manifest=output_filename,
+            pred_text_attr_name="pred_text",
+            gt_text_attr_name="answer",
+            metric="bleu",
+        )
+        if output_manifest_w_bleu:
+            logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_bleu}!")
             logging.info(f"{total_res}")
 
     return cfg

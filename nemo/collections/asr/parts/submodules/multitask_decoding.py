@@ -610,6 +610,7 @@ class AEDStreamingDecodingConfig:
     exclude_sink_frames: int = 8 # number of frames to exclude from the xatt scores calculation
     xatt_scores_layer: int = -2 # layer to get xatt scores from
     max_generation_length: int = 512 # maximum number of tokens to be generated for each sample
+    use_avgpool_for_alignatt: bool = False # use avgpool for alignatt
 
 
 @dataclass

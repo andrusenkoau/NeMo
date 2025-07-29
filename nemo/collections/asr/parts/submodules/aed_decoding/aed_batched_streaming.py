@@ -196,37 +196,37 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
         # alignatt decoding policy
         elif self.decoding_cfg.streaming_policy == "alignatt":
-            if canary_data.decoding_step < 0:
+            if self.state.decoding_step < 0:
                 # first decoding step
-                tgt, batch_size, _ = self.decoding.decoding.greedy_search._prepare_for_search(
-                    canary_data.decoder_input_ids,
-                    canary_data.encoded_speech,
+                tgt, batch_size, _ = self.asr_model.decoding.decoding.greedy_search._prepare_for_search(
+                    self.state.decoder_input_ids,
+                    encoded_speech,
                 )
                 input_ids = tgt
                 start_from = 0
             else:
-                input_ids = canary_data.tgt[
-                    canary_data.batch_idxs, canary_data.current_context_lengths - 1
+                input_ids = self.state.tgt[
+                    self.state.batch_idxs, self.state.current_context_lengths - 1
                 ].unsqueeze(-1)
-                start_from = torch.min(canary_data.current_context_lengths).item() - 1
+                start_from = torch.min(self.state.current_context_lengths).item() - 1
 
-            decoder_mems_list = canary_data.decoder_mems_list
-            canary_data.steps_per_inner_loop = torch.zeros(batch_size, dtype=torch.long, device=self.state.device)
-            canary_data.active_samples_inner_loop = (
-                torch.ones(batch_size, dtype=torch.bool, device=self.state.device) * canary_data.active_samples
+            decoder_mems_list = self.state.decoder_mems_list
+            self.state.steps_per_inner_loop = torch.zeros(self.state.batch_size, dtype=torch.long, device=self.state.device)
+            self.state.active_samples_inner_loop = (
+                torch.ones(self.state.batch_size, dtype=torch.bool, device=self.state.device) * self.state.active_samples
             )
 
-            for i in range(start_from, canary_data.max_generation_length):
+            for i in range(start_from, self.state.max_generation_length):
                 # prepare positional indexes offset for attention decoder
                 if not decoder_mems_list:
-                    positional_indexes = torch.zeros_like(canary_data.current_context_lengths)
+                    positional_indexes = torch.zeros_like(self.state.current_context_lengths)
                 else:
-                    positional_indexes = canary_data.current_context_lengths - 1
+                    positional_indexes = self.state.current_context_lengths - 1
 
                 logits, decoder_mems_list, xatt_scores_list = (
-                    self.decoding.decoding.greedy_search._one_step_forward(
+                    self.asr_model.decoding.decoding.greedy_search._one_step_forward(
                         input_ids,
-                        canary_data.encoded_speech,
+                        encoded_speech,
                         encoder_input_mask,
                         decoder_mems_list,
                         positional_indexes,
@@ -236,21 +236,21 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 )
 
                 next_tokens = torch.argmax(logits[:, -1], dim=-1)
-                text_token = self.tokenizer.ids_to_tokens(next_tokens.tolist())
+                text_token = self.asr_model.tokenizer.ids_to_tokens(next_tokens.tolist())
 
                 # compute the most attended encoder token
-                xatt_scores = xatt_scores_list[cfg.xatt_scores_layer]
+                xatt_scores = xatt_scores_list[self.decoding_cfg.xatt_scores_layer]
                 xatt_scores = torch.mean(xatt_scores, 1)
-                if i == 0 and xatt_scores.shape[-1] <= cfg.exclude_sink_frames:
+                if i == 0 and xatt_scores.shape[-1] <= self.decoding_cfg.exclude_sink_frames:
                     exclude_sink_frames = xatt_scores.shape[-1] - 2
                 else:
-                    exclude_sink_frames = cfg.exclude_sink_frames
+                    exclude_sink_frames = self.decoding_cfg.exclude_sink_frames
                 most_attended_idxs = (
                     torch.argmax(xatt_scores[:, :, exclude_sink_frames:], dim=-1) + exclude_sink_frames
                 )
 
-                if cfg.use_avgpool_for_alignatt:
-                    average_pooling_xatt_scores = canary_data.avgpool2d(xatt_scores[:, :, exclude_sink_frames:])
+                if self.decoding_cfg.use_avgpool_for_alignatt:
+                    average_pooling_xatt_scores = self.state.avgpool2d(xatt_scores[:, :, exclude_sink_frames:])
                     most_attended_idxs_avgpool = (
                         torch.argmax(average_pooling_xatt_scores, dim=-1) + exclude_sink_frames
                     )
@@ -264,128 +264,215 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
                 # aligatt condition (True -- continue decoding, False -- wait for more speech)
                 alignatt_condition = (
-                    canary_data.encoded_speech.shape[1] - (most_attended_idxs + 1) >= cfg.alignatt_thr
+                    encoded_speech.shape[1] - (most_attended_idxs + 1) >= self.decoding_cfg.alignatt_thr
                 )
 
                 # alignatt condition is always True for the last speech chunk
-                alignatt_condition += canary_data.is_last_chunk_batch
+                alignatt_condition += self.state.is_last_chunk_batch
 
                 # applay alignatt condition for inner loop
-                canary_data.active_samples_inner_loop *= alignatt_condition
+                self.state.active_samples_inner_loop *= alignatt_condition
 
-                if cfg.debug_mode:
+                if self.debug_mode:
                     logging.warning(f"-------------" * 5)
-                    logging.warning(f"canary_data.decoding_step  : {canary_data.decoding_step}")
-                    logging.warning(f"decoding step i: {i}")
-                    logging.warning(f"[encoded_speech.shape]     : {canary_data.encoded_speech.shape}")
-                    logging.warning(f"[positional_indexes]     : {positional_indexes}")
+                    logging.warning(f"self.state.decoding_step   : {self.state.decoding_step}")
+                    logging.warning(f"decoding step i            : {i}")
+                    logging.warning(f"[encoded_speech.shape]     : {encoded_speech.shape}")
+                    logging.warning(f"[positional_indexes]       : {positional_indexes}")
                     logging.warning(f"[most_attended_idxs]       : {most_attended_idxs}")
-                    logging.warning(f"[is_last_chunk_batch]     : {canary_data.is_last_chunk_batch}")
-                    logging.warning(f"[active_samples]           : {canary_data.active_samples}")
-                    logging.warning(f"[active_samples_inner_loop]: {canary_data.active_samples_inner_loop}")
-                    logging.warning(f"[current_context_lengths]  : {canary_data.current_context_lengths}")
+                    logging.warning(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
+                    logging.warning(f"[active_samples]           : {self.state.active_samples}")
+                    logging.warning(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
+                    logging.warning(f"[current_context_lengths]  : {self.state.current_context_lengths}")
                     logging.warning(f"[predicted tokens]         : {text_token}")
-                    logging.warning(f"[predicted tokens id]: {next_tokens}")
-                    import pdb
-
-                    pdb.set_trace()
+                    logging.warning(f"[predicted tokens id]      : {next_tokens}")
+                    import ipdb; ipdb.set_trace()
 
                 # increase speech chunk if no active samples in the inner loop
-                if not torch.any(canary_data.active_samples_inner_loop):
-                    if cfg.debug_mode:
+                if not torch.any(self.state.active_samples_inner_loop):
+                    if self.debug_mode:
                         logging.warning(f"!#! no active samples in inner loop, do next upper step !#!")
                     break
 
                 # compute eos tokens mask
                 # TODO add a case of "." + EOS prediction. It is the important case for AST tasl with PC support
-                is_eos_tokens = next_tokens == self.tokenizer.eos
+                is_eos_tokens = next_tokens == self.asr_model.tokenizer.eos
                 # rearange active samples (inner loop) depends on eos prediction
-                canary_data.active_samples_inner_loop *= torch.logical_not(is_eos_tokens)
+                self.state.active_samples_inner_loop *= torch.logical_not(is_eos_tokens)
                 # disable samples (upper loop) with eos and end of speech
-                eos_and_end_speech_mask = is_eos_tokens * canary_data.is_last_chunk_batch
-                canary_data.active_samples *= torch.logical_not(eos_and_end_speech_mask)
+                eos_and_end_speech_mask = is_eos_tokens * self.state.is_last_chunk_batch
+                self.state.active_samples *= torch.logical_not(eos_and_end_speech_mask)
 
-                if not torch.any(canary_data.active_samples_inner_loop):
-                    if cfg.debug_mode:
+                if not torch.any(self.state.active_samples_inner_loop):
+                    if self.debug_mode:
                         logging.warning(f"!#! no active samples in inner loop, do next upper step !#!")
                     break
 
                 # write predicted tokens to the tgt tensor
                 torch.where(
-                    canary_data.active_samples_inner_loop, next_tokens, canary_data.eos_tokens, out=next_tokens
+                    self.state.active_samples_inner_loop, next_tokens, self.state.eos_tokens, out=next_tokens
                 )
-                canary_data.tgt[canary_data.batch_idxs, canary_data.current_context_lengths] = next_tokens
+                self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
 
                 # update tokens frame alignment based on current encoder step (this alignment is used for LAAL calculation)
-                canary_data.tokens_frame_alignment[canary_data.batch_idxs, canary_data.current_context_lengths] = (
-                    canary_data.encoded_speech.size(-2)
+                self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
+                    encoded_speech.size(-2)
                 )
 
-                canary_data.decoding_step += input_ids.size(-1)
+                self.state.decoding_step += input_ids.size(-1)
                 # input_ids = next_tokens.unsqueeze(-1)
 
                 # check for hallucinations
                 # TODO add more consequtive tokens? Now we are checking only 3 same tokens
                 hallucination_mask = torch.logical_and(
-                    canary_data.tgt[canary_data.batch_idxs, canary_data.current_context_lengths]
-                    == canary_data.tgt[canary_data.batch_idxs, canary_data.current_context_lengths - 1],
-                    canary_data.tgt[canary_data.batch_idxs, canary_data.current_context_lengths - 1]
-                    == canary_data.tgt[canary_data.batch_idxs, canary_data.current_context_lengths - 2],
+                    self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths]
+                    == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1],
+                    self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1]
+                    == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 2],
                 )
                 if torch.any(hallucination_mask):
                     logging.warning(f"!!! hallucination detected !!!")
-                    canary_data.active_samples *= torch.logical_not(hallucination_mask)
-                    canary_data.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
+                    self.state.active_samples *= torch.logical_not(hallucination_mask)
+                    self.state.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
 
                 # disable samples with maximum context length
                 samples_with_max_context_length = (
-                    canary_data.current_context_lengths == canary_data.max_generation_length - 1
+                    self.state.current_context_lengths == self.state.max_generation_length - 1
                 )
-                if torch.any(samples_with_max_context_length * canary_data.active_samples):
+                if torch.any(samples_with_max_context_length * self.state.active_samples):
                     logging.warning(f"!!! maximum context length reached !!!")
-                    canary_data.active_samples *= torch.logical_not(samples_with_max_context_length)
-                    canary_data.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
+                    self.state.active_samples *= torch.logical_not(samples_with_max_context_length)
+                    self.state.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
                 # zero out decoder_mems_list for non active samples
                 # TODO it does not work if first token was EOS
-                if torch.any(torch.logical_not(canary_data.active_samples_inner_loop)):
+                if torch.any(torch.logical_not(self.state.active_samples_inner_loop)):
                     for j in range(len(decoder_mems_list)):
-                        decoder_mems_list[j][:, -1] *= canary_data.active_samples_inner_loop.unsqueeze(-1)
+                        decoder_mems_list[j][:, -1] *= self.state.active_samples_inner_loop.unsqueeze(-1)
 
-                canary_data.decoder_mems_list = decoder_mems_list
-                canary_data.current_context_lengths += canary_data.active_samples_inner_loop
+                self.state.decoder_mems_list = decoder_mems_list
+                self.state.current_context_lengths += self.state.active_samples_inner_loop
                 # TODO model does not predicts any real tokens in the case of first EOS prediction
-                input_ids = canary_data.tgt[
-                    canary_data.batch_idxs, canary_data.current_context_lengths - 1
+                input_ids = self.state.tgt[
+                    self.state.batch_idxs, self.state.current_context_lengths - 1
                 ].unsqueeze(-1)
 
                 # limit number of steps per inner loop if not end of speech
-                canary_data.steps_per_inner_loop += canary_data.active_samples_inner_loop
-                disable_samples_mask = canary_data.steps_per_inner_loop == canary_data.max_tokens_per_alignatt_step
-                disable_samples_mask *= torch.logical_not(canary_data.is_last_chunk_batch)
-                canary_data.active_samples_inner_loop *= torch.logical_not(disable_samples_mask)
+                self.state.steps_per_inner_loop += self.state.active_samples_inner_loop
+                disable_samples_mask = self.state.steps_per_inner_loop == self.state.max_tokens_per_alignatt_step
+                disable_samples_mask *= torch.logical_not(self.state.is_last_chunk_batch)
+                self.state.active_samples_inner_loop *= torch.logical_not(disable_samples_mask)
 
-                if cfg.debug_mode:
+                if self.debug_mode:
                     logging.warning(f"-------------" * 5)
-                    logging.warning(f"canary_data.decoding_step  : {canary_data.decoding_step}")
-                    logging.warning(f"decoding step i: {i}")
-                    logging.warning(f"[encoded_speech.shape]     : {canary_data.encoded_speech.shape}")
-                    logging.warning(f"[positional_indexes]     : {positional_indexes}")
+                    logging.warning(f"self.state.decoding_step   : {self.state.decoding_step}")
+                    logging.warning(f"decoding step i            : {i}")
+                    logging.warning(f"[encoded_speech.shape]     : {encoded_speech.shape}")
+                    logging.warning(f"[positional_indexes]       : {positional_indexes}")
                     logging.warning(f"[most_attended_idxs]       : {most_attended_idxs}")
-                    logging.warning(f"[is_last_chunk_batch]     : {canary_data.is_last_chunk_batch}")
-                    logging.warning(f"[active_samples]           : {canary_data.active_samples}")
-                    logging.warning(f"[active_samples_inner_loop]: {canary_data.active_samples_inner_loop}")
-                    logging.warning(f"[current_context_lengths]  : {canary_data.current_context_lengths}")
+                    logging.warning(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
+                    logging.warning(f"[active_samples]           : {self.state.active_samples}")
+                    logging.warning(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
+                    logging.warning(f"[current_context_lengths]  : {self.state.current_context_lengths}")
                     logging.warning(f"[predicted tokens]         : {text_token}")
                     logging.warning(f"[predicted tokens id]: {next_tokens}")
 
-                if cfg.debug_mode:
-                    import pdb
-
-                    pdb.set_trace()
+                if self.debug_mode:
+                    import ipdb; ipdb.set_trace()
 
         else:
             raise ValueError("Canary streaming decoding supports only alignatt or waitk decodong policy")
         
         return None, None, self.state
 
+
+    def compute_laal(
+            self,
+            delays,
+            source_length,
+            target_length
+        ):
+        if delays[0] > source_length:
+            return delays[0]
+        LAAL = 0
+        gamma = max(len(delays), target_length) / source_length
+        tau = 0
+        for t_minus_1, d in enumerate(delays):
+            LAAL += d - t_minus_1 / gamma
+            tau = t_minus_1 + 1
+            if d >= source_length:
+                break
+        LAAL /= tau
+        return LAAL
+
+
+    def compute_alignatt_lagging(
+            self,
+            batch_samples,
+            predicted_token_ids,
+            canary_data,
+            asr_model,
+            BOW_PREFIX="\u2581"
+        ):
+        tokens_idx_shift = canary_data.decoder_input_ids.size(-1)
+        target_length_word = [len(a['text'].split()) for a in batch_samples]
+        laal_list = []
+        for i, tokens in enumerate(predicted_token_ids):
+            if len(tokens) == 0:
+                laal_list.append(5000)
+                continue
+            audio_encoder_fs = 80
+            audio_signal_length = batch_samples[i]["audio_length_ms"]
+            # obtain lagging for alignatt
+            lagging = []
+            for j, cur_t in enumerate(tokens):
+                pred_idx = canary_data.tokens_frame_alignment[i, tokens_idx_shift + j] + canary_data.right_context
+                cur_t = asr_model.tokenizer.vocab[cur_t]
+                eos_token = asr_model.tokenizer.vocab[asr_model.tokenizer.eos_id]
+                if (cur_t.startswith(BOW_PREFIX) and cur_t != BOW_PREFIX) or cur_t == eos_token:  # word boundary
+                    lagging.append(pred_idx * audio_encoder_fs)
+                if cur_t == eos_token:
+                    break
+            if len(lagging) == 0:
+                lagging.append(0)
+            laal = self.compute_laal(lagging, audio_signal_length, target_length_word[i])
+            if torch.is_tensor(laal):
+                laal_list.append(laal.item())
+            else:
+                laal_list.append(laal)
+        return laal_list
+
+
+    def compute_waitk_lagging(
+            self,
+            batch_samples,
+            predicted_token_ids,
+            canary_data,
+            asr_model,
+            BOW_PREFIX="\u2581"
+        ):
+        waitk_lagging = self.decoding_cfg.waitk_lagging
+        pre_decision_ratio = canary_data.frame_chunk_size
+        target_length_word = [len(a['text'].split()) for a in batch_samples]
+        laal_list = []
+        for i, tokens in enumerate(predicted_token_ids):
+            lagging = []
+            audio_encoder_fs = 80
+            audio_signal_length = batch_samples[i]["audio_length_ms"]
+            for j, cur_t in enumerate(tokens):
+                cur_src_len = (j + waitk_lagging) * pre_decision_ratio + canary_data.right_context
+                cur_src_len *= audio_encoder_fs  # to ms
+                cur_src_len = min(audio_signal_length, cur_src_len)
+                spm = asr_model.tokenizer.vocab[cur_t]
+                # reach word boundary
+                if (
+                    spm.startswith(BOW_PREFIX) and spm != BOW_PREFIX
+                ) or cur_t == asr_model.tokenizer.eos_id:  # word boundary
+                    lagging.append(cur_src_len)
+                if cur_t == asr_model.tokenizer.eos_id:
+                    break
+            if len(lagging) == 0:
+                lagging.append(0)
+            laal = compute_laal(lagging, audio_signal_length, target_length_word[i])
+            laal_list.append(laal)
+        return laal_list
