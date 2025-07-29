@@ -135,6 +135,7 @@ class TranscriptionConfig:
     # Config for word / character error rate calculation
     calculate_wer: bool = True
     calculate_bleu: bool = True
+    calculate_latency: bool = True
     clean_groundtruth_text: bool = False
     langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
@@ -284,6 +285,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
     # setup lhotse dataloader to obtain decoding promt for decoder_input_ids
     decoder_input_ids = obtain_data_prompt(cfg, asr_model)
+    logging.setLevel(logging.INFO)
 
     # if hasattr(asr_model, 'change_decoding_strategy'):
     #     if not isinstance(asr_model, EncDecRNNTModel) and not isinstance(asr_model, EncDecHybridRNNTCTCModel):
@@ -347,6 +349,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     latency_secs = (context_samples.chunk + context_samples.right) / audio_sample_rate
     logging.info(f"Theoretical latency: {latency_secs:.2f} seconds")
 
+    # import ipdb; ipdb.set_trace()
+
     audio_dataset = SimpleAudioDataset(
         audio_filenames=[record["audio_filepath"] for record in records], sample_rate=audio_sample_rate
     )
@@ -369,6 +373,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
     with torch.no_grad(), torch.inference_mode():
         all_hyps = []
+        tokens_frame_alignment = []
+        predicted_token_ids = []
         audio_data: AudioBatch
         for audio_data in tqdm(audio_dataloader):
             # get audio
@@ -507,25 +513,18 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 # TODO: remove this
                 logging.warning(f"[pred_text] {i}: {transcription}")
                 all_hyps.append(transcription)
+                tokens_frame_alignment.append(model_state.tokens_frame_alignment[i])
+                predicted_token_ids.append(model_state.tgt[i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]])
 
             # compute decoding latency
-            batch_samples = samples[-current_batch_size:]
-            for i in range(streaming_buffer.streams_length.size(-1)):
-                batch_samples[i]["audio_length_ms"] = int(streaming_buffer.streams_length[i].item()) * 10
-
-            if cfg.decoding_policy == "waitk":
-                laal_list = compute_waitk_lagging(
-                    cfg, batch_samples, predicted_token_ids, canary_data, asr_model, BOW_PREFIX="\u2581"
-                )
-            elif cfg.decoding_policy == "alignatt":
-                laal_list = compute_alignatt_lagging(
-                    batch_samples, predicted_token_ids, canary_data, asr_model, BOW_PREFIX="\u2581"
-                )        
+            # batch_samples = samples[-current_batch_size:]
+            # for i in range(streaming_buffer.streams_length.size(-1)):
+            #     batch_samples[i]["audio_length_ms"] = int(streaming_buffer.streams_length[i].item()) * 10
+       
 
 
 
     # write predictions to outputfile
-    logging.setLevel(logging.INFO)
     output_filename = cfg.output_filename
     Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
 
@@ -561,6 +560,21 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         if output_manifest_w_bleu:
             logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_bleu}!")
             logging.info(f"{total_res}")
+
+    # compute decoding latency
+    if cfg.calculate_latency:
+        
+        if cfg.decoding.streaming_policy == "waitk":
+            laal_list = decoding_computer.compute_waitk_lagging(
+                records, predicted_token_ids, context_encoder_frames, BOW_PREFIX="\u2581"
+            )
+        elif cfg.decoding.streaming_policy == "alignatt":
+            laal_list = decoding_computer.compute_alignatt_lagging(
+                records, predicted_token_ids, tokens_frame_alignment, context_encoder_frames, BOW_PREFIX="\u2581"
+            ) 
+
+        laal = sum(laal_list) / len(laal_list)
+        logging.info(f"Decoding latency (LAAL): {laal:.2f} seconds")
 
     return cfg
 

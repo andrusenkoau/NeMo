@@ -70,8 +70,8 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 logging.warning(f"!!! need more initial speech according to the waitk policy !!!")
                 logging.warning(f"[encoded_speech.shape]: {encoded_speech.shape}")
 
-        # wait-k decoding policy
-        if self.decoding_cfg.streaming_policy == "waitk":
+        # wait-k streaming decoding policy
+        elif self.decoding_cfg.streaming_policy == "waitk":
             if self.state.decoding_step < 0:
                 # first decoding step
                 tgt, batch_size, _ = self.asr_model.decoding.decoding.greedy_search._prepare_for_search(
@@ -194,7 +194,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     # import ipdb; ipdb.set_trace()
                     pass
 
-        # alignatt decoding policy
+        # alignatt streaming decoding policy
         elif self.decoding_cfg.streaming_policy == "alignatt":
             if self.state.decoding_step < 0:
                 # first decoding step
@@ -408,27 +408,29 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
     def compute_alignatt_lagging(
             self,
-            batch_samples,
+            records,
             predicted_token_ids,
-            canary_data,
-            asr_model,
+            tokens_frame_alignment,
+            context_encoder_frames,
             BOW_PREFIX="\u2581"
         ):
-        tokens_idx_shift = canary_data.decoder_input_ids.size(-1)
-        target_length_word = [len(a['text'].split()) for a in batch_samples]
+        # import ipdb; ipdb.set_trace()
+        tokens_idx_shift = self.state.decoder_input_ids.size(-1)
+        target_length_word = [len(item['text'].split()) for item in records]
+        audio_signal_lengths = [float(item['duration'])*1000 for item in records]
         laal_list = []
         for i, tokens in enumerate(predicted_token_ids):
             if len(tokens) == 0:
                 laal_list.append(5000)
                 continue
             audio_encoder_fs = 80
-            audio_signal_length = batch_samples[i]["audio_length_ms"]
+            audio_signal_length = audio_signal_lengths[i]
             # obtain lagging for alignatt
             lagging = []
             for j, cur_t in enumerate(tokens):
-                pred_idx = canary_data.tokens_frame_alignment[i, tokens_idx_shift + j] + canary_data.right_context
-                cur_t = asr_model.tokenizer.vocab[cur_t]
-                eos_token = asr_model.tokenizer.vocab[asr_model.tokenizer.eos_id]
+                pred_idx = tokens_frame_alignment[i][tokens_idx_shift + j] + context_encoder_frames.right # TODO: check right_context
+                cur_t = self.asr_model.tokenizer.vocab[cur_t]
+                eos_token = self.asr_model.tokenizer.vocab[self.asr_model.tokenizer.eos_id]
                 if (cur_t.startswith(BOW_PREFIX) and cur_t != BOW_PREFIX) or cur_t == eos_token:  # word boundary
                     lagging.append(pred_idx * audio_encoder_fs)
                 if cur_t == eos_token:
@@ -445,34 +447,34 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
     def compute_waitk_lagging(
             self,
-            batch_samples,
+            records,
             predicted_token_ids,
-            canary_data,
-            asr_model,
+            context_encoder_frames,
             BOW_PREFIX="\u2581"
         ):
         waitk_lagging = self.decoding_cfg.waitk_lagging
-        pre_decision_ratio = canary_data.frame_chunk_size
-        target_length_word = [len(a['text'].split()) for a in batch_samples]
+        pre_decision_ratio = context_encoder_frames.chunk
+        target_length_word = [len(item['text'].split()) for item in records]
+        audio_signal_lengths = [float(item['duration'])*1000 for item in records]
         laal_list = []
         for i, tokens in enumerate(predicted_token_ids):
             lagging = []
             audio_encoder_fs = 80
-            audio_signal_length = batch_samples[i]["audio_length_ms"]
+            audio_signal_length = audio_signal_lengths[i]
             for j, cur_t in enumerate(tokens):
-                cur_src_len = (j + waitk_lagging) * pre_decision_ratio + canary_data.right_context
+                cur_src_len = (j + waitk_lagging) * pre_decision_ratio + context_encoder_frames.right
                 cur_src_len *= audio_encoder_fs  # to ms
                 cur_src_len = min(audio_signal_length, cur_src_len)
-                spm = asr_model.tokenizer.vocab[cur_t]
+                spm = self.asr_model.tokenizer.vocab[cur_t]
                 # reach word boundary
                 if (
                     spm.startswith(BOW_PREFIX) and spm != BOW_PREFIX
-                ) or cur_t == asr_model.tokenizer.eos_id:  # word boundary
+                ) or cur_t == self.asr_model.tokenizer.eos_id:  # word boundary
                     lagging.append(cur_src_len)
-                if cur_t == asr_model.tokenizer.eos_id:
+                if cur_t == self.asr_model.tokenizer.eos_id:
                     break
             if len(lagging) == 0:
                 lagging.append(0)
-            laal = compute_laal(lagging, audio_signal_length, target_length_word[i])
+            laal = self.compute_laal(lagging, audio_signal_length, target_length_word[i])
             laal_list.append(laal)
         return laal_list
