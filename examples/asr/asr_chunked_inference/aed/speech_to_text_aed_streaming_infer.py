@@ -15,6 +15,8 @@
 """
 Script to perform buffered and streaming inference using AED (Canary) models.
 
+Long audio recognition is supported only for alignatt streaming decoding policy.
+
 Buffered inference is the primary form of audio transcription when the audio segment is longer than 20-30 seconds.
 Also, this is a demonstration of the algorithm that can be used for streaming inference with low latency.
 This is especially useful for models such as Conformers, which have quadratic time and memory scaling with
@@ -35,7 +37,7 @@ Example usage:
 ```shell
 # TODO: update this example
 python speech_to_text_aed_streaming_infer.py \
-    pretrained_name=nvidia/parakeet-rnnt-1.1b \
+    pretrained_name=nvidia/canary-180m-flash.nemo \
     model_path=null \
     audio_dir="<optional path to folder of audio files>" \
     dataset_manifest="<optional path to manifest>" \
@@ -45,7 +47,9 @@ python speech_to_text_aed_streaming_infer.py \
     left_context_secs=10.0 \
     batch_size=32 \
     clean_groundtruth_text=False \
-    langid='en'
+    langid='en' \
+    decoding.streaming_policy=alignatt \
+    
 ```
 """
 import copy
@@ -103,8 +107,6 @@ class TranscriptionConfig:
     output_filename: Optional[str] = None
     batch_size: int = 32
     num_workers: int = 0
-    append_pred: bool = False  # Sets mode of work, if True it will add new field transcriptions.
-    pred_name_postfix: Optional[str] = None  # If you need to use another model name, rather than standard one.
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
 
     # Chunked configs
@@ -133,14 +135,14 @@ class TranscriptionConfig:
     decoding: AEDStreamingDecodingConfig = field(default_factory=AEDStreamingDecodingConfig)
 
     # Config for word / character error rate calculation
-    calculate_wer: bool = True
-    calculate_bleu: bool = True
+    calculate_wer: bool = True      # for ASR task
+    calculate_bleu: bool = True     # for AST task
     calculate_latency: bool = True
     clean_groundtruth_text: bool = False
     langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
 
-    # extra arguments for prompt generation
+    # extra arguments for Canary prompt generation
     presort_manifest: bool = True
     return_hypotheses: bool = False
     channel_selector: Optional[int] = None
@@ -149,10 +151,12 @@ class TranscriptionConfig:
     timestamps: bool = False
     prompt: dict = field(default_factory=dict)
 
+    # debug mode
     debug_mode: bool = False
 
 
-def obtain_data_prompt(cfg, asr_model):
+# TODO: is any other way to obtain data prompt without lhotse?
+def obtain_data_prompt(cfg, asr_model) -> torch.Tensor:
     logging.info(f"Setup lhotse dataloader from {cfg.dataset_manifest}")
     filepaths, sorted_manifest_path = prepare_audio_data(cfg)
     filepaths = sorted_manifest_path if sorted_manifest_path is not None else filepaths
@@ -180,8 +184,6 @@ def obtain_data_prompt(cfg, asr_model):
         return batch_example.prompt
 
 
-
-
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
 def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     """
@@ -194,7 +196,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
     cfg = OmegaConf.structured(cfg)
 
-    # TODO: check decoding policy 
+    if cfg.decoding.streaming_policy not in {"alignatt", "waitk"}:
+        raise ValueError("This script currently supports only `alignatt` or `waitk` streaming policy")
     
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
@@ -217,7 +220,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         elif cfg.allow_mps and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             logging.warning(
                 "MPS device (Apple Silicon M-series GPU) support is experimental."
-                " Env variable `PYTORCH_ENABLE_MPS_FALLBACK=1` should be set in most cases to avoid failures."
+                "Env variable `PYTORCH_ENABLE_MPS_FALLBACK=1` should be set in most cases to avoid failures."
             )
             map_location = torch.device('mps')
         else:
@@ -270,13 +273,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     asr_model = asr_model.to(asr_model.device)
     asr_model.to(compute_dtype)
 
-    # Change Decoding Config
-    with open_dict(cfg.decoding):
-        if cfg.decoding.streaming_policy != "waitk" and cfg.decoding.streaming_policy != "alignatt":
-            raise NotImplementedError(
-                "This script currently supports only `waitk` or `alignatt` strategy"
-            )
-
     # Setup decoding strategy
     if hasattr(asr_model, 'change_decoding_strategy'):
         multitask_decoding = MultiTaskDecodingConfig()
@@ -286,18 +282,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     # setup lhotse dataloader to obtain decoding promt for decoder_input_ids
     decoder_input_ids = obtain_data_prompt(cfg, asr_model)
     logging.setLevel(logging.INFO)
-
-    # if hasattr(asr_model, 'change_decoding_strategy'):
-    #     if not isinstance(asr_model, EncDecRNNTModel) and not isinstance(asr_model, EncDecHybridRNNTCTCModel):
-    #         raise ValueError("The script supports rnnt model and hybrid model with rnnt decodng!")
-    #     else:
-    #         # rnnt model
-    #         if isinstance(asr_model, EncDecRNNTModel):
-    #             asr_model.change_decoding_strategy(cfg.decoding)
-
-    #         # hybrid ctc rnnt model with decoder_type = rnnt
-    #         if hasattr(asr_model, 'cur_decoder'):
-    #             asr_model.change_decoding_strategy(cfg.decoding, decoder_type='rnnt')
 
     if manifest is not None:
         records = read_manifest(manifest)
@@ -349,8 +333,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     latency_secs = (context_samples.chunk + context_samples.right) / audio_sample_rate
     logging.info(f"Theoretical latency: {latency_secs:.2f} seconds")
 
-    # import ipdb; ipdb.set_trace()
-
     audio_dataset = SimpleAudioDataset(
         audio_filenames=[record["audio_filepath"] for record in records], sample_rate=audio_sample_rate
     )
@@ -364,10 +346,10 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         in_order=True,
     )
 
-    decoding_computer: GreedyBatchedStreamingAEDComputer = GreedyBatchedStreamingAEDComputer(
+    decoding_computer = GreedyBatchedStreamingAEDComputer(
         asr_model,
-        context_samples.chunk//encoder_frame2audio_samples,
-        cfg.decoding,
+        frame_chunk_size=context_samples.chunk//encoder_frame2audio_samples,
+        decoding_cfg=cfg.decoding,
         debug_mode=cfg.debug_mode,
     )
 
@@ -384,10 +366,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             batch_size = audio_batch.shape[0]
             device = audio_batch.device
 
-
             # initialize aed model state
             model_state = AEDStreamingState(decoder_input_ids=decoder_input_ids, device=device)
-            model_state.frame_chunk_size = context_samples.chunk//encoder_frame2audio_samples
+            model_state.frame_chunk_size = context_encoder_frames.chunk
             model_state.batch_idxs = torch.arange(batch_size, dtype=torch.long, device=asr_model.device)
             model_state.current_context_lengths = torch.zeros_like(model_state.batch_idxs) + decoder_input_ids.size(-1)
             model_state.decoder_input_ids = decoder_input_ids[:batch_size]
@@ -403,16 +384,16 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             model_state.active_samples_inner_loop = torch.ones(
                 batch_size, dtype=torch.bool, device=asr_model.device
             )
-            model_state.right_context = context_samples.right//encoder_frame2audio_samples
+            model_state.right_context = context_encoder_frames.right
             model_state.eos_tokens = torch.full(
                 [batch_size], asr_model.tokenizer.eos, dtype=torch.long, device=asr_model.device
             )
             model_state.avgpool2d = torch.nn.AvgPool2d(5, stride=1, padding=2, count_include_pad=False)
             model_state.batch_size = batch_size
 
-
             # decode audio by chunks
             left_sample = 0
+            end_of_window_sample = min(context_samples.chunk, audio_batch.shape[1])
             # right_sample = initial latency in audio samples
             right_sample = min(context_samples.chunk + context_samples.right, audio_batch.shape[1])
             # start with empty buffer
@@ -441,12 +422,13 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 )
                 
                 # is_last_window_batch = context_samples.chunk >= rest_audio_lengths - chunk_lengths_batch + context_samples.right
-                is_last_window_batch = context_samples.chunk >= rest_audio_lengths
+                is_last_window_batch = end_of_window_sample >= audio_batch_lengths
 
                 if cfg.debug_mode:
                     logging.warning(f"*** new encoder step ***")
                     logging.warning(f"chunk_length: {chunk_length}")
                     logging.warning(f"chunk_lengths_batch: {chunk_lengths_batch}")
+                    logging.warning(f"end_of_window_sample: {end_of_window_sample}")
                     logging.warning(f"is_last_chunk_batch: {is_last_chunk_batch}")
                     logging.warning(f"is_last_window_batch: {is_last_window_batch}")
                     logging.warning(f"rest_audio_lengths: {rest_audio_lengths}")
@@ -496,6 +478,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 rest_audio_lengths -= chunk_lengths_batch
                 left_sample = right_sample
                 right_sample = min(right_sample + context_samples.chunk, audio_batch.shape[1])  # add next chunk
+                end_of_window_sample = min(end_of_window_sample + context_samples.chunk, audio_batch.shape[1]) # add next chunk
                 
                 if cfg.debug_mode:
                     logging.warning(f"rest_audio_lengths: {rest_audio_lengths}")

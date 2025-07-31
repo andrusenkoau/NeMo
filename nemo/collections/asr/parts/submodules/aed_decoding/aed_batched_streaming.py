@@ -19,7 +19,7 @@ class AEDStreamingState:
     is_last_chunk_batch: torch.Tensor = False  # whether the current chunk is the last speech chunk in the audio
     max_generation_length: int = 512  # maximum number of tokens to be generated for each sample
     max_tokens_per_alignatt_step: int = (
-        10  # maximum number of tokens to be generated for each step of alignatt decoding policy (before the last speech chunk)
+        50  # maximum number of tokens to be generated for each step of alignatt decoding policy (before the last speech chunk)
     )
     device: torch.device = None
 
@@ -241,6 +241,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 # compute the most attended encoder token
                 xatt_scores = xatt_scores_list[self.decoding_cfg.xatt_scores_layer]
                 xatt_scores = torch.mean(xatt_scores, 1)
+                # TODO: take into account the left context shift
                 if i == 0 and xatt_scores.shape[-1] <= self.decoding_cfg.exclude_sink_frames:
                     exclude_sink_frames = xatt_scores.shape[-1] - 2
                 else:
@@ -274,7 +275,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.active_samples_inner_loop *= alignatt_condition
 
                 if self.debug_mode:
-                    logging.info(f"-------------" * 5)
+                    logging.info(f"========================" * 5)
                     logging.info(f"self.state.decoding_step   : {self.state.decoding_step}")
                     logging.info(f"decoding step i            : {i}")
                     logging.info(f"[encoded_speech.shape]     : {encoded_speech.shape}")
@@ -286,7 +287,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     logging.info(f"[current_context_lengths]  : {self.state.current_context_lengths}")
                     logging.info(f"[predicted tokens]         : {text_token}")
                     logging.info(f"[predicted tokens id]      : {next_tokens}")
-                    import ipdb; ipdb.set_trace()
+                    # import ipdb; ipdb.set_trace()
 
                 # increase speech chunk if no active samples in the inner loop
                 if not torch.any(self.state.active_samples_inner_loop):
@@ -315,6 +316,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
 
                 # update tokens frame alignment based on current encoder step (this alignment is used for LAAL calculation)
+                # TODO: take into account the left context shift
                 self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
                     encoded_speech.size(-2)
                 )
@@ -377,8 +379,16 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     logging.info(f"[predicted tokens]         : {text_token}")
                     logging.info(f"[predicted tokens id]: {next_tokens}")
 
+                
                 if self.debug_mode:
-                    import ipdb; ipdb.set_trace()
+                    pass
+                    # import ipdb; ipdb.set_trace()
+
+                if not torch.any(self.state.active_samples_inner_loop):
+                    if self.debug_mode:
+                        import ipdb; ipdb.set_trace()
+                        logging.info(f"!#! no active samples in inner loop, do next upper step !#!")
+                    break
 
         else:
             raise ValueError("Canary streaming decoding supports only alignatt or waitk decodong policy")
