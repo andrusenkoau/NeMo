@@ -477,6 +477,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     input_signal=buffer.samples, length=buffer.context_size_batch.total()
                 )
                 if cfg.debug_mode:
+                    logging.info(f"buffer.context_size_batch: {buffer.context_size_batch}")
                     logging.info(f"buffer.context_size_batch.total(): {buffer.context_size_batch.total()}")
                     logging.info(f"processed_signal: {processed_signal.shape}")
                     logging.info(f"processed_signal_length: {processed_signal_length}")

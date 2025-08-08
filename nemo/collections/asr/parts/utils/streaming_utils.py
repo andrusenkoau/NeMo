@@ -2278,6 +2278,22 @@ class ContextSizeBatch:
         Returns:
             number of frames removed from the left side
         """
+        # self.left += self.chunk
+        # self.chunk.fill_(0)
+        # self.right += num_frames_batch
+
+        # self.chunk = torch.where(is_last_chunk_batch, self.right, expected_context.chunk)
+        # self.right = torch.where(is_last_chunk_batch, 0, self.right - expected_context.chunk)
+
+        # # fix left context
+        # self.left = torch.where(self.chunk > 0, self.left, 0)
+
+        # extra_samples = torch.maximum(self.total() - expected_context.total(), torch.zeros_like(self.left))
+        # self.left -= extra_samples
+        # self.left = torch.where(self.left < 0, torch.zeros_like(self.left), self.left)
+        # print("inside add_frames_")
+        # import ipdb; ipdb.set_trace()
+
         self.left += self.chunk
         self.chunk.fill_(0)
         self.right += num_frames_batch
@@ -2289,8 +2305,12 @@ class ContextSizeBatch:
         self.left = torch.where(self.chunk > 0, self.left, 0)
 
         extra_samples = torch.maximum(self.total() - expected_context.total(), torch.zeros_like(self.left))
+        # extra_samples = torch.maximum(self.left - expected_context.chunk, torch.zeros_like(self.left))
+        # extra_samples = torch.maximum(self.left - expected_context.left, torch.zeros_like(self.left))
         self.left -= extra_samples
         self.left = torch.where(self.left < 0, torch.zeros_like(self.left), self.left)
+        # print("inside add_frames_")
+        # import ipdb; ipdb.set_trace()
 
 
 class StreamingBatchedAudioBuffer:
@@ -2339,6 +2359,7 @@ class StreamingBatchedAudioBuffer:
         extra_samples_in_buffer = self.context_size.add_frames_get_removed_(
             added_chunk_length, is_last_chunk=is_last_chunk, expected_context=self.expected_context
         )
+        import ipdb; ipdb.set_trace()
         self.context_size_batch.add_frames_(
             num_frames_batch=audio_lengths,
             is_last_chunk_batch=is_last_chunk_batch,
