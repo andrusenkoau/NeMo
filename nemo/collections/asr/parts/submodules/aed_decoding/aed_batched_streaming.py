@@ -252,11 +252,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 # compute the most attended encoder token
                 xatt_scores = xatt_scores_list[self.decoding_cfg.xatt_scores_layer]
                 xatt_scores = torch.mean(xatt_scores, 1)
-                # TODO: take into account the left context shift
                 if i == 0 and xatt_scores.shape[-1] <= self.decoding_cfg.exclude_sink_frames:
                     exclude_sink_frames = xatt_scores.shape[-1] // 2
                 else:
-                    # exclude_sink_frames = self.decoding_cfg.exclude_sink_frames
                     exclude_sink_frames = self.decoding_cfg.exclude_sink_frames if self.state.prev_encoder_shift == 0 else 0
                 most_attended_idxs = (
                     torch.argmax(xatt_scores[:, :, exclude_sink_frames:], dim=-1) + exclude_sink_frames
@@ -328,16 +326,11 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
 
                 # update tokens frame alignment based on current encoder step (this alignment is used for LAAL calculation)
-                # TODO: take into account the left context shift
                 self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
                     encoded_speech.size(-2) + self.state.prev_encoder_shift # we need to add the real frame position in the audio signal
                 )
-                # self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
-                #     encoded_speech.size(-2)
-                # )
 
                 self.state.decoding_step += input_ids.size(-1)
-                # input_ids = next_tokens.unsqueeze(-1)
 
                 # check for hallucinations
                 # TODO add more consequtive tokens? Now we are checking only 3 same tokens
@@ -362,7 +355,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     self.state.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
                 # zero out decoder_mems_list for non active samples
-                # TODO it does not work if first token was EOS
+                # TODO batched decoding works wrong if first token was EOS for one of the samples
                 if torch.any(torch.logical_not(self.state.active_samples_inner_loop)):
                     for j in range(len(decoder_mems_list)):
                         decoder_mems_list[j][:, -1] *= self.state.active_samples_inner_loop.unsqueeze(-1)

@@ -456,10 +456,11 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     logging.info(f"*** encoder step {step_idx} ***")
                     logging.info(f"chunk_length: {chunk_length}")
                     logging.info(f"chunk_lengths_batch: {chunk_lengths_batch}")
-                    logging.info(f"end_of_window_sample: {end_of_window_sample}")
+                    logging.info(f"end_of_window_sample: {end_of_window_sample}, {end_of_window_sample/audio_sample_rate:.2f}s")
                     logging.info(f"is_last_chunk_batch: {is_last_chunk_batch}")
                     logging.info(f"is_last_chunk: {is_last_chunk}")
                     logging.info(f"is_last_window_batch: {is_last_window_batch}")
+                    logging.info(f"model_state.active_samples: {model_state.active_samples}")
                     logging.info(f"rest_audio_lengths: {rest_audio_lengths}")
 
                 buffer.add_audio_batch_(
@@ -476,6 +477,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     input_signal=buffer.samples, length=buffer.context_size_batch.total()
                 )
                 if cfg.debug_mode:
+                    logging.info(f"buffer.context_size_batch.total(): {buffer.context_size_batch.total()}")
                     logging.info(f"processed_signal: {processed_signal.shape}")
                     logging.info(f"processed_signal_length: {processed_signal_length}")
                 # get encoder output using full buffer [left-chunk-right]
