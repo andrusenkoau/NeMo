@@ -6,7 +6,8 @@ import torch
 from typing import Optional
 from omegaconf import DictConfig
 from nemo.collections.asr.parts.mixins.mixins import lens_to_mask
-from nemo.collections.asr.parts.utils import rnnt_utils
+from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel
+from nemo.collections.asr.parts.submodules.multitask_decoding import AEDStreamingDecodingConfig
 from nemo.utils import logging
 
 
@@ -21,6 +22,8 @@ class AEDStreamingState:
     max_tokens_per_alignatt_step: int = (
         50  # maximum number of tokens to be generated for each step of alignatt decoding policy (before the last speech chunk)
     )
+    tokens_frame_alignment: torch.Tensor = None  # frame alignment of the predicted tokens (used for LAAL calculation in alignatt)
+    prev_encoder_shift: int = 0  # previous encoder shift (used for LAAL calculation in alignatt)
     device: torch.device = None
 
 
@@ -31,15 +34,18 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
     def __init__(
         self,
-        asr_model,
-        frame_chunk_size,
-        decoding_cfg,
-        debug_mode=False,
+        asr_model: EncDecMultiTaskModel,
+        frame_chunk_size: int,
+        decoding_cfg: AEDStreamingDecodingConfig,
+        debug_mode: bool = False,
     ):
         """
         Init method.
         Args:
-
+            asr_model: isntace of ASR model (Canary)
+            frame_chunk_size: size of the frame chunk
+            decoding_cfg: decoding configuration
+            debug_mode: debug mode
         """
         super().__init__()
 
@@ -49,7 +55,12 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         self.state = AEDStreamingState()
         self.debug_mode = debug_mode
 
-    def __call__(self, encoder_output, encoder_output_len, prev_batched_state):
+    def __call__(
+        self,
+        encoder_output: torch.Tensor,
+        encoder_output_len: torch.Tensor,
+        prev_batched_state: AEDStreamingState,
+    ) -> AEDStreamingState:
 
         self.state = prev_batched_state
 
@@ -61,13 +72,13 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             encoded_speech.dtype
         )
 
-        # initiall waitk lagging. Applicable for waitk and alignatt decoding policies
+        # initiall waitk lagging. Applicable for waitk and alignatt decoding policies. Control the start of the decoding process.
         if encoded_speech.size(-2) // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
             torch.logical_not(self.state.is_last_chunk_batch)
         ):
             # need to wait for more speech
             if self.debug_mode:
-                logging.info(f"!!! need more initial speech according to the waitk policy !!!")
+                logging.info(f"!!! need to accumulate more speech to start the decoding process !!!")
                 logging.info(f"[encoded_speech.shape]: {encoded_speech.shape}")
 
         # wait-k streaming decoding policy
@@ -318,8 +329,11 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 # update tokens frame alignment based on current encoder step (this alignment is used for LAAL calculation)
                 # TODO: take into account the left context shift
                 self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
-                    encoded_speech.size(-2)
+                    encoded_speech.size(-2) + self.state.prev_encoder_shift # we need to add the real frame position in the audio signal
                 )
+                # self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
+                #     encoded_speech.size(-2)
+                # )
 
                 self.state.decoding_step += input_ids.size(-1)
                 # input_ids = next_tokens.unsqueeze(-1)
@@ -393,7 +407,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         else:
             raise ValueError("Canary streaming decoding supports only alignatt or waitk decodong policy")
         
-        return None, None, self.state
+        return self.state
 
 
     def compute_laal(
