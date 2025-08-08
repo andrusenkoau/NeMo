@@ -254,9 +254,10 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 xatt_scores = torch.mean(xatt_scores, 1)
                 # TODO: take into account the left context shift
                 if i == 0 and xatt_scores.shape[-1] <= self.decoding_cfg.exclude_sink_frames:
-                    exclude_sink_frames = xatt_scores.shape[-1] - 2
+                    exclude_sink_frames = xatt_scores.shape[-1] // 2
                 else:
-                    exclude_sink_frames = self.decoding_cfg.exclude_sink_frames
+                    # exclude_sink_frames = self.decoding_cfg.exclude_sink_frames
+                    exclude_sink_frames = self.decoding_cfg.exclude_sink_frames if self.state.prev_encoder_shift == 0 else 0
                 most_attended_idxs = (
                     torch.argmax(xatt_scores[:, :, exclude_sink_frames:], dim=-1) + exclude_sink_frames
                 )
