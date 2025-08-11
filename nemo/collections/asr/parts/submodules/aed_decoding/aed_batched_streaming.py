@@ -22,6 +22,7 @@ class AEDStreamingState:
     max_tokens_per_alignatt_step: int = (
         50  # maximum number of tokens to be generated for each step of alignatt decoding policy (before the last speech chunk)
     )
+    use_avgpool_for_alignatt: bool = True # use avgpooling for alignatt decoding policy
     tokens_frame_alignment: torch.Tensor = None  # frame alignment of the predicted tokens (used for LAAL calculation in alignatt)
     prev_encoder_shift: int = 0  # previous encoder shift (used for LAAL calculation in alignatt)
     device: torch.device = None
@@ -73,13 +74,16 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         )
 
         # initiall waitk lagging. Applicable for waitk and alignatt decoding policies. Control the start of the decoding process.
-        if encoded_speech.size(-2) // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
+        # if encoded_speech.size(-2) // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
+        #     torch.logical_not(self.state.is_last_chunk_batch)
+        # ):
+        if encoder_output_len.max() // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
             torch.logical_not(self.state.is_last_chunk_batch)
         ):
             # need to wait for more speech
             if self.debug_mode:
                 logging.info(f"!!! need to accumulate more speech to start the decoding process !!!")
-                logging.info(f"[encoded_speech.shape]: {encoded_speech.shape}")
+                logging.info(f"[encoder_output_len]: {encoder_output_len}")
 
         # wait-k streaming decoding policy
         elif self.decoding_cfg.streaming_policy == "waitk":
@@ -145,8 +149,8 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     logging.info(f"decoding step (i)        : {i}")
                     logging.info(f"start_from               : {start_from}")
                     logging.info(f"max_generation_length    : {max_generation_length}")
-                    logging.info(f"[encoded_speech.shape]   : {encoded_speech.shape}")
-                    logging.info(f"[is_last_chunk_batch]   : {self.state.is_last_chunk_batch}")
+                    logging.info(f"[encoder_output_len]     : {encoder_output_len}")
+                    logging.info(f"[is_last_chunk_batch]    : {self.state.is_last_chunk_batch}")
                     logging.info(f"[active_samples]         : {self.state.active_samples}")
                     logging.info(f"[current_context_lengths]: {self.state.current_context_lengths}")
                     logging.info(f"[predicted token]        : {text_tokens}")
@@ -274,9 +278,13 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     most_attended_idxs = most_attended_idxs.squeeze(-1)
 
                 # aligatt condition (True -- continue decoding, False -- wait for more speech)
+                # TODO: consider only active samples
                 alignatt_condition = (
-                    encoded_speech.shape[1] - (most_attended_idxs + 1) >= self.decoding_cfg.alignatt_thr
+                    encoder_output_len - (most_attended_idxs + 1) >= self.decoding_cfg.alignatt_thr
                 )
+                # alignatt_condition = (
+                #     encoded_speech.shape[1] - (most_attended_idxs + 1) >= self.decoding_cfg.alignatt_thr
+                # )
 
                 # alignatt condition is always True for the last speech chunk
                 alignatt_condition += self.state.is_last_chunk_batch
@@ -289,6 +297,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     logging.info(f"self.state.decoding_step   : {self.state.decoding_step}")
                     logging.info(f"decoding step i            : {i}")
                     logging.info(f"[encoded_speech.shape]     : {encoded_speech.shape}")
+                    logging.info(f"[encoder_output_len]       : {encoder_output_len}")
                     logging.info(f"[positional_indexes]       : {positional_indexes}")
                     logging.info(f"[most_attended_idxs]       : {most_attended_idxs}")
                     logging.info(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
@@ -317,6 +326,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 if not torch.any(self.state.active_samples_inner_loop):
                     if self.debug_mode:
                         logging.info(f"!#! no active samples in inner loop, do next upper step !#!")
+                        logging.info(f"[active_samples]           : {self.state.active_samples}")
+                        logging.info(f"[active_samples_inner_loop]: {self.state.active_samples_inner_loop}")
+                        logging.info(f"________________________")
                     break
 
                 # write predicted tokens to the tgt tensor
@@ -326,8 +338,11 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
 
                 # update tokens frame alignment based on current encoder step (this alignment is used for LAAL calculation)
+                # self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
+                #     encoded_speech.size(-2) + self.state.prev_encoder_shift # we need to add the real frame position in the audio signal
+                # )
                 self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
-                    encoded_speech.size(-2) + self.state.prev_encoder_shift # we need to add the real frame position in the audio signal
+                    encoder_output_len + self.state.prev_encoder_shift # we need to add the real frame position in the audio signal
                 )
 
                 self.state.decoding_step += input_ids.size(-1)
@@ -378,6 +393,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     logging.info(f"self.state.decoding_step   : {self.state.decoding_step}")
                     logging.info(f"decoding step i            : {i}")
                     logging.info(f"[encoded_speech.shape]     : {encoded_speech.shape}")
+                    logging.info(f"[encoder_output_len]       : {encoder_output_len}")
                     logging.info(f"[positional_indexes]       : {positional_indexes}")
                     logging.info(f"[most_attended_idxs]       : {most_attended_idxs}")
                     logging.info(f"[is_last_chunk_batch]      : {self.state.is_last_chunk_batch}")
