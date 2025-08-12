@@ -464,6 +464,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         tokens_idx_shift = self.state.decoder_input_ids.size(-1)
         target_length_word = [len(item['text'].split()) for item in records]
         audio_signal_lengths = [float(item['duration'])*1000 for item in records]
+        eos_token = self.asr_model.tokenizer.tokenizer.id_to_piece(self.asr_model.tokenizer.eos_id)
         laal_list = []
         for i, tokens in enumerate(predicted_token_ids):
             if len(tokens) == 0:
@@ -475,8 +476,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             lagging = []
             for j, cur_t in enumerate(tokens):
                 pred_idx = tokens_frame_alignment[i][tokens_idx_shift + j] + context_encoder_frames.right # TODO: check right_context
-                cur_t = self.asr_model.tokenizer.vocab[cur_t]
-                eos_token = self.asr_model.tokenizer.vocab[self.asr_model.tokenizer.eos_id]
+                cur_t = self.asr_model.tokenizer.tokenizer.id_to_piece(cur_t.item())
                 if (cur_t.startswith(BOW_PREFIX) and cur_t != BOW_PREFIX) or cur_t == eos_token:  # word boundary
                     lagging.append(pred_idx * audio_encoder_fs)
                 if cur_t == eos_token:
@@ -511,7 +511,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 cur_src_len = (j + waitk_lagging) * pre_decision_ratio + context_encoder_frames.right
                 cur_src_len *= audio_encoder_fs  # to ms
                 cur_src_len = min(audio_signal_length, cur_src_len)
-                spm = self.asr_model.tokenizer.vocab[cur_t]
+                spm = self.asr_model.tokenizer.tokenizer.id_to_piece(cur_t.item())
                 # reach word boundary
                 if (
                     spm.startswith(BOW_PREFIX) and spm != BOW_PREFIX
