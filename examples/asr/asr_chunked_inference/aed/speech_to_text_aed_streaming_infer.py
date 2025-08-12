@@ -139,6 +139,8 @@ class TranscriptionConfig:
     calculate_bleu: bool = True     # for AST task
     calculate_latency: bool = True
     clean_groundtruth_text: bool = False
+    ignore_capitalization: bool = True
+    ignore_punctuation: bool = True
     langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
 
@@ -557,6 +559,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             clean_groundtruth_text=cfg.clean_groundtruth_text,
             langid=cfg.langid,
             use_cer=cfg.use_cer,
+            ignore_capitalization=cfg.ignore_capitalization,
+            ignore_punctuation=cfg.ignore_punctuation,
             output_filename=None,
         )
         if output_manifest_w_wer:

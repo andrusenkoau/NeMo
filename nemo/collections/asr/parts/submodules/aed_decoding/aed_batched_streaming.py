@@ -20,7 +20,7 @@ class AEDStreamingState:
     is_last_chunk_batch: torch.Tensor = False  # whether the current chunk is the last speech chunk in the audio
     max_generation_length: int = 512  # maximum number of tokens to be generated for each sample
     max_tokens_per_alignatt_step: int = (
-        50  # maximum number of tokens to be generated for each step of alignatt decoding policy (before the last speech chunk)
+        30  # maximum number of tokens to be generated for each step of alignatt decoding policy (before the last speech chunk)
     )
     use_avgpool_for_alignatt: bool = True # use avgpooling for alignatt decoding policy
     tokens_frame_alignment: torch.Tensor = None  # frame alignment of the predicted tokens (used for LAAL calculation in alignatt)
@@ -77,7 +77,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         # if encoded_speech.size(-2) // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
         #     torch.logical_not(self.state.is_last_chunk_batch)
         # ):
-        if encoder_output_len.max() // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
+        if encoder_output_len.min() // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
             torch.logical_not(self.state.is_last_chunk_batch)
         ):
             # need to wait for more speech
@@ -282,9 +282,6 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 alignatt_condition = (
                     encoder_output_len - (most_attended_idxs + 1) >= self.decoding_cfg.alignatt_thr
                 )
-                # alignatt_condition = (
-                #     encoded_speech.shape[1] - (most_attended_idxs + 1) >= self.decoding_cfg.alignatt_thr
-                # )
 
                 # alignatt condition is always True for the last speech chunk
                 alignatt_condition += self.state.is_last_chunk_batch
@@ -349,12 +346,27 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
                 # check for hallucinations
                 # TODO add more consequtive tokens? Now we are checking only 3 same tokens
-                hallucination_mask = torch.logical_and(
+                hallucination_mask_1 = torch.logical_and(
                     self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths]
                     == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1],
                     self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1]
                     == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 2],
                 )
+
+                hallucination_mask_2 = torch.logical_and(
+                    self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths]
+                    == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 2],
+                    self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1]
+                    == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 3],
+                )
+
+                hallucination_mask_3 = \
+                    (self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 3]) * \
+                    (self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1] == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 4]) * \
+                    (self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 2] == self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 5])
+
+                hallucination_mask = hallucination_mask_1 + hallucination_mask_2 + hallucination_mask_3
+
                 if torch.any(hallucination_mask):
                     logging.info(f"!!! hallucination detected !!!")
                     self.state.active_samples *= torch.logical_not(hallucination_mask)
