@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
-import texterrors
+from kaldialign import align
 import torch
 from omegaconf import open_dict
 
@@ -46,7 +46,7 @@ def get_correct_marks(r: Union[List[int], List[str]], h: Union[List[int], List[s
     """
     return [
         a == b
-        for a, b in zip(*(texterrors.align_texts([str(rr) for rr in r], [str(hh) for hh in h], False)[:-1]))
+        for a, b in (align([str(rr) for rr in r], [str(hh) for hh in h], "<eps>")[:-1])
         if b != "<eps>"
     ]
 
