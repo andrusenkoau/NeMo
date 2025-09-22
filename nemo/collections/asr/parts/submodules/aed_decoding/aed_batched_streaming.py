@@ -187,7 +187,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.current_context_lengths == self.decoding_cfg.max_generation_length - 1
             )
             if torch.any(samples_with_max_context_length * self.state.active_samples):
-                logging.info(f"!!! maximum context length reached !!!")
+                logging.info("!!! maximum context length reached !!!")
                 self.state.active_samples *= torch.logical_not(samples_with_max_context_length)
                 self.state.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
@@ -316,7 +316,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                 self.state.current_context_lengths == self.state.max_generation_length - 1
             )
             if torch.any(samples_with_max_context_length * self.state.active_samples):
-                logging.info(f"!!! maximum context length reached !!!")
+                logging.info("!!! maximum context length reached !!!")
                 self.state.active_samples *= torch.logical_not(samples_with_max_context_length)
                 self.state.active_samples_inner_loop *= torch.logical_not(samples_with_max_context_length)
 
@@ -352,7 +352,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             * (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 4])
         )
         if torch.any(hallucination_mask_1):
-            logging.info(f"!!! hallucination 'a a a a' detected !!!")
+            logging.info("!!! hallucination 'a a a a' detected !!!")
         # pattern 2: "a b a b a b"
         hallucination_mask_2 = (
             (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 2])
@@ -361,7 +361,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             * (tgt[batch_idxs, ccl - 1] == tgt[batch_idxs, ccl - 5])
         )
         if torch.any(hallucination_mask_2):
-            logging.info(f"!!! hallucination 'a b a b a b' detected !!!")
+            logging.info("!!! hallucination 'a b a b a b' detected !!!")
         # pattern 3: "a b c a b c a b c"
         hallucination_mask_3 = (
             (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 3])
@@ -372,7 +372,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             * (tgt[batch_idxs, ccl - 2] == tgt[batch_idxs, ccl - 8])
         )
         if torch.any(hallucination_mask_3):
-            logging.info(f"!!! hallucination 'a b c a b c a b c' detected !!!")
+            logging.info("!!! hallucination 'a b c a b c a b c' detected !!!")
         hallucination_mask = hallucination_mask_1 + hallucination_mask_2 + hallucination_mask_3
         return hallucination_mask
 
@@ -484,7 +484,7 @@ def return_decoder_input_ids(decoding_config, asr_model) -> torch.Tensor:
             # we'll emit a warning.
             if default_turns_for_role := [t for t in default_turns if t["role"] == role]:
                 if len(default_turns_for_role) > 1:
-                    warnings.warn(
+                    logging.warning(
                         f"More than one default turn detected for {role=}. "
                         f"We'll be using default slot values for the first turn of {role=} only."
                     )

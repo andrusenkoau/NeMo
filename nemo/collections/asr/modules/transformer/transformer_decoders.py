@@ -159,7 +159,7 @@ class TransformerDecoderBlock(nn.Module, AttentionAdapterModuleMixin):
             pack_ip = self.forward_enabled_adapters(pack_ip)
             output_states = pack_ip['x']
 
-        return self.layer_norm_3(output_states), xatt_scores
+        return self.layer_norm_3(output_states), extra_output
 
     def forward(self, decoder_query, decoder_mask, decoder_keys, encoder_states, encoder_mask):
         if self.pre_ln:

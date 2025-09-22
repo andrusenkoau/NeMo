@@ -18,7 +18,7 @@ import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
-from nemo.collections.asr.parts.submodules.aed_decoding.aed_batched_streaming import (
+from nemo.collections.asr.parts.submodules.aed_decoding import (
     GreedyBatchedStreamingAEDComputer,
     initialize_aed_model_state,
     return_decoder_input_ids,
