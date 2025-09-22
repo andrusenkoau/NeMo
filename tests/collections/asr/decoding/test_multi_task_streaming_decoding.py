@@ -16,9 +16,11 @@ import editdistance
 import pytest
 import torch
 from tqdm.auto import tqdm
+from omegaconf import OmegaConf
 
 from nemo.collections.asr.parts.submodules.aed_decoding.aed_batched_streaming import (
     GreedyBatchedStreamingAEDComputer,
+    return_decoder_input_ids,
     initialize_aed_model_state,
 )
 from nemo.collections.asr.parts.submodules.multitask_decoding import (
@@ -93,6 +95,8 @@ def test_multi_task_streaming_decoding(
     streaming_decoding_cfg.streaming_policy = decoding_policy
     streaming_decoding_cfg.chunk_secs = 1
     streaming_decoding_cfg.right_context_secs = 0.0
+    streaming_decoding_cfg.batch_size = batch_size
+    streaming_decoding_cfg.prompt = OmegaConf.create({'pnc': 'no', 'task': 'asr'})
 
     context_encoder_frames = ContextSize(
         left=100,
@@ -123,10 +127,7 @@ def test_multi_task_streaming_decoding(
                 manifest[i : i + batch_size], model=model, device=device
             )
             local_batch_size = encoder_output_len.shape[0]
-            decoder_input_ids = (
-                torch.tensor([7, 4, 16, 62, 62, 6, 9, 11, 13]).unsqueeze(0).expand(local_batch_size, -1).to(device)
-            )
-
+            decoder_input_ids = return_decoder_input_ids(streaming_decoding_cfg, model)
             model_state = initialize_aed_model_state(
                 asr_model=model,
                 decoder_input_ids=decoder_input_ids,

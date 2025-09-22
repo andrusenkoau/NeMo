@@ -14,12 +14,13 @@
 
 from abc import ABC
 from dataclasses import dataclass
-
+from omegaconf import OmegaConf
 import torch
 
 from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, lens_to_mask
 from nemo.collections.asr.parts.submodules.multitask_decoding import AEDStreamingDecodingConfig
 from nemo.collections.asr.parts.utils.streaming_utils import ContextSize
+from nemo.collections.asr.models.aed_multitask_models import parse_multitask_prompt
 from nemo.utils import logging
 
 
@@ -375,6 +376,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         hallucination_mask = hallucination_mask_1 + hallucination_mask_2 + hallucination_mask_3
         return hallucination_mask
 
+
     def compute_laal(self, delays, source_length, target_length):
         if delays[0] > source_length:
             return delays[0]
@@ -460,6 +462,48 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             laal = self.compute_laal(lagging, audio_signal_length, target_length_word[i])
             laal_list.append(laal)
         return laal_list
+
+
+def return_decoder_input_ids(decoding_config, asr_model) -> torch.Tensor:
+    """
+    Obtain decoder input ids for decoding config.
+    """
+    override_cfg = asr_model.get_transcribe_config()
+    override_cfg.prompt = parse_multitask_prompt(OmegaConf.to_container(decoding_config.prompt))
+    
+    default_turns = asr_model.prompt.get_default_dialog_slots()
+    if not decoding_config.prompt:
+        # No turns were provided, use defaults.
+        turns = default_turns
+    else:
+        # Turns were provided, iterate over them and fill missing slot values using defaults..
+        turns = override_cfg.prompt.copy()  # shallow copy #1: don't override the config
+        for turn in turns:
+            role = turn["role"]
+            # Check if we have defaults for this role.
+            # There shouldn't be more than a single turn for a given role, but if there are,
+            # we'll emit a warning.
+            if default_turns_for_role := [t for t in default_turns if t["role"] == role]:
+                if len(default_turns_for_role) > 1:
+                    warnings.warn(
+                        f"More than one default turn detected for {role=}. "
+                        f"We'll be using default slot values for the first turn of {role=} only."
+                    )
+                default_slots = default_turns_for_role[0]["slots"]
+                turn["slots"] = turn["slots"].copy()  # shallow copy #1: don't override the config
+                # fill missing slots using defaults
+                for slot, val in default_slots.items():
+                    if turn["slots"].get(slot) is None:
+                        turn["slots"][slot] = val
+
+    decoder_input_ids = (
+        asr_model.prompt.encode_dialog(turns=turns)["context_ids"]
+        .unsqueeze(0)
+        .repeat(decoding_config.batch_size, 1)
+        .to(asr_model.device)
+    )
+
+    return decoder_input_ids
 
 
 def initialize_aed_model_state(

@@ -63,10 +63,9 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from nemo.collections.asr.models.aed_multitask_models import parse_multitask_prompt
 from nemo.collections.asr.parts.submodules.aed_decoding.aed_batched_streaming import (
-    AEDStreamingState,
     GreedyBatchedStreamingAEDComputer,
+    return_decoder_input_ids,
     initialize_aed_model_state,
 )
 from nemo.collections.asr.parts.submodules.multitask_decoding import (
@@ -156,38 +155,6 @@ class TranscriptionConfig:
 
     # debug mode
     debug_mode: bool = False
-
-
-def obtain_data_prompt(cfg, asr_model) -> torch.Tensor:
-    """
-    Obtain data prompt for decoder input.
-    """
-    # TODO: is any other way to obtain data prompt without lhotse?
-    logging.info(f"Setup lhotse dataloader from {cfg.dataset_manifest}")
-    filepaths, sorted_manifest_path = prepare_audio_data(cfg)
-    filepaths = sorted_manifest_path if sorted_manifest_path is not None else filepaths
-
-    override_cfg = asr_model.get_transcribe_config()
-    override_cfg.batch_size = cfg.batch_size
-    override_cfg.num_workers = cfg.num_workers
-    override_cfg.return_hypotheses = cfg.return_hypotheses
-    override_cfg.channel_selector = cfg.channel_selector
-    override_cfg.augmentor = None
-    override_cfg.text_field = cfg.gt_text_attr_name
-    override_cfg.lang_field = cfg.gt_lang_attr_name
-    override_cfg.timestamps = cfg.timestamps
-    if hasattr(override_cfg, "prompt"):
-        override_cfg.prompt = parse_multitask_prompt(OmegaConf.to_container(cfg.prompt))
-    transcribe_cfg = override_cfg
-
-    asr_model._transcribe_on_begin(filepaths, transcribe_cfg)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        transcribe_cfg._internal.temp_dir = tmpdir
-        dataloader = asr_model._transcribe_input_processing(filepaths, transcribe_cfg)
-        batch_example = next(iter(dataloader))
-        batch_example = move_data_to_device(batch_example, transcribe_cfg._internal.device)
-        return batch_example.prompt
 
 
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
@@ -286,8 +253,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         multitask_decoding.strategy = "greedy"
         asr_model.change_decoding_strategy(multitask_decoding)
 
-    # setup lhotse dataloader to obtain decoding promt for decoder_input_ids
-    decoder_input_ids = obtain_data_prompt(cfg, asr_model)
     logging.setLevel(logging.INFO)
 
     if manifest is not None:
@@ -358,6 +323,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         frame_chunk_size=context_encoder_frames.chunk,
         decoding_cfg=cfg.decoding,
     )
+
+    decoder_input_ids = return_decoder_input_ids(cfg, asr_model)
 
     with torch.no_grad(), torch.inference_mode():
         all_hyps = []
@@ -463,6 +430,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]
                 ]
                 transcription = asr_model.tokenizer.ids_to_text(transcription_idx.tolist()).strip()
+                logging.info(f"i: {transcription}")
                 all_hyps.append(transcription)
                 tokens_frame_alignment.append(model_state.tokens_frame_alignment[i])
                 predicted_token_ids.append(
