@@ -14,13 +14,13 @@
 
 from abc import ABC
 from dataclasses import dataclass
-from omegaconf import OmegaConf
-import torch
 
-from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, lens_to_mask
+import torch
+from omegaconf import OmegaConf
+
+from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, lens_to_mask, parse_multitask_prompt
 from nemo.collections.asr.parts.submodules.multitask_decoding import AEDStreamingDecodingConfig
 from nemo.collections.asr.parts.utils.streaming_utils import ContextSize
-from nemo.collections.asr.models.aed_multitask_models import parse_multitask_prompt
 from nemo.utils import logging
 
 
@@ -376,7 +376,6 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         hallucination_mask = hallucination_mask_1 + hallucination_mask_2 + hallucination_mask_3
         return hallucination_mask
 
-
     def compute_laal(self, delays, source_length, target_length):
         if delays[0] > source_length:
             return delays[0]
@@ -470,7 +469,7 @@ def return_decoder_input_ids(decoding_config, asr_model) -> torch.Tensor:
     """
     override_cfg = asr_model.get_transcribe_config()
     override_cfg.prompt = parse_multitask_prompt(OmegaConf.to_container(decoding_config.prompt))
-    
+
     default_turns = asr_model.prompt.get_default_dialog_slots()
     if not decoding_config.prompt:
         # No turns were provided, use defaults.
