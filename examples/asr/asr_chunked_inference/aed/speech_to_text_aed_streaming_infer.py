@@ -52,7 +52,6 @@ import copy
 import glob
 import json
 import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -80,8 +79,7 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
     SimpleAudioDataset,
     StreamingBatchedAudioBuffer,
 )
-from nemo.collections.asr.parts.utils.transcribe_utils import compute_output_filename, prepare_audio_data, setup_model
-from nemo.collections.common.data.utils import move_data_to_device
+from nemo.collections.asr.parts.utils.transcribe_utils import compute_output_filename, setup_model
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 
