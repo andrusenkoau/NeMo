@@ -412,7 +412,9 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
         tgt, batch_size, max_generation_length = self._prepare_for_search(decoder_input_ids, encoder_hidden_states)
 
         # generate initial buffer of beam_size prefixes-hypotheses
-        log_probs, decoder_mems_list, _ = self._one_step_forward(tgt, encoder_hidden_states, encoder_input_mask, None, 0)
+        log_probs, decoder_mems_list, _ = self._one_step_forward(
+            tgt, encoder_hidden_states, encoder_input_mask, None, 0
+        )
         scores, prefixes = torch.topk(log_probs.permute(0, 2, 1), self.beam_size, dim=1)
         scores, prefixes = scores.view(-1, 1), prefixes.view(-1, 1)
 
@@ -546,7 +548,9 @@ class BeamSearchSequenceGeneratorWithFusionModels(BeamSearchSequenceGenerator):
         batch_fusion_states_candidates_list = []
 
         # generate initial buffer of beam_size prefixes-hypotheses
-        log_probs, decoder_mems_list, _ = self._one_step_forward(tgt, encoder_hidden_states, encoder_input_mask, None, 0)
+        log_probs, decoder_mems_list, _ = self._one_step_forward(
+            tgt, encoder_hidden_states, encoder_input_mask, None, 0
+        )
         # get fusion models scores
         for fusion_model_idx, fusion_model in enumerate(self.fusion_models):
             fusion_scores, batch_fusion_states_candidates = fusion_model.advance(
