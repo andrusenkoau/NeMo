@@ -97,11 +97,8 @@ def _stt_en_fastconformer_tdt_large_raw():
 
 @pytest.fixture(scope="package")
 def _canary_180m_flash_raw():
-    if CHECKPOINTS_PATH.exists():
-        model = ASRModel.restore_from(str(CHECKPOINTS_PATH / "canary-180m-flash.nemo"), map_location="cpu")
-    else:
-        model_name = "nvidia/canary-180m-flash"
-        model = ASRModel.from_pretrained(model_name, map_location="cpu")
+    model_name = "nvidia/canary-180m-flash"
+    model = ASRModel.from_pretrained(model_name, map_location="cpu")
     make_preprocessor_deterministic(model)
     return model
 
