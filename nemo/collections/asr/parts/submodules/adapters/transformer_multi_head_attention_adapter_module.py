@@ -104,7 +104,9 @@ class TransformerMultiHeadAttentionAdapter(transformer_modules.MultiHeadAttentio
         key = self.pre_norm(keys)
         value = self.pre_norm(values)
 
-        return super().forward(query, key, value, attention_mask)
+        output, extra_output = super().forward(query, key, value, attention_mask)
+
+        return output
 
     def reset_parameters(self):
         with torch.no_grad():

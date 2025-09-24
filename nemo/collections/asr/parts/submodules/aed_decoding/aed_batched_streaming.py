@@ -148,7 +148,6 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     decoder_mems_list,
                     positional_indexes,
                     return_scores=False,
-                    return_xatt_scores=True,
                 )
             )
             next_tokens = torch.argmax(logits[:, -1], dim=-1)
@@ -236,7 +235,6 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     decoder_mems_list,
                     positional_indexes,
                     return_scores=False,
-                    return_xatt_scores=True,
                 )
             )
             next_tokens = torch.argmax(logits[:, -1], dim=-1)
