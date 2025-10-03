@@ -104,7 +104,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
 
     def run_waitk_decoding_step(self, encoded_speech, encoder_input_mask):
         """
-        Run a decoding step for waith streaming policy.
+        Run a decoding step for waitk streaming policy.
         """
         if self.state.decoding_step < 0:
             # first decoding step
