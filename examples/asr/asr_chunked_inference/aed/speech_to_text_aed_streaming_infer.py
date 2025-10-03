@@ -33,7 +33,7 @@ Example usage:
 ```shell
 # TODO: update this example
 python speech_to_text_aed_streaming_infer.py \
-    pretrained_name=nvidia/canary-180m-flash.nemo \
+    pretrained_name=nvidia/canary-1b-v2 \
     model_path=null \
     audio_dir="<optional path to folder of audio files>" \
     dataset_manifest="<optional path to manifest>" \
@@ -133,8 +133,8 @@ class TranscriptionConfig:
     decoding: AEDStreamingDecodingConfig = field(default_factory=AEDStreamingDecodingConfig)
 
     # Config for word / character error rate calculation
-    calculate_wer: bool = True  # for ASR task
-    calculate_bleu: bool = True  # for AST task
+    calculate_wer: bool = True    # for ASR task
+    calculate_bleu: bool = False  # for AST task
     calculate_latency: bool = True
     clean_groundtruth_text: bool = False
     ignore_capitalization: bool = True
@@ -424,7 +424,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
             # get final results for each sample in the batch
             for i in range(batch_size):
-                transcription_idx = model_state.tgt[
+                transcription_idx = model_state.pred_tokens_ids[
                     i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]
                 ]
                 transcription = asr_model.tokenizer.ids_to_text(transcription_idx.tolist()).strip()
@@ -432,7 +432,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 all_hyps.append(transcription)
                 tokens_frame_alignment.append(model_state.tokens_frame_alignment[i])
                 predicted_token_ids.append(
-                    model_state.tgt[i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]]
+                    model_state.pred_tokens_ids[i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]]
                 )
 
     # write predictions to outputfile

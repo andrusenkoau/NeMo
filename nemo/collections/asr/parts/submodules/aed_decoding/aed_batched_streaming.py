@@ -27,7 +27,7 @@ from nemo.utils import logging
 @dataclass
 class AEDStreamingState:
     decoder_input_ids: torch.Tensor = None  # tokens ids of initial AED model prompt
-    tgt: torch.Tensor = None  # buffer with deocoded tokens ids
+    pred_tokens_ids: torch.Tensor = None  # buffer with predicted tokens ids
     decoding_step: int = -1  # current decoding step
     decoder_mems_list: list = None  # decoder caches, helps to reduce the memory usage
     is_last_chunk_batch: torch.Tensor = False  # whether the current chunk is the last speech chunk in the audio
@@ -111,13 +111,13 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         """
         if self.state.decoding_step < 0:
             # first decoding step
-            tgt, batch_size, _ = self.asr_model.decoding.decoding.greedy_search._prepare_for_search(
+            pred_tokens_ids, batch_size, _ = self.asr_model.decoding.decoding.greedy_search._prepare_for_search(
                 self.state.decoder_input_ids,
                 encoded_speech,
             )
-            input_ids = tgt
+            input_ids = pred_tokens_ids
         else:
-            input_ids = self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
 
         self.state.active_samples_inner_loop = (
             torch.ones(self.state.batch_size, dtype=torch.bool, device=self.state.device) * self.state.active_samples
@@ -163,23 +163,23 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             if not torch.any(self.state.active_samples_inner_loop):
                 break
 
-            # write predicted tokens to the tgt tensor
+            # write predicted tokens to the pred_tokens_ids tensor
             torch.where(self.state.active_samples_inner_loop, next_tokens, self.state.eos_tokens, out=next_tokens)
-            self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
+            self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
 
             self.state.decoding_step += input_ids.size(-1)
 
             # check for hallucinations
             if self.decoding_cfg.hallucinations_detector:
                 hallucination_mask = self.detect_hallucinations(
-                    self.state.tgt, self.state.batch_idxs, self.state.current_context_lengths
+                    self.state.pred_tokens_ids, self.state.batch_idxs, self.state.current_context_lengths
                 )
                 if torch.any(hallucination_mask):
                     self.state.active_samples *= torch.logical_not(hallucination_mask)
                     self.state.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
 
             self.state.current_context_lengths += self.state.active_samples_inner_loop
-            input_ids = self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
 
             # disable samples with maximum context length
             samples_with_max_context_length = (
@@ -202,14 +202,14 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         """
         if self.state.decoding_step < 0:
             # first decoding step
-            tgt, batch_size, _ = self.asr_model.decoding.decoding.greedy_search._prepare_for_search(
+            pred_tokens_ids, batch_size, _ = self.asr_model.decoding.decoding.greedy_search._prepare_for_search(
                 self.state.decoder_input_ids,
                 encoded_speech,
             )
-            input_ids = tgt
+            input_ids = pred_tokens_ids
             start_from = 0
         else:
-            input_ids = self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
             start_from = torch.min(self.state.current_context_lengths).item() - 1
 
         decoder_mems_list = self.state.decoder_mems_list
@@ -288,9 +288,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             if not torch.any(self.state.active_samples_inner_loop):
                 break
 
-            # write predicted tokens to the tgt tensor
+            # write predicted tokens to the pred_tokens_ids tensor
             torch.where(self.state.active_samples_inner_loop, next_tokens, self.state.eos_tokens, out=next_tokens)
-            self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
+            self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths] = next_tokens
 
             # update tokens frame alignment based on current encoder step (this alignment is used for LAAL calculation)
             self.state.tokens_frame_alignment[self.state.batch_idxs, self.state.current_context_lengths] = (
@@ -303,7 +303,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             # check for hallucinations
             if self.decoding_cfg.hallucinations_detector:
                 hallucination_mask = self.detect_hallucinations(
-                    self.state.tgt, self.state.batch_idxs, self.state.current_context_lengths
+                    self.state.pred_tokens_ids, self.state.batch_idxs, self.state.current_context_lengths
                 )
                 if torch.any(hallucination_mask):
                     self.state.active_samples *= torch.logical_not(hallucination_mask)
@@ -327,7 +327,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             self.state.decoder_mems_list = decoder_mems_list
             self.state.current_context_lengths += self.state.active_samples_inner_loop
             # TODO model does not predicts any real tokens in the case of first EOS prediction (rare case for batched decoding)
-            input_ids = self.state.tgt[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
 
             # limit number of steps per inner loop if not end of speech
             if self.state.max_tokens_per_alignatt_step is not None:
@@ -339,35 +339,35 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             if not torch.any(self.state.active_samples_inner_loop):
                 break
 
-    def detect_hallucinations(self, tgt, batch_idxs, current_context_lengths):
+    def detect_hallucinations(self, pred_tokens_ids, batch_idxs, current_context_lengths):
 
         ccl = current_context_lengths
         # pattern 1: four consequtive tokens are the same: "a a a a"
         hallucination_mask_1 = (
-            (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 1])
-            * (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 2])
-            * (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 3])
-            * (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 4])
+            (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 1])
+            * (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 2])
+            * (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 3])
+            * (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 4])
         )
         if torch.any(hallucination_mask_1):
             logging.info("!!! hallucination 'a a a a' detected !!!")
         # pattern 2: "a b a b a b"
         hallucination_mask_2 = (
-            (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 2])
-            * (tgt[batch_idxs, ccl - 1] == tgt[batch_idxs, ccl - 3])
-            * (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 4])
-            * (tgt[batch_idxs, ccl - 1] == tgt[batch_idxs, ccl - 5])
+            (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 2])
+            * (pred_tokens_ids[batch_idxs, ccl - 1] == pred_tokens_ids[batch_idxs, ccl - 3])
+            * (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 4])
+            * (pred_tokens_ids[batch_idxs, ccl - 1] == pred_tokens_ids[batch_idxs, ccl - 5])
         )
         if torch.any(hallucination_mask_2):
             logging.info("!!! hallucination 'a b a b a b' detected !!!")
         # pattern 3: "a b c a b c a b c"
         hallucination_mask_3 = (
-            (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 3])
-            * (tgt[batch_idxs, ccl - 1] == tgt[batch_idxs, ccl - 4])
-            * (tgt[batch_idxs, ccl - 2] == tgt[batch_idxs, ccl - 5])
-            * (tgt[batch_idxs, ccl] == tgt[batch_idxs, ccl - 6])
-            * (tgt[batch_idxs, ccl - 1] == tgt[batch_idxs, ccl - 7])
-            * (tgt[batch_idxs, ccl - 2] == tgt[batch_idxs, ccl - 8])
+            (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 3])
+            * (pred_tokens_ids[batch_idxs, ccl - 1] == pred_tokens_ids[batch_idxs, ccl - 4])
+            * (pred_tokens_ids[batch_idxs, ccl - 2] == pred_tokens_ids[batch_idxs, ccl - 5])
+            * (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 6])
+            * (pred_tokens_ids[batch_idxs, ccl - 1] == pred_tokens_ids[batch_idxs, ccl - 7])
+            * (pred_tokens_ids[batch_idxs, ccl - 2] == pred_tokens_ids[batch_idxs, ccl - 8])
         )
         if torch.any(hallucination_mask_3):
             logging.info("!!! hallucination 'a b c a b c a b c' detected !!!")
@@ -530,14 +530,14 @@ def initialize_aed_model_state(
     model_state.batch_idxs = torch.arange(batch_size, dtype=torch.long, device=asr_model.device)
     model_state.current_context_lengths = torch.zeros_like(model_state.batch_idxs) + decoder_input_ids.size(-1)
     model_state.decoder_input_ids = decoder_input_ids[:batch_size]
-    model_state.tgt = torch.full(
+    model_state.pred_tokens_ids = torch.full(
         [batch_size, model_state.max_generation_length],
         asr_model.tokenizer.eos,
         dtype=torch.long,
         device=asr_model.device,
     )
-    model_state.tgt[:, : model_state.decoder_input_ids.size(-1)] = model_state.decoder_input_ids
-    model_state.tokens_frame_alignment = torch.zeros_like(model_state.tgt)
+    model_state.pred_tokens_ids[:, : model_state.decoder_input_ids.size(-1)] = model_state.decoder_input_ids
+    model_state.tokens_frame_alignment = torch.zeros_like(model_state.pred_tokens_ids)
     model_state.active_samples = torch.ones(batch_size, dtype=torch.bool, device=asr_model.device)
     model_state.active_samples_inner_loop = torch.ones(batch_size, dtype=torch.bool, device=asr_model.device)
     model_state.right_context = context_encoder_frames.right
