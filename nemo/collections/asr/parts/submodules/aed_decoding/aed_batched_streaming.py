@@ -60,7 +60,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         """
         Init method.
         Args:
-            asr_model: isntace of ASR model (Canary)
+            asr_model: instance of ASR model (Canary)
             frame_chunk_size: size of the frame chunk
             decoding_cfg: decoding configuration
         """
