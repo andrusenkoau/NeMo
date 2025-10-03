@@ -91,7 +91,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         self.state = prev_batched_state
         self.state.encoder_output_len = encoder_output_len
 
-        # initiall waitk lagging. Applicable for Wait-k and AlignAtt decoding policies. Control the start of the decoding process.
+        # initial waitk lagging. Applicable for Wait-k and AlignAtt decoding policies. Control the start of the decoding process.
         if encoder_output_len.max() // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
             torch.logical_not(self.state.is_last_chunk_batch)
         ):
