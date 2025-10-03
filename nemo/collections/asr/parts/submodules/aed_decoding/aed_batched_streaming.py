@@ -38,7 +38,7 @@ class AEDStreamingState:
     max_tokens_per_alignatt_step: int = (
         None  # maximum number of tokens to be generated for each step of alignatt decoding policy
     )
-    use_avgpool_for_alignatt: bool = True  # use avgpooling for alignatt decoding policy
+    use_avgpool_for_alignatt: bool = False  # use avgpooling for alignatt decoding policy
     tokens_frame_alignment: torch.Tensor = (
         None  # frame alignment of the predicted tokens (used for LAAL calculation in alignatt)
     )
