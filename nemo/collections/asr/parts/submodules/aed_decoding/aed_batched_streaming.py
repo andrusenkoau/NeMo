@@ -130,7 +130,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         else:
             max_generation_length = self.decoding_cfg.max_generation_length
 
-        # inner deocding loop (with same speech chunk)
+        # inner decoding loop (with same speech chunk)
         for i in range(start_from, max_generation_length):
 
             if not decoder_mems_list:
