@@ -71,6 +71,15 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         self.decoding_cfg = decoding_cfg
         self.state = AEDStreamingState()
 
+        # define the decoding method once during initialization
+        if decoding_cfg.streaming_policy == "waitk":
+            self._run_decoding_step = self.run_waitk_decoding_step
+        elif decoding_cfg.streaming_policy == "alignatt":
+            self._run_decoding_step = self.run_alignatt_decoding_step
+        else:
+            raise ValueError("Canary streaming decoding supports only alignatt or waitk decoding policy")
+
+
     def __call__(
         self,
         encoder_output: torch.Tensor,
@@ -94,14 +103,8 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             # need to wait for more speech
             return self.state
 
-        # wait-k streaming decoding policy
-        elif self.decoding_cfg.streaming_policy == "waitk":
-            self.run_waitk_decoding_step(encoded_speech, encoder_input_mask)
-        # alignatt streaming decoding policy
-        elif self.decoding_cfg.streaming_policy == "alignatt":
-            self.run_alignatt_decoding_step(encoded_speech, encoder_input_mask)
-        else:
-            raise ValueError("Canary streaming decoding supports only alignatt or waitk decodong policy")
+        # call the pre-determined decoding method
+        self._run_decoding_step(encoded_speech, encoder_input_mask)
 
         return self.state
 
