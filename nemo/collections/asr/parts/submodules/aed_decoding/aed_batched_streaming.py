@@ -84,17 +84,12 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         self,
         encoder_output: torch.Tensor,
         encoder_output_len: torch.Tensor,
+        encoder_input_mask: torch.Tensor,
         prev_batched_state: AEDStreamingState,
     ) -> AEDStreamingState:
 
         self.state = prev_batched_state
         self.state.encoder_output_len = encoder_output_len
-
-        # prepare encoder embeddings for the decoding
-        # enc_states = encoder_output.permute(0, 2, 1)
-        encoded_speech = self.asr_model.encoder_decoder_proj(encoder_output)
-
-        encoder_input_mask = lens_to_mask(encoder_output_len, encoded_speech.shape[1]).to(encoded_speech.dtype)
 
         # initiall waitk lagging. Applicable for Wait-k and AlignAtt decoding policies. Control the start of the decoding process.
         if encoder_output_len.max() // self.frame_chunk_size < self.decoding_cfg.waitk_lagging and torch.any(
@@ -104,7 +99,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             return self.state
 
         # call the pre-determined decoding method
-        self._run_decoding_step(encoded_speech, encoder_input_mask)
+        self._run_decoding_step(encoder_output, encoder_input_mask)
 
         return self.state
 

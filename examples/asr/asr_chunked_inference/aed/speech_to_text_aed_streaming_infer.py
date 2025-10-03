@@ -79,6 +79,9 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
     SimpleAudioDataset,
     StreamingBatchedAudioBuffer,
 )
+from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
+
+
 from nemo.collections.asr.parts.utils.transcribe_utils import compute_output_filename, setup_model
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -386,20 +389,13 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
 
                 model_state.is_last_chunk_batch = is_last_chunk_batch
 
-                # get processed signal
-                processed_signal, processed_signal_length = asr_model.preprocessor(
-                    input_signal=buffer.samples, length=buffer.context_size_batch.total()
-                )
                 # get encoder output using full buffer [left-chunk-right]
-                encoder_output_with_rc, encoder_output_len_with_rc = asr_model.encoder(
-                    audio_signal=processed_signal, length=processed_signal_length
-                )
-                encoder_output_with_rc = encoder_output_with_rc.transpose(1, 2)  # [B, T, C]
-                # remove extra context from encoder_output (leave only frames corresponding to the chunk)
+                _, encoded_len, enc_states, _ = asr_model(input_signal=buffer.samples, input_signal_length=buffer.context_size_batch.total())
+                # remove right context from encoder output length (only for non-last chunks)
                 encoder_context_batch = buffer.context_size_batch.subsample(factor=encoder_frame2audio_samples)
-                encoder_output = encoder_output_with_rc
-                encoder_output_len = encoder_context_batch.left + encoder_context_batch.chunk
-                encoder_output_len = torch.where(is_last_chunk_batch, encoder_output_len_with_rc, encoder_output_len)
+                encoded_len_no_rc = encoder_context_batch.left + encoder_context_batch.chunk
+                encoded_length_corrected = torch.where(is_last_chunk_batch, encoded_len, encoded_len_no_rc)
+                encoder_input_mask = lens_to_mask(encoded_length_corrected, enc_states.shape[1]).to(enc_states.dtype)
 
                 # keep track of the real frame position in the audio signal
                 model_state.prev_encoder_shift = max(
@@ -408,11 +404,11 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     - context_encoder_frames.chunk,
                     0,
                 )
-
                 # decode only chunk frames (controlled by encoder_context_batch.chunk)
                 model_state = decoding_computer(
-                    encoder_output=encoder_output,
-                    encoder_output_len=encoder_output_len,
+                    encoder_output=enc_states,
+                    encoder_output_len=encoded_length_corrected,
+                    encoder_input_mask=encoder_input_mask,
                     prev_batched_state=model_state,
                 )
                 # move to next sample
