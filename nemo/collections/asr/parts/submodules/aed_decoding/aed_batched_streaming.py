@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import torch
 from omegaconf import OmegaConf
 
-from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, lens_to_mask, parse_multitask_prompt
+from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, parse_multitask_prompt
 from nemo.collections.asr.parts.submodules.multitask_decoding import AEDStreamingDecodingConfig
 from nemo.collections.asr.parts.utils.streaming_utils import ContextSize
 from nemo.utils import logging
