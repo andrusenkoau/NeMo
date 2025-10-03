@@ -32,7 +32,7 @@ class AEDStreamingState:
     decoder_mems_list: list = None  # decoder caches, helps to reduce the memory usage
     is_last_chunk_batch: torch.Tensor = False  # whether the current chunk is the last speech chunk in the audio
     max_generation_length: int = (
-        512  # maximum number of tokens to be generated for each sample (can be bigger for long audio)
+        256  # maximum number of tokens to be generated for each sample (can be bigger for long audio)
     )
     max_tokens_per_one_second: int = 10  # maximum number of tokens to be generated per one second of audio
     max_tokens_per_alignatt_step: int = (
