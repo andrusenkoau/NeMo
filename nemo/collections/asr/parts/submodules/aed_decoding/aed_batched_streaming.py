@@ -79,7 +79,6 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         else:
             raise ValueError("Canary streaming decoding supports only alignatt or waitk decoding policy")
 
-
     def __call__(
         self,
         encoder_output: torch.Tensor,
@@ -115,7 +114,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             )
             input_ids = pred_tokens_ids
         else:
-            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[
+                self.state.batch_idxs, self.state.current_context_lengths - 1
+            ].unsqueeze(-1)
 
         self.state.active_samples_inner_loop = (
             torch.ones(self.state.batch_size, dtype=torch.bool, device=self.state.device) * self.state.active_samples
@@ -177,7 +178,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
                     self.state.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
 
             self.state.current_context_lengths += self.state.active_samples_inner_loop
-            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[
+                self.state.batch_idxs, self.state.current_context_lengths - 1
+            ].unsqueeze(-1)
 
             # disable samples with maximum context length
             samples_with_max_context_length = (
@@ -207,7 +210,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             input_ids = pred_tokens_ids
             start_from = 0
         else:
-            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[
+                self.state.batch_idxs, self.state.current_context_lengths - 1
+            ].unsqueeze(-1)
             start_from = torch.min(self.state.current_context_lengths).item() - 1
 
         decoder_mems_list = self.state.decoder_mems_list
@@ -325,7 +330,9 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             self.state.decoder_mems_list = decoder_mems_list
             self.state.current_context_lengths += self.state.active_samples_inner_loop
             # TODO model does not predicts any real tokens in the case of first EOS prediction (rare case for batched decoding)
-            input_ids = self.state.pred_tokens_ids[self.state.batch_idxs, self.state.current_context_lengths - 1].unsqueeze(-1)
+            input_ids = self.state.pred_tokens_ids[
+                self.state.batch_idxs, self.state.current_context_lengths - 1
+            ].unsqueeze(-1)
 
             # limit number of steps per inner loop if not end of speech
             if self.state.max_tokens_per_alignatt_step is not None:
@@ -342,7 +349,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
         # we need to have at least 8 tokens to run hallucinations detector
         if self.state.decoding_step < 8:
             return torch.zeros(pred_tokens_ids.shape[0], dtype=torch.bool, device=pred_tokens_ids.device)
-        
+
         ccl = current_context_lengths
         # pattern 1: four consecutive tokens are the same: "a a a a"
         hallucination_mask_1 = (

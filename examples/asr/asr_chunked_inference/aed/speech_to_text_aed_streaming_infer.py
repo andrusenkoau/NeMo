@@ -62,6 +62,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
 from nemo.collections.asr.parts.submodules.aed_decoding import (
     GreedyBatchedStreamingAEDComputer,
     initialize_aed_model_state,
@@ -79,9 +80,6 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
     SimpleAudioDataset,
     StreamingBatchedAudioBuffer,
 )
-from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
-
-
 from nemo.collections.asr.parts.utils.transcribe_utils import compute_output_filename, setup_model
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -136,7 +134,7 @@ class TranscriptionConfig:
     decoding: AEDStreamingDecodingConfig = field(default_factory=AEDStreamingDecodingConfig)
 
     # Config for word / character error rate calculation
-    calculate_wer: bool = True    # for ASR task
+    calculate_wer: bool = True  # for ASR task
     calculate_bleu: bool = False  # for AST task
     calculate_latency: bool = True
     clean_groundtruth_text: bool = False
@@ -390,7 +388,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 model_state.is_last_chunk_batch = is_last_chunk_batch
 
                 # get encoder output using full buffer [left-chunk-right]
-                _, encoded_len, enc_states, _ = asr_model(input_signal=buffer.samples, input_signal_length=buffer.context_size_batch.total())
+                _, encoded_len, enc_states, _ = asr_model(
+                    input_signal=buffer.samples, input_signal_length=buffer.context_size_batch.total()
+                )
                 # remove right context from encoder output length (only for non-last chunks)
                 encoder_context_batch = buffer.context_size_batch.subsample(factor=encoder_frame2audio_samples)
                 encoded_len_no_rc = encoder_context_batch.left + encoder_context_batch.chunk
@@ -428,7 +428,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 all_hyps.append(transcription)
                 tokens_frame_alignment.append(model_state.tokens_frame_alignment[i])
                 predicted_token_ids.append(
-                    model_state.pred_tokens_ids[i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]]
+                    model_state.pred_tokens_ids[
+                        i, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[i]
+                    ]
                 )
 
     # write predictions to outputfile
