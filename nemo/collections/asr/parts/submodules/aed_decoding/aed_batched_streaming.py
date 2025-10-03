@@ -344,7 +344,7 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             return torch.zeros(pred_tokens_ids.shape[0], dtype=torch.bool, device=pred_tokens_ids.device)
         
         ccl = current_context_lengths
-        # pattern 1: four consequtive tokens are the same: "a a a a"
+        # pattern 1: four consecutive tokens are the same: "a a a a"
         hallucination_mask_1 = (
             (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 1])
             * (pred_tokens_ids[batch_idxs, ccl] == pred_tokens_ids[batch_idxs, ccl - 2])
