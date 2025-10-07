@@ -18,6 +18,7 @@ import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
+from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
 from nemo.collections.asr.parts.submodules.aed_decoding import (
     GreedyBatchedStreamingAEDComputer,
     initialize_aed_model_state,
@@ -29,7 +30,6 @@ from nemo.collections.asr.parts.submodules.multitask_decoding import (
 )
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.asr.parts.utils.streaming_utils import ContextSize
-from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
 from tests.collections.asr.decoding.utils import load_audio, make_preprocessor_deterministic
 
 DEVICES = [torch.device("cpu")]
@@ -59,11 +59,9 @@ def get_batch_encoder_outputs_from_records(records, model, device):
         input_batch = torch.nn.utils.rnn.pad_sequence(all_inputs, batch_first=True).to(
             device=device, dtype=torch.float32
         )
-        length_batch = torch.tensor(all_lengths, dtype=torch.int64).to(device)        
+        length_batch = torch.tensor(all_lengths, dtype=torch.int64).to(device)
         # get encoder output using full audio signal
-        _, encoded_length, encoded_output, _ = model(
-            input_signal=input_batch, input_signal_length=length_batch
-        )
+        _, encoded_length, encoded_output, _ = model(input_signal=input_batch, input_signal_length=length_batch)
 
     return encoded_output, encoded_length
 
@@ -143,7 +141,9 @@ def test_multi_task_streaming_decoding(
                 current_len = torch.full_like(encoder_output_len, fill_value=t + chunk_size)
                 current_len = torch.minimum(current_len, encoder_output_len)
                 model_state.is_last_chunk_batch = current_len >= encoder_output_len
-                encoder_input_mask = lens_to_mask(current_len, encoder_output[:, : t + chunk_size].shape[1]).to(encoder_output.dtype)
+                encoder_input_mask = lens_to_mask(current_len, encoder_output[:, : t + chunk_size].shape[1]).to(
+                    encoder_output.dtype
+                )
 
                 model_state = decoding_computer(
                     encoder_output=encoder_output[:, : t + chunk_size],
@@ -160,7 +160,9 @@ def test_multi_task_streaming_decoding(
                 all_hyps.append(transcription)
                 tokens_frame_alignment.append(model_state.tokens_frame_alignment[j])
                 predicted_token_ids.append(
-                    model_state.pred_tokens_ids[j, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[j]]
+                    model_state.pred_tokens_ids[
+                        j, model_state.decoder_input_ids.size(-1) : model_state.current_context_lengths[j]
+                    ]
                 )
 
     # compare decoding results with reference transcripts
