@@ -240,6 +240,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     else:
         assert filepaths is not None
         records = [{"audio_filepath": audio_file} for audio_file in filepaths]
+    assert len(records) > 0, "No audio files found"
 
     asr_model.preprocessor.featurizer.dither = 0.0
     asr_model.preprocessor.featurizer.pad_to = 0
