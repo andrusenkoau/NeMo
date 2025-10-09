@@ -171,9 +171,8 @@ class GreedyBatchedStreamingAEDComputer:
                 hallucination_mask = self.detect_hallucinations(
                     self.state.pred_tokens_ids, self.state.batch_idxs, self.state.current_context_lengths
                 )
-                if torch.any(hallucination_mask):
-                    self.state.active_samples *= torch.logical_not(hallucination_mask)
-                    self.state.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
+                self.state.active_samples *= torch.logical_not(hallucination_mask)
+                self.state.active_samples_inner_loop *= torch.logical_not(hallucination_mask)
 
             self.state.current_context_lengths += self.state.active_samples_inner_loop
             input_ids = self.state.pred_tokens_ids[
