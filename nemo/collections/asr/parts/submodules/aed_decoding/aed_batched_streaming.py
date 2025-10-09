@@ -345,7 +345,7 @@ class GreedyBatchedStreamingAEDComputer:
     def detect_hallucinations(self, pred_tokens_ids, batch_idxs, current_context_lengths):
 
         # we need to have at least 8 tokens to run hallucinations detector
-        if self.state.decoding_step < 8:
+        if torch.any(current_context_lengths < 8):
             return torch.zeros(pred_tokens_ids.shape[0], dtype=torch.bool, device=pred_tokens_ids.device)
 
         ccl = current_context_lengths
