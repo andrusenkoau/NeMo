@@ -64,7 +64,6 @@ from tqdm.auto import tqdm
 from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
 from nemo.collections.asr.parts.submodules.aed_decoding import (
     GreedyBatchedStreamingAEDComputer,
-    initialize_aed_model_state,
     return_decoder_input_ids,
 )
 from nemo.collections.asr.parts.submodules.multitask_decoding import (
@@ -314,7 +313,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             device = audio_batch.device
 
             # initialize aed model state
-            model_state = initialize_aed_model_state(
+            model_state = GreedyBatchedStreamingAEDComputer.initialize_aed_model_state(
                 asr_model=asr_model,
                 decoder_input_ids=decoder_input_ids,
                 batch_size=batch_size,

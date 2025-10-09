@@ -467,6 +467,57 @@ class GreedyBatchedStreamingAEDComputer:
             laal_list.append(laal)
         return laal_list
 
+    @classmethod
+    def initialize_aed_model_state(
+        cls,
+        asr_model,
+        decoder_input_ids: torch.Tensor,
+        batch_size: int,
+        context_encoder_frames: ContextSize,
+        chunk_secs: float,
+        right_context_secs: float,
+    ) -> AEDStreamingState:
+        """
+        Initialize AED model state for streaming inference.
+
+        Args:
+            asr_model: ASR model instance (used for tokenizer and device)
+            decoder_input_ids: Prompt tensor for decoder input
+            batch_size: Batch size for inference
+            context_encoder_frames: Context size configuration
+
+        Returns:
+            Initialized AEDStreamingState object
+        """
+        # initialize AED model state
+        model_state = AEDStreamingState(decoder_input_ids=decoder_input_ids, device=asr_model.device)
+
+        model_state.frame_chunk_size = context_encoder_frames.chunk
+        model_state.batch_idxs = torch.arange(batch_size, dtype=torch.long, device=asr_model.device)
+        model_state.current_context_lengths = torch.zeros_like(model_state.batch_idxs) + decoder_input_ids.size(-1)
+        model_state.decoder_input_ids = decoder_input_ids[:batch_size]
+        model_state.pred_tokens_ids = torch.full(
+            [batch_size, model_state.max_generation_length],
+            asr_model.tokenizer.eos,
+            dtype=torch.long,
+            device=asr_model.device,
+        )
+        model_state.pred_tokens_ids[:, : model_state.decoder_input_ids.size(-1)] = model_state.decoder_input_ids
+        model_state.tokens_frame_alignment = torch.zeros_like(model_state.pred_tokens_ids)
+        model_state.active_samples = torch.ones(batch_size, dtype=torch.bool, device=asr_model.device)
+        model_state.active_samples_inner_loop = torch.ones(batch_size, dtype=torch.bool, device=asr_model.device)
+        model_state.right_context = context_encoder_frames.right
+        model_state.eos_tokens = torch.full(
+            [batch_size], asr_model.tokenizer.eos, dtype=torch.long, device=asr_model.device
+        )
+        model_state.avgpool2d = torch.nn.AvgPool2d(5, stride=1, padding=2, count_include_pad=False)
+        model_state.batch_size = batch_size
+        model_state.max_tokens_per_alignatt_step = model_state.max_tokens_per_one_second * int(
+            chunk_secs + right_context_secs
+        )
+
+        return model_state
+
 
 def return_decoder_input_ids(decoding_config, asr_model) -> torch.Tensor:
     """
@@ -508,53 +559,3 @@ def return_decoder_input_ids(decoding_config, asr_model) -> torch.Tensor:
     )
 
     return decoder_input_ids
-
-
-def initialize_aed_model_state(
-    asr_model,
-    decoder_input_ids: torch.Tensor,
-    batch_size: int,
-    context_encoder_frames: ContextSize,
-    chunk_secs: float,
-    right_context_secs: float,
-) -> AEDStreamingState:
-    """
-    Initialize AED model state for streaming inference.
-
-    Args:
-        asr_model: ASR model instance (used for tokenizer and device)
-        decoder_input_ids: Prompt tensor for decoder input
-        batch_size: Batch size for inference
-        context_encoder_frames: Context size configuration
-
-    Returns:
-        Initialized AEDStreamingState object
-    """
-    # initialize AED model state
-    model_state = AEDStreamingState(decoder_input_ids=decoder_input_ids, device=asr_model.device)
-
-    model_state.frame_chunk_size = context_encoder_frames.chunk
-    model_state.batch_idxs = torch.arange(batch_size, dtype=torch.long, device=asr_model.device)
-    model_state.current_context_lengths = torch.zeros_like(model_state.batch_idxs) + decoder_input_ids.size(-1)
-    model_state.decoder_input_ids = decoder_input_ids[:batch_size]
-    model_state.pred_tokens_ids = torch.full(
-        [batch_size, model_state.max_generation_length],
-        asr_model.tokenizer.eos,
-        dtype=torch.long,
-        device=asr_model.device,
-    )
-    model_state.pred_tokens_ids[:, : model_state.decoder_input_ids.size(-1)] = model_state.decoder_input_ids
-    model_state.tokens_frame_alignment = torch.zeros_like(model_state.pred_tokens_ids)
-    model_state.active_samples = torch.ones(batch_size, dtype=torch.bool, device=asr_model.device)
-    model_state.active_samples_inner_loop = torch.ones(batch_size, dtype=torch.bool, device=asr_model.device)
-    model_state.right_context = context_encoder_frames.right
-    model_state.eos_tokens = torch.full(
-        [batch_size], asr_model.tokenizer.eos, dtype=torch.long, device=asr_model.device
-    )
-    model_state.avgpool2d = torch.nn.AvgPool2d(5, stride=1, padding=2, count_include_pad=False)
-    model_state.batch_size = batch_size
-    model_state.max_tokens_per_alignatt_step = model_state.max_tokens_per_one_second * int(
-        chunk_secs + right_context_secs
-    )
-
-    return model_state

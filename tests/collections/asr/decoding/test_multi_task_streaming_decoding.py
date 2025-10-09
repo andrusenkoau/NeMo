@@ -21,7 +21,6 @@ from tqdm.auto import tqdm
 from nemo.collections.asr.models.aed_multitask_models import lens_to_mask
 from nemo.collections.asr.parts.submodules.aed_decoding import (
     GreedyBatchedStreamingAEDComputer,
-    initialize_aed_model_state,
     return_decoder_input_ids,
 )
 from nemo.collections.asr.parts.submodules.multitask_decoding import (
@@ -127,7 +126,7 @@ def test_multi_task_streaming_decoding(
             )
             local_batch_size = encoder_output_len.shape[0]
             decoder_input_ids = return_decoder_input_ids(streaming_decoding_cfg, model)
-            model_state = initialize_aed_model_state(
+            model_state = GreedyBatchedStreamingAEDComputer.initialize_aed_model_state(
                 asr_model=model,
                 decoder_input_ids=decoder_input_ids,
                 batch_size=local_batch_size,
