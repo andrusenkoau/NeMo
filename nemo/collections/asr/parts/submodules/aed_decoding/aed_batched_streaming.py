@@ -25,24 +25,24 @@ from nemo.utils import logging
 
 @dataclass
 class AEDStreamingState:
-    decoder_input_ids: torch.Tensor = None  # tokens ids of initial AED model prompt
-    pred_tokens_ids: torch.Tensor = None  # buffer with predicted tokens ids
+    decoder_input_ids: torch.Tensor | None = None  # tokens ids of initial AED model prompt
+    pred_tokens_ids: torch.Tensor | None = None  # buffer with predicted tokens ids
     decoding_step: int = -1  # current decoding step
-    decoder_mems_list: list = None  # decoder caches, helps to reduce the memory usage
+    decoder_mems_list: list | None = None  # decoder caches, helps to reduce the memory usage
     is_last_chunk_batch: torch.Tensor = False  # whether the current chunk is the last speech chunk in the audio
     max_generation_length: int = (
         256  # maximum number of tokens to be generated for each sample (can be bigger for long audio)
     )
     max_tokens_per_one_second: int = 10  # maximum number of tokens to be generated per one second of audio
-    max_tokens_per_alignatt_step: int = (
+    max_tokens_per_alignatt_step: int | None = (
         None  # maximum number of tokens to be generated for each step of alignatt decoding policy
     )
     use_avgpool_for_alignatt: bool = False  # use avgpooling for alignatt decoding policy
-    tokens_frame_alignment: torch.Tensor = (
+    tokens_frame_alignment: torch.Tensor | None = (
         None  # frame alignment of the predicted tokens (used for LAAL calculation in alignatt)
     )
     prev_encoder_shift: int = 0  # previous encoder shift (used for LAAL calculation in alignatt)
-    device: torch.device = None
+    device: torch.device | None = None
 
 
 class GreedyBatchedStreamingAEDComputer:
