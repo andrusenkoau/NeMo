@@ -78,8 +78,12 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
     SimpleAudioDataset,
     StreamingBatchedAudioBuffer,
 )
-from nemo.collections.asr.parts.utils.transcribe_utils import get_inference_device, get_inference_dtype
-from nemo.collections.asr.parts.utils.transcribe_utils import compute_output_filename, setup_model
+from nemo.collections.asr.parts.utils.transcribe_utils import (
+    compute_output_filename,
+    get_inference_device,
+    get_inference_dtype,
+    setup_model,
+)
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 
