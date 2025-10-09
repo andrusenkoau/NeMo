@@ -31,7 +31,6 @@ Recommended settings for audio buffer:
 Example usage:
 
 ```shell
-# TODO: update this example
 python speech_to_text_aed_streaming_infer.py \
     pretrained_name=nvidia/canary-1b-v2 \
     model_path=null \
