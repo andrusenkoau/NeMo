@@ -160,6 +160,7 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
             decoder_mems_list, _ = self.decoder.forward(
                 decoder_hidden_states, decoder_input_mask, decoder_mems_list, return_mems=True
             )
+            xatt_scores_list = None
         with self.classifier.with_log_softmax_enabled(return_scores) as clf:
             logits = clf.forward(hidden_states=decoder_mems_list[-1][:, -1:])
 
