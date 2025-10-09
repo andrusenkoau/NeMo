@@ -67,7 +67,6 @@ class GreedyBatchedStreamingAEDComputer:
         self.asr_model = asr_model
         self.frame_chunk_size = frame_chunk_size
         self.decoding_cfg = decoding_cfg
-        self.state = AEDStreamingState()
 
         # define the decoding method once during initialization
         if decoding_cfg.streaming_policy == "waitk":
