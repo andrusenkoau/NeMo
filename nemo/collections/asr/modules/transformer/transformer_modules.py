@@ -125,7 +125,6 @@ class TransformerEmbedding(nn.Module):
             # and make sure that the resulting position_ids are within the
             # range of the positional embedding
             position_ids = position_ids + shift_pos
-            # position_ids = torch.clamp(position_ids, 0, self.max_sequence_length - 1)
 
         token_embeddings = self.token_embedding(input_ids)
         position_embeddings = self.position_embedding(position_ids)
