@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import ABC
 from dataclasses import dataclass
 
 import torch
@@ -46,7 +45,7 @@ class AEDStreamingState:
     device: torch.device = None
 
 
-class GreedyBatchedStreamingAEDComputer(ABC):
+class GreedyBatchedStreamingAEDComputer:
     """
     Batched streaming AED decoding with support for waitk and alignatt decoding policies.
     """
@@ -64,7 +63,6 @@ class GreedyBatchedStreamingAEDComputer(ABC):
             frame_chunk_size: size of the frame chunk
             decoding_cfg: decoding configuration
         """
-        super().__init__()
 
         self.asr_model = asr_model
         self.frame_chunk_size = frame_chunk_size
