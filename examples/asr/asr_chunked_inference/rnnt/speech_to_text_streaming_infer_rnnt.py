@@ -235,6 +235,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         # fix relative paths
         for record in records:
             record["audio_filepath"] = str(filepath_to_absolute(record["audio_filepath"], manifest_dir))
+        records = sorted(records, key=lambda x: x['duration'], reverse=True)
     else:
         assert filepaths is not None
         records = [{"audio_filepath": audio_file} for audio_file in filepaths]
@@ -347,7 +348,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 encoder_context_batch = buffer.context_size_batch.subsample(factor=encoder_frame2audio_samples)
                 # remove left context
                 encoder_output = encoder_output[:, encoder_context.left :]
-
+                
                 # decode only chunk frames
                 chunk_batched_hyps, _, state = decoding_computer(
                     x=encoder_output,
@@ -379,9 +380,20 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             )
             all_hyps[i] = hyp
 
-    output_filename, pred_text_attr_name = write_transcription(
-        all_hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, timestamps=cfg.timestamps
-    )
+    # write predictions to outputfile
+    # import ipdb; ipdb.set_trace()
+    import json
+    output_filename = cfg.output_filename
+    Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
+    pred_text_attr_name = "pred_text"
+    with open(output_filename, "w") as out_f:
+        for i, record in enumerate(records):
+            record[pred_text_attr_name] = all_hyps[i].text
+            out_f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    # output_filename, pred_text_attr_name = write_transcription(
+    #     all_hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, timestamps=cfg.timestamps
+    # )
     logging.info(f"Finished writing predictions to {output_filename}!")
 
     if cfg.calculate_wer:
