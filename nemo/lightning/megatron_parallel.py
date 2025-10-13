@@ -54,7 +54,7 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as McoreDDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
+#from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
 from megatron.core.transformer.transformer_config import TransformerConfig
 from torch import Tensor, nn
 from typing_extensions import override
