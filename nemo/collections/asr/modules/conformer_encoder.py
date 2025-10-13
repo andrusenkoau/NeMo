@@ -820,6 +820,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     att_mask = att_mask.triu(diagonal=-att_context_size[0])
                 if att_context_size[1] >= 0:
                     att_mask = att_mask.tril(diagonal=att_context_size[1])
+
             elif self.att_context_style == "chunked_limited":
                 # When right context is unlimited, just the left side of the masking need to get updated
                 if att_context_size[1] == -1:
