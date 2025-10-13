@@ -800,6 +800,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     att_mask = att_mask.triu(diagonal=-att_context_size[0])
                 if att_context_size[1] >= 0:
                     att_mask = att_mask.tril(diagonal=att_context_size[1])
+
             elif self.att_context_style == "chunked_limited":
                 # When right context is unlimited, just the left side of the masking need to get updated
                 if att_context_size[1] == -1:
@@ -820,6 +821,39 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         torch.le(diff_chunks, left_chunks_num), torch.ge(diff_chunks, 0)
                     )
                     att_mask = torch.logical_and(att_mask, chunked_limited_mask.unsqueeze(0))
+
+            elif self.att_context_style == "chunked_limited_with_rigth_context":
+                assert len(att_context_size) == 3, "att_context_size must have 3 elements: [left_context, chunk_size, right_context]"
+                
+                left_context_frames = att_context_size[0]
+                chunk_size_frames = att_context_size[1]
+                right_context_frames = att_context_size[2]
+
+                # Calculate chunk index for each frame (which processing group it belongs to)
+                frame_idx = torch.arange(0, max_audio_length, dtype=torch.int, device=att_mask.device)
+                chunk_idx = torch.div(frame_idx, chunk_size_frames, rounding_mode="trunc")
+
+                # For each chunk i, the visible window is:
+                # Start: chunk_i * chunk_size_frames - left_context_frames
+                # End: chunk_i * chunk_size_frames + chunk_size_frames - 1 + right_context_frames
+
+                window_start = chunk_idx * chunk_size_frames - left_context_frames
+                window_start = torch.maximum(window_start, torch.zeros_like(window_start))
+
+                window_end = chunk_idx * chunk_size_frames + chunk_size_frames - 1 + right_context_frames
+                window_end = torch.minimum(window_end, torch.full_like(window_end, max_audio_length - 1))
+
+                # Create the mask: frame i can see frame j if window_start[i] <= j <= window_end[i]
+                j_indices = frame_idx.unsqueeze(0)  # [1, T]
+                window_start_expanded = window_start.unsqueeze(1)  # [T, 1]
+                window_end_expanded = window_end.unsqueeze(1)      # [T, 1]
+
+                chunked_limited_mask = torch.logical_and(
+                    j_indices >= window_start_expanded,
+                    j_indices <= window_end_expanded
+                )
+                att_mask = torch.logical_and(att_mask, chunked_limited_mask.unsqueeze(0))
+
         else:
             att_mask = None
 
