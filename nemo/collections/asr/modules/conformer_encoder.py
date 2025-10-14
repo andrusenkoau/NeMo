@@ -617,10 +617,18 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 (audio_signal.size(0),), audio_signal.size(-1), dtype=torch.int64, device=audio_signal.device
             )
 
+        dcc_chunk = None
         # select a random att_context_size with the distribution specified by att_context_probs during training
         # for non-validation cases like test, validation or inference, it uses the first mode in self.att_context_size
         if self.training and len(self.att_context_size_all) > 1:
             cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
+            if self.att_context_style == "chunked_limited_with_rc":
+                if random.random() < self.unified_asr_prob:
+                    # offline mode
+                    cur_att_context_size = [-1, -1, -1]
+                else:
+                    # streaming mode
+                    dcc_chunk = cur_att_context_size[1] # chunk size for dynamic chunked convolution
         else:
             cur_att_context_size = self.att_context_size
 
@@ -687,6 +695,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 pad_mask=pad_mask,
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
+                dcc_chunk=dcc_chunk,
             )
 
             if cache_last_channel_cur is not None:
@@ -822,7 +831,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     )
                     att_mask = torch.logical_and(att_mask, chunked_limited_mask.unsqueeze(0))
 
-            elif self.att_context_style == "chunked_limited_with_rigth_context":
+            elif self.att_context_style == "chunked_limited_with_rc" and sum(att_context_size) != -3:
                 assert len(att_context_size) == 3, "att_context_size must have 3 elements: [left_context, chunk_size, right_context]"
                 
                 left_context_frames = att_context_size[0]

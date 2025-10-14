@@ -13,9 +13,11 @@
 # limitations under the License.
 #
 
+from re import X
 import torch
 from torch import nn as nn
 from torch.nn import LayerNorm
+import torch.nn.functional as F
 
 from nemo.collections.asr.parts.submodules.adapters.attention_adapter_mixin import AttentionAdapterModuleMixin
 from nemo.collections.asr.parts.submodules.batchnorm import FusedBatchNorm1d
@@ -157,7 +159,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, dcc_chunk=None):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -166,6 +168,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             pad_mask (torch.tensor): padding mask
             cache_last_channel (torch.tensor) : cache for MHA layers (B, T_cache, d_model)
             cache_last_time (torch.tensor) : cache for convolutional layers (B, d_model, T_cache)
+            dcc_chunk (int) : chunk size for dynamic chunked convolution
         Returns:
             x (torch.Tensor): (B, T, d_model)
             cache_last_channel (torch.tensor) : next cache for MHA layers (B, T_cache, d_model)
@@ -203,7 +206,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             residual = pack_input['x']
 
         x = self.norm_conv(residual)
-        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time)
+        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
         if cache_last_time is not None:
             (x, cache_last_time) = x
         residual = residual + self.dropout(x)
@@ -263,6 +266,7 @@ class ConformerConvolution(nn.Module):
 
         if conv_context_size is None:
             conv_context_size = (kernel_size - 1) // 2
+        self.conv_context_size = conv_context_size
 
         if pointwise_activation in activation_registry:
             self.pointwise_activation = activation_registry[pointwise_activation]()
@@ -317,33 +321,104 @@ class ConformerConvolution(nn.Module):
             bias=self.use_bias,
         )
 
-    def forward(self, x, pad_mask=None, cache=None):
-        x = x.transpose(1, 2)
-        x = self.pointwise_conv1(x)
+    def forward(self, x, pad_mask=None, cache=None, dcc_chunk=None):
+        
+        if dcc_chunk is not None:
+            # apply dynamic chunked convolution with the config (only during training)
+            chunk_size = dcc_chunk
+            batch_size = x.size(0)
+            
+            # define right padding for the last chunk
+            if x.shape[1] % chunk_size != 0:
+                final_right_padding = chunk_size - (x.shape[1] % chunk_size)
+            else:
+                final_right_padding = 0
 
-        # Compute the activation function or use GLU for original Conformer
-        if self.pointwise_activation == 'glu_':
-            x = nn.functional.glu(x, dim=1)
-        else:
-            x = self.pointwise_activation(x)
+            x = x.transpose(1, 2) # [B, T, D] -> [B, D, T]
+            x = self.pointwise_conv1(x)
 
-        if pad_mask is not None:
-            x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+            # Compute the activation function or use GLU for original Conformer
+            if self.pointwise_activation == 'glu_':
+                x = nn.functional.glu(x, dim=1)
+            else:
+                x = self.pointwise_activation(x)
 
-        x = self.depthwise_conv(x, cache=cache)
-        if cache is not None:
-            x, cache = x
+            x = F.pad(x, (self.conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
 
-        if self.norm_type == "layer_norm":
+            # split the tensor into chunks
+            x = x.unfold(2, size=chunk_size + self.conv_context_size, step=chunk_size)
+
+            # add padding to the last chunk
+            x = F.pad(x, (0, self.conv_context_size), value=0)
+
+            # -> [batch_size, num_chunks, in_channels, lc+chunk_size+rpad]
             x = x.transpose(1, 2)
-            x = self.batch_norm(x)
-            x = x.transpose(1, 2)
-        else:
-            x = self.batch_norm(x)
 
-        x = self.activation(x)
-        x = self.pointwise_conv2(x)
-        x = x.transpose(1, 2)
+            # -> [batch_size * num_chunks, in_channels, lc+chunk_size+rpad]
+            x = x.flatten(start_dim=0, end_dim=1)
+
+            # we are using only weigth from depthwise convolution
+            x = F.conv1d(
+                x,
+                weight=self.depthwise_conv.weight,
+                bias=self.depthwise_conv.bias,
+                stride=self.depthwise_conv.stride,
+                padding=0,
+                dilation=self.depthwise_conv.dilation,
+                groups=self.depthwise_conv.groups,
+            )
+
+            if self.norm_type == "layer_norm":
+                x = x.transpose(1, 2)
+                x = self.batch_norm(x)
+                x = x.transpose(1, 2)
+            else:
+                x = self.batch_norm(x)
+
+            x = self.activation(x)
+            x = self.pointwise_conv2(x)
+
+            # -> [batch_size * num_chunks, chunk_size, out_channels]
+            x = x.transpose(1, 2)
+
+            # -> [batch_size, num_chunks, chunk_size, out_channels]
+            x = torch.unflatten(x, dim=0, sizes=(batch_size, -1))
+
+            # -> [batch_size, t + final_right_padding, out_channels]
+            x = torch.flatten(x, start_dim=1, end_dim=2)
+
+            # -> [batch_size, t, out_channels]
+            if final_right_padding > 0:
+                x = x[:, :-final_right_padding, :]
+
+        else:
+            # original Conformer convolution with standard and causal padding
+            x = x.transpose(1, 2)
+            x = self.pointwise_conv1(x)
+
+            # Compute the activation function or use GLU for original Conformer
+            if self.pointwise_activation == 'glu_':
+                x = nn.functional.glu(x, dim=1)
+            else:
+                x = self.pointwise_activation(x)
+
+            if pad_mask is not None:
+                x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+
+            x = self.depthwise_conv(x, cache=cache)
+            if cache is not None:
+                x, cache = x
+
+            if self.norm_type == "layer_norm":
+                x = x.transpose(1, 2)
+                x = self.batch_norm(x)
+                x = x.transpose(1, 2)
+            else:
+                x = self.batch_norm(x)
+
+            x = self.activation(x)
+            x = self.pointwise_conv2(x)
+            x = x.transpose(1, 2)
         if cache is None:
             return x
         else:
