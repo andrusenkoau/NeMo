@@ -314,6 +314,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_probs=None,
         att_chunk_context_size=None,
         att_context_style='regular',
+        unified_asr_prob=None,
         xscaling=True,
         untie_biases=True,
         pos_emb_max_len=5000,
@@ -342,6 +343,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.n_layers = n_layers
         self._feat_in = feat_in
         self.att_context_style = att_context_style
+        self.unified_asr_prob = unified_asr_prob
         self.subsampling_factor = subsampling_factor
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
 
@@ -1047,6 +1049,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         else:
             sampling_frames = 0
 
+        # import pdb; pdb.set_trace()
+        
         if isinstance(sampling_frames, list):
             streaming_cfg.chunk_size = [
                 sampling_frames[0] + self.subsampling_factor * lookahead_steps,

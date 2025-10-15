@@ -31,6 +31,8 @@ from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.collections.common.parts.utils import activation_registry
 from nemo.core.classes.mixins import AccessMixin
 
+from nemo.utils import logging
+
 __all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer']
 
 
@@ -327,7 +329,11 @@ class ConformerConvolution(nn.Module):
             # apply dynamic chunked convolution with the config (only during training)
             chunk_size = dcc_chunk
             batch_size = x.size(0)
-            
+            if isinstance(self.conv_context_size, list):
+                conv_context_size = self.conv_context_size[0]
+            else:
+                conv_context_size = self.conv_context_size
+
             # define right padding for the last chunk
             if x.shape[1] % chunk_size != 0:
                 final_right_padding = chunk_size - (x.shape[1] % chunk_size)
@@ -343,13 +349,18 @@ class ConformerConvolution(nn.Module):
             else:
                 x = self.pointwise_activation(x)
 
-            x = F.pad(x, (self.conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
+            # logging.warning("*********"*10)
+            # logging.warning(f"x.shape: {x.shape}")
+            # logging.warning(f"self.conv_context_size: {self.conv_context_size}")
+            # logging.warning(f"conv_context_size: {conv_context_size}")
+
+            x = F.pad(x, (conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
 
             # split the tensor into chunks
-            x = x.unfold(2, size=chunk_size + self.conv_context_size, step=chunk_size)
+            x = x.unfold(2, size=chunk_size + conv_context_size, step=chunk_size)
 
             # add padding to the last chunk
-            x = F.pad(x, (0, self.conv_context_size), value=0)
+            x = F.pad(x, (0, conv_context_size), value=0)
 
             # -> [batch_size, num_chunks, in_channels, lc+chunk_size+rpad]
             x = x.transpose(1, 2)
