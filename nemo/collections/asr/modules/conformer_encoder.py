@@ -928,7 +928,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         raise ValueError(
                             f"Right context (att_context_size[{i}][1]) can not be unlimited for chunked_limited style!"
                         )
-                if conv_context_style == "dynamic_chunked" and att_context_style == "chunked_limited_with_rc":
+                if conv_context_style == "dynamic_chunked" and att_context_style == "chunked_limited_with_rc" and att_cs[2] != 0:
                     assert (conv_kernel_size - 1) / 2 <=  att_cs[2], f"(conv_kernel_size - 1) / 2 must be less than or equal to right context"
         else:
             att_context_size_all = [[-1, -1]]

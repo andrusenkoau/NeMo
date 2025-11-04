@@ -53,6 +53,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+import time
 
 import lightning.pytorch as pl
 import torch
@@ -295,6 +296,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     with torch.no_grad(), torch.inference_mode():
         all_hyps = []
         audio_data: AudioBatch
+        start_time = time.time()
         for audio_data in tqdm(audio_dataloader):
             # get audio
             # NB: preprocessor runs on torch.float32, no need to cast dtype here
@@ -367,6 +369,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 right_sample = min(right_sample + context_samples.chunk, audio_batch.shape[1])  # add next chunk
 
             all_hyps.extend(batched_hyps_to_hypotheses(current_batched_hyps, None, batch_size=batch_size))
+        end_time = time.time()
 
     # convert text
     for i, hyp in enumerate(all_hyps):
@@ -409,6 +412,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
             logging.info(f"{total_res}")
 
+    logging.info(f"The whole streaming inference process took: {round(end_time - start_time, 2)}s")
+    
     return cfg
 
 
