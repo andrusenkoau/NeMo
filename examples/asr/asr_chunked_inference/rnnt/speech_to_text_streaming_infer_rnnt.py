@@ -53,6 +53,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+import time
 
 # NB: PYTORCH_CUDA_ALLOC_CONF should be set before importing pytorch / nemo
 # using expandable_segments can save more than 10x GPU memory when using small chunks
@@ -516,6 +517,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
             logging.info(f"{total_res}")
 
+    logging.info(f"The whole streaming inference process took: {round(end_time - start_time, 2)}s")
+    
     return cfg
 
 
