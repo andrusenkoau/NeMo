@@ -336,9 +336,11 @@ class ConformerConvolution(nn.Module):
 
             # define right padding for the last chunk
             if x.shape[1] % chunk_size != 0:
-                final_right_padding = chunk_size - (x.shape[1] % chunk_size)
+                final_right_padding = chunk_size - (x.shape[1] % chunk_size) + conv_context_size
+                final_chunk_padding = chunk_size - (x.shape[1] % chunk_size)
             else:
-                final_right_padding = 0
+                final_right_padding = conv_context_size
+                final_chunk_padding = 0
 
             x = x.transpose(1, 2) # [B, T, D] -> [B, D, T]
             x = self.pointwise_conv1(x)
@@ -353,14 +355,24 @@ class ConformerConvolution(nn.Module):
             # logging.warning(f"x.shape: {x.shape}")
             # logging.warning(f"self.conv_context_size: {self.conv_context_size}")
             # logging.warning(f"conv_context_size: {conv_context_size}")
+            # logging.warning(f"final_right_padding: {final_right_padding}")
+            # logging.warning(f"final_chunk_padding: {final_chunk_padding}")
+            # logging.warning(f"chunk_size: {chunk_size}")
+
+            # raise ValueError("Stop here")
 
             x = F.pad(x, (conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
+            # logging.warning(f"x.shape after padding 1: {x.shape}")
 
             # split the tensor into chunks
-            x = x.unfold(2, size=chunk_size + conv_context_size, step=chunk_size)
+            x = x.unfold(2, size=conv_context_size + chunk_size + conv_context_size, step=chunk_size)
 
-            # add padding to the last chunk
-            x = F.pad(x, (0, conv_context_size), value=0)
+            # logging.warning(f"conv_context_size + chunk_size + right_chunk_context: {conv_context_size + chunk_size + conv_context_size}")
+            # logging.warning(f"x.shape after unfold: {x.shape}")
+
+            # # -> [batch_size, in_channels, num_chunks, lc+chunk_size+rpad]
+            # x = F.pad(x, (0, conv_context_size), value=0)
+            # logging.warning(f"x.shape after padding 2: {x.shape}")
 
             # -> [batch_size, num_chunks, in_channels, lc+chunk_size+rpad]
             x = x.transpose(1, 2)
@@ -379,6 +391,8 @@ class ConformerConvolution(nn.Module):
                 groups=self.depthwise_conv.groups,
             )
 
+            # logging.warning(f"x.shape after depthwise conv: {x.shape}")
+
             if self.norm_type == "layer_norm":
                 x = x.transpose(1, 2)
                 x = self.batch_norm(x)
@@ -389,8 +403,11 @@ class ConformerConvolution(nn.Module):
             x = self.activation(x)
             x = self.pointwise_conv2(x)
 
-            # -> [batch_size * num_chunks, chunk_size, out_channels]
+            # -> [batch_size * num_chunks, chunk_size+right_context, out_channels]
             x = x.transpose(1, 2)
+
+            # # -> [batch_size * num_chunks, chunk_size, out_channels]
+            # x = x[:, :chunk_size, :]
 
             # -> [batch_size, num_chunks, chunk_size, out_channels]
             x = torch.unflatten(x, dim=0, sizes=(batch_size, -1))
@@ -399,8 +416,8 @@ class ConformerConvolution(nn.Module):
             x = torch.flatten(x, start_dim=1, end_dim=2)
 
             # -> [batch_size, t, out_channels]
-            if final_right_padding > 0:
-                x = x[:, :-final_right_padding, :]
+            if final_chunk_padding > 0:
+                x = x[:, :-final_chunk_padding, :]
 
         else:
             # original Conformer convolution with standard and causal padding
