@@ -222,6 +222,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         if not isinstance(asr_model, EncDecRNNTModel) and not isinstance(asr_model, EncDecHybridRNNTCTCModel):
             raise ValueError("The script supports rnnt model and hybrid model with rnnt decodng!")
         else:
+            asr_model.encoder.set_default_att_context_size(att_context_size=[70,100,13])
             # rnnt model
             if isinstance(asr_model, EncDecRNNTModel):
                 asr_model.change_decoding_strategy(cfg.decoding)
@@ -230,6 +231,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             if hasattr(asr_model, 'cur_decoder'):
                 asr_model.change_decoding_strategy(cfg.decoding, decoder_type='rnnt')
 
+    set_duration = None
     if manifest is not None:
         records = read_manifest(manifest)
         manifest_dir = Path(manifest).parent.absolute()
@@ -237,6 +239,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         for record in records:
             record["audio_filepath"] = str(filepath_to_absolute(record["audio_filepath"], manifest_dir))
         records = sorted(records, key=lambda x: x['duration'], reverse=True)
+        set_duration = sum(float(record['duration']) for record in records)
     else:
         assert filepaths is not None
         records = [{"audio_filepath": audio_file} for audio_file in filepaths]
@@ -413,6 +416,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             logging.info(f"{total_res}")
 
     logging.info(f"The whole streaming inference process took: {round(end_time - start_time, 2)}s")
+    if set_duration is not None:
+        # compte RTFx
+        logging.info(f"RTFx: {int(set_duration / (end_time - start_time))}")
     
     return cfg
 
