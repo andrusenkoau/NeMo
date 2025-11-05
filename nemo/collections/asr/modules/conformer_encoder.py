@@ -633,8 +633,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 if random.random() < self.unified_asr_prob:
                     # offline mode
                     cur_att_context_size = [-1, -1, -1]
-                else:
-                    # streaming mode
+                elif self.conv_context_style == "dynamic_chunked":
+                    # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
                     # dcc_chunk = int(cur_att_context_size[1] + (self.conv_kernel_size - 1) / 2)
                     dcc_chunk = cur_att_context_size[1]
         else:
@@ -670,6 +670,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             offset = None
 
         audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
+
+        # import ipdb; ipdb.set_trace()
 
         # Create the self-attention and padding masks
         pad_mask, att_mask = self._create_masks(
