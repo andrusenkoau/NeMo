@@ -75,6 +75,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
         conv_context_size=None,
+        conv_context_style="regular",
         dropout=0.1,
         dropout_att=0.1,
         pos_bias_u=None,
@@ -103,6 +104,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.conv = ConformerConvolution(
             d_model=d_model,
             kernel_size=conv_kernel_size,
+            conv_context_style=conv_context_style,
             norm_type=conv_norm_type,
             conv_context_size=conv_context_size,
             use_bias=use_bias,
@@ -254,6 +256,7 @@ class ConformerConvolution(nn.Module):
         self,
         d_model,
         kernel_size,
+        conv_context_style="regular",
         norm_type='batch_norm',
         conv_context_size=None,
         pointwise_activation='glu_',
@@ -263,6 +266,7 @@ class ConformerConvolution(nn.Module):
         assert (kernel_size - 1) % 2 == 0
         self.d_model = d_model
         self.kernel_size = kernel_size
+        self.conv_context_style = conv_context_style
         self.norm_type = norm_type
         self.use_bias = use_bias
 
@@ -326,6 +330,10 @@ class ConformerConvolution(nn.Module):
     def forward(self, x, pad_mask=None, cache=None, dcc_chunk=None):
         
         if dcc_chunk is not None:
+            
+            if dcc_chunk and self.conv_context_style == "regular":
+                raise ValueError("dcc_chunk is not supported for regular convolution context style!")
+            
             # apply dynamic chunked convolution with the config (only during training)
             chunk_size = dcc_chunk
             batch_size = x.size(0)
@@ -334,12 +342,17 @@ class ConformerConvolution(nn.Module):
             else:
                 conv_context_size = self.conv_context_size
 
+            if self.conv_context_style == "dcc_rc":
+                right_dcc_context = conv_context_size
+            else:
+                right_dcc_context = 0
+
             # define right padding for the last chunk
             if x.shape[1] % chunk_size != 0:
-                final_right_padding = chunk_size - (x.shape[1] % chunk_size) + conv_context_size
+                final_right_padding = chunk_size - (x.shape[1] % chunk_size) + right_dcc_context
                 final_chunk_padding = chunk_size - (x.shape[1] % chunk_size)
             else:
-                final_right_padding = conv_context_size
+                final_right_padding = right_dcc_context
                 final_chunk_padding = 0
 
             x = x.transpose(1, 2) # [B, T, D] -> [B, D, T]
@@ -351,28 +364,29 @@ class ConformerConvolution(nn.Module):
             else:
                 x = self.pointwise_activation(x)
 
-            logging.warning("*********"*10)
-            logging.warning(f"x.shape: {x.shape}")
-            logging.warning(f"self.conv_context_size: {self.conv_context_size}")
-            logging.warning(f"conv_context_size: {conv_context_size}")
-            logging.warning(f"final_right_padding: {final_right_padding}")
-            logging.warning(f"final_chunk_padding: {final_chunk_padding}")
-            logging.warning(f"chunk_size: {chunk_size}")
+            # logging.warning("*********"*10)
+            # logging.warning(f"x.shape: {x.shape}")
+            # logging.warning(f"self.conv_context_size: {self.conv_context_size}")
+            # logging.warning(f"conv_context_size: {conv_context_size}")
+            # logging.warning(f"right_dcc_context: {right_dcc_context}")
+            # logging.warning(f"final_right_padding: {final_right_padding}")
+            # logging.warning(f"final_chunk_padding: {final_chunk_padding}")
+            # logging.warning(f"chunk_size: {chunk_size}")
 
             # raise ValueError("Stop here")
 
             x = F.pad(x, (conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
-            logging.warning(f"x.shape after padding 1: {x.shape}")
+            # logging.warning(f"x.shape after padding 1: {x.shape}")
 
             # split the tensor into chunks
-            x = x.unfold(2, size=conv_context_size + chunk_size + conv_context_size, step=chunk_size)
+            x = x.unfold(2, size=conv_context_size + chunk_size + right_dcc_context, step=chunk_size)
 
-            logging.warning(f"conv_context_size + chunk_size + right_chunk_context: {conv_context_size + chunk_size + conv_context_size}")
-            logging.warning(f"x.shape after unfold: {x.shape}")
+            # logging.warning(f"conv_context_size + chunk_size + right_dcc_context: {conv_context_size + chunk_size + right_dcc_context}")
+            # logging.warning(f"x.shape after unfold: {x.shape}")
 
             # # -> [batch_size, in_channels, num_chunks, lc+chunk_size+rpad]
             x = F.pad(x, (0, conv_context_size), value=0)
-            logging.warning(f"x.shape after padding 2: {x.shape}")
+            # logging.warning(f"x.shape after padding 2: {x.shape}")
 
             # -> [batch_size, num_chunks, in_channels, lc+chunk_size+rpad]
             x = x.transpose(1, 2)
@@ -391,7 +405,7 @@ class ConformerConvolution(nn.Module):
                 groups=self.depthwise_conv.groups,
             )
 
-            logging.warning(f"x.shape after depthwise conv: {x.shape}")
+            # logging.warning(f"x.shape after depthwise conv: {x.shape}")
 
             if self.norm_type == "layer_norm":
                 x = x.transpose(1, 2)
@@ -407,7 +421,8 @@ class ConformerConvolution(nn.Module):
             x = x.transpose(1, 2)
 
             # # -> [batch_size * num_chunks, chunk_size, out_channels]
-            x = x[:, :chunk_size, :]
+            if self.conv_context_style == "dcc_rc":
+                x = x[:, :chunk_size, :]
 
             # -> [batch_size, num_chunks, chunk_size, out_channels]
             x = torch.unflatten(x, dim=0, sizes=(batch_size, -1))
