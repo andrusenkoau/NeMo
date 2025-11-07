@@ -222,7 +222,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         if not isinstance(asr_model, EncDecRNNTModel) and not isinstance(asr_model, EncDecHybridRNNTCTCModel):
             raise ValueError("The script supports rnnt model and hybrid model with rnnt decodng!")
         else:
-            asr_model.encoder.set_default_att_context_size(att_context_size=[70,100,13])
+            if asr_model.cfg.encoder.att_context_style == 'chunked_limited_with_rc':
+                asr_model.encoder.set_default_att_context_size(att_context_size=[70,1000,13])
             # rnnt model
             if isinstance(asr_model, EncDecRNNTModel):
                 asr_model.change_decoding_strategy(cfg.decoding)
