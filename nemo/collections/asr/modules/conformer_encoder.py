@@ -307,6 +307,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_probs=None,
         att_chunk_context_size=None,
         att_context_style='regular',
+        skip_att_chunk_rc_prob=0.0,
         unified_asr_prob=None,
         xscaling=True,
         untie_biases=True,
@@ -336,6 +337,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.n_layers = n_layers
         self._feat_in = feat_in
         self.att_context_style = att_context_style
+        self.skip_chunk_rc_prob = skip_att_chunk_rc_prob
         self.unified_asr_prob = unified_asr_prob
         self.subsampling_factor = subsampling_factor
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
@@ -659,7 +661,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     dcc_chunk = cur_att_context_size[1]
         else:
             if self.att_context_style == "chunked_limited_with_rc":
-                cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
+                if self.training:
+                    cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
+                else:
+                    cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
+                    # cur_att_context_size = self.att_context_size
                 # logging.info(f"cur_att_context_size: {cur_att_context_size}")
             else:
                 cur_att_context_size = self.att_context_size
@@ -888,6 +894,15 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 window_start = torch.maximum(window_start, torch.zeros_like(window_start))
 
                 window_end = chunk_idx * chunk_size_frames + chunk_size_frames - 1 + right_context_frames
+
+                # skip right context for some chunks with skip_att_chunk_rc_prob (only for training stage)
+                
+                if self.training and self.skip_att_chunk_rc_prob > 0.0:
+                    chunks_num = max_audio_length // chunk_size_frames
+                    for chunk_step in range(chunks_num):
+                        if random.random() < self.skip_att_chunk_rc_prob:
+                            window_end[chunk_step*chunk_size_frames:chunk_step*chunk_size_frames+chunk_size_frames] -= right_context_frames
+                
                 window_end = torch.minimum(window_end, torch.full_like(window_end, max_audio_length - 1))
 
                 # Create the mask: frame i can see frame j if window_start[i] <= j <= window_end[i]
