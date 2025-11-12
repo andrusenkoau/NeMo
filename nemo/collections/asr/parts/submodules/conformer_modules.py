@@ -183,6 +183,8 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         x = self.feed_forward1(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
+        # import ipdb; ipdb.set_trace()
+
         x = self.norm_self_att(residual)
         if self.self_attention_model == 'rel_pos':
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
@@ -364,6 +366,9 @@ class ConformerConvolution(nn.Module):
             else:
                 x = self.pointwise_activation(x)
 
+            if pad_mask is not None:
+                x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+
             # logging.warning("*********"*10)
             # logging.warning(f"x.shape: {x.shape}")
             # logging.warning(f"self.conv_context_size: {self.conv_context_size}")
@@ -461,7 +466,14 @@ class ConformerConvolution(nn.Module):
 
             x = self.activation(x)
             x = self.pointwise_conv2(x)
+
             x = x.transpose(1, 2)
+
+
+        # # apply padding mask to the final convolution output
+        # if pad_mask is not None:
+        #     x = x.masked_fill(pad_mask.unsqueeze(2), 0.0)
+
         if cache is None:
             return x
         else:
