@@ -897,6 +897,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
                 # skip right context for some chunks with skip_att_chunk_rc_prob (only for training stage)
                 
+                # import ipdb; ipdb.set_trace()
                 if self.training and self.skip_att_chunk_rc_prob > 0.0:
                     chunks_num = max_audio_length // chunk_size_frames
                     for chunk_step in range(chunks_num):
@@ -943,6 +944,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             att_mask = ~att_mask
 
         pad_mask = ~pad_mask
+
+        # import ipdb; ipdb.set_trace()
         return pad_mask, att_mask
 
     def enable_pad_mask(self, on=True):
