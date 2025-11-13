@@ -669,6 +669,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 # logging.info(f"cur_att_context_size: {cur_att_context_size}")
             else:
                 cur_att_context_size = self.att_context_size
+                # cur_att_context_size = [-1,-1]
 
         # logging.info(f"self.att_chunk_context_size: {self.att_chunk_context_size}")
         # logging.info(f"cur_att_context_size: {cur_att_context_size}")
