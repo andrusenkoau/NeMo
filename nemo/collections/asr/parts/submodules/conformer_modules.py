@@ -366,8 +366,8 @@ class ConformerConvolution(nn.Module):
             else:
                 x = self.pointwise_activation(x)
 
-            if pad_mask is not None:
-                x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+            # if pad_mask is not None:
+            #     x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
 
             # logging.warning("*********"*10)
             # logging.warning(f"x.shape: {x.shape}")
