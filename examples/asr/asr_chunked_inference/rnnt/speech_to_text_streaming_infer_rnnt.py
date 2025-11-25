@@ -223,7 +223,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             raise ValueError("The script supports rnnt model and hybrid model with rnnt decodng!")
         else:
             if asr_model.cfg.encoder.att_context_style == 'chunked_limited_with_rc':
-                asr_model.encoder.set_default_att_context_size(att_context_size=[70,1000,13])
+                asr_model.encoder.set_default_att_context_size(att_context_size=[70,12,32])
             # rnnt model
             if isinstance(asr_model, EncDecRNNTModel):
                 asr_model.change_decoding_strategy(cfg.decoding)
@@ -355,12 +355,18 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 # remove left context
                 encoder_output = encoder_output[:, encoder_context.left :]
                 
+                # import ipdb; ipdb.set_trace()
                 # decode only chunk frames
                 chunk_batched_hyps, _, state = decoding_computer(
                     x=encoder_output,
                     out_len=encoder_context_batch.chunk,
                     prev_batched_state=state,
                 )
+                # chunk_batched_hyps, _, state = decoding_computer(
+                #     x=encoder_output,
+                #     out_len=encoder_output_len,
+                #     prev_batched_state=state,
+                # )
                 # merge hyps with previous hyps
                 if current_batched_hyps is None:
                     current_batched_hyps = chunk_batched_hyps

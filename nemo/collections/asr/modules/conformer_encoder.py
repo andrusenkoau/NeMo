@@ -664,8 +664,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 if self.training:
                     cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
                 else:
-                    cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
+                    # cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
+                    cur_att_context_size = [-1, -1, -1]
                     # cur_att_context_size = self.att_context_size
+                    # cur_att_context_size = [70,1000,13]
                 # logging.info(f"cur_att_context_size: {cur_att_context_size}")
             else:
                 cur_att_context_size = self.att_context_size
@@ -706,7 +708,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
 
-        # import ipdb; ipdb.set_trace()
+        # logging.warning("*********"*10)
+        # logging.warning(f"audio_signal.shape: {audio_signal.shape}")
+        # logging.warning(f"cur_att_context_size: {cur_att_context_size}")
+        # logging.warning(f"padding_length: {padding_length}")
+        # logging.warning(f"padding_length: {max_audio_length}")
+        # logging.warning(f"offset: {offset}")
+        # raise ValueError("Stop here")
 
         # Create the self-attention and padding masks
         pad_mask, att_mask = self._create_masks(
