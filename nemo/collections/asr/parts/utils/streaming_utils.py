@@ -2240,10 +2240,15 @@ class ContextSizeBatch:
             factor: subsampling factor
         """
         return ContextSizeBatch(
-            left=torch.div(self.left, factor, rounding_mode="floor"),
-            chunk=torch.div(self.chunk, factor, rounding_mode="floor"),
-            right=torch.div(self.right, factor, rounding_mode="floor"),
+            left=torch.div(self.left + factor - 1, factor, rounding_mode="floor"),
+            chunk=torch.div(self.chunk + factor - 1, factor, rounding_mode="floor"),
+            right=torch.div(self.right + factor - 1, factor, rounding_mode="floor"),
         )
+        # return ContextSizeBatch(
+        #     left=torch.div(self.left, factor, rounding_mode="floor"),
+        #     chunk=torch.div(self.chunk, factor, rounding_mode="floor"),
+        #     right=torch.div(self.right, factor, rounding_mode="floor"),
+        # )
 
     def add_frames_(
         self, num_frames_batch: torch.Tensor, is_last_chunk_batch: torch.Tensor, expected_context: "ContextSize"
