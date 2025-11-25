@@ -415,6 +415,7 @@ def main(cfg: TranscriptionConfig):
             all_offline_tran = []
             all_refs_text = []
             batch_size = cfg.batch_size
+            total_audio_duration = 0.0
 
             if cfg.dataset_manifest is not None:
                 manifest_dir = Path(cfg.dataset_manifest).parent
@@ -422,6 +423,7 @@ def main(cfg: TranscriptionConfig):
                 # fix relative paths
                 for item in samples:
                     audio_filepath = Path(item["audio_filepath"])
+                    total_audio_duration += float(item["duration"])
                     if not audio_filepath.is_absolute():
                         item["audio_filepath"] = str(manifest_dir / audio_filepath)
 
@@ -471,6 +473,7 @@ def main(cfg: TranscriptionConfig):
 
         end_time = time.time()
         logging.info(f"The whole streaming process took: {round(end_time - start_time, 2)}s")
+        logging.info(f"RTFx: {round(total_audio_duration / (end_time - start_time), 2)}")
 
         # stores the results including the transcriptions of the streaming inference in a json file
         if cfg.output_manifest is not None and len(all_refs_text) == len(all_streaming_tran):
