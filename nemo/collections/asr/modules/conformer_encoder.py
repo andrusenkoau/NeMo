@@ -307,6 +307,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_probs=None,
         att_chunk_context_size=None,
         att_context_style='regular',
+        att_zero_rc_weight=None,
         skip_att_chunk_rc_prob=0.0,
         unified_asr_prob=None,
         xscaling=True,
@@ -363,6 +364,15 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             self.att_chunk_context_size = att_chunk_context_size
         else:
             self.att_chunk_context_size = None
+
+        # setting up att_rc_weigts:
+        if att_zero_rc_weight is not None and self.att_chunk_context_size[2][0] == 0:
+            assert 0 <= att_zero_rc_weight <= 1, "att_zero_rc_weight must be between 0 and 1!"
+            non_zero_rc_weight = (1 - att_zero_rc_weight) / len(self.att_chunk_context_size[2][1:])
+            self.att_rc_weights = [non_zero_rc_weight] * len(self.att_chunk_context_size[2])
+            self.att_rc_weights[0] = att_zero_rc_weight
+        else:
+            self.att_rc_weights = None
 
         # Setting up the att_context_size
         (
@@ -650,8 +660,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             elif self.att_context_style == "chunked_limited_with_rc":
                 left_context = random.choices(self.att_chunk_context_size[0])[0]
                 middle_context = random.choices(self.att_chunk_context_size[1])[0]
-                right_context = random.choices(self.att_chunk_context_size[2])[0]
+                if self.att_rc_weights is not None:
+                    right_context = random.choices(self.att_chunk_context_size[2], weights=self.att_rc_weights)[0]
+                else:
+                    right_context = random.choices(self.att_chunk_context_size[2])[0]
                 cur_att_context_size = [left_context, middle_context, right_context]
+
+                # logging.info(f"cur_att_context_size: {cur_att_context_size}")
+                # logging.info(f"self.att_rc_weights: {self.att_rc_weights}")
+                # logging.info(f"right_context: {right_context}")
+                # raise ValueError("Stop here")
 
                 if random.random() < self.unified_asr_prob:
                     # pure offline mode with full context
