@@ -444,7 +444,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 )
                 # chunk_batched_hyps, _, state = decoding_computer(
                 #     x=encoder_output,
-                #     out_len=encoder_output_len,
+                #     out_len=encoder_context_batch.chunk,
                 #     prev_batched_state=state,
                 # )
                 # merge hyps with previous hyps
