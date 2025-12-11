@@ -55,6 +55,17 @@ from pathlib import Path
 from typing import Optional
 import time
 
+
+# NB: PYTORCH_CUDA_ALLOC_CONF should be set before importing pytorch / nemo
+alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+if "expandable_segments" not in alloc_conf:
+    if len(alloc_conf) > 0:
+        alloc_conf += ",expandable_segments:True"
+    else:
+        alloc_conf = "expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
+
+
 import lightning.pytorch as pl
 import torch
 from omegaconf import OmegaConf, open_dict
@@ -359,12 +370,16 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 # decode only chunk frames
                 chunk_batched_hyps, _, state = decoding_computer(
                     x=encoder_output,
-                    out_len=encoder_context_batch.chunk,
+                    out_len=torch.where(
+                        is_last_chunk_batch,
+                        encoder_output_len - encoder_context_batch.left,
+                        encoder_context_batch.chunk,
+                    ),
                     prev_batched_state=state,
                 )
                 # chunk_batched_hyps, _, state = decoding_computer(
                 #     x=encoder_output,
-                #     out_len=encoder_output_len,
+                #     out_len=encoder_context_batch.chunk,
                 #     prev_batched_state=state,
                 # )
                 # merge hyps with previous hyps
