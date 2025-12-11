@@ -115,7 +115,18 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         MHA_max_cache_len = att_context_size[0]
 
         if self_attention_model == 'rel_pos':
-            self.self_attn = RelPositionMultiHeadAttention(
+            self.self_attn_offline = RelPositionMultiHeadAttention(
+                n_head=n_heads,
+                n_feat=d_model,
+                dropout_rate=dropout_att,
+                pos_bias_u=pos_bias_u,
+                pos_bias_v=pos_bias_v,
+                max_cache_len=MHA_max_cache_len,
+                use_bias=use_bias,
+                use_pytorch_sdpa=self.use_pytorch_sdpa,
+                use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+            )
+            self.self_attn_streaming = RelPositionMultiHeadAttention(
                 n_head=n_heads,
                 n_feat=d_model,
                 dropout_rate=dropout_att,
@@ -163,7 +174,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, dcc_chunk=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, dcc_chunk=None, self_attention_moe='offline'):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -187,7 +198,29 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
 
         x = self.norm_self_att(residual)
         if self.self_attention_model == 'rel_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            # logging.warning(f"_________________ self_attention_moe: {self_attention_moe}")
+            if self_attention_moe == 'offline':
+                x = self.self_attn_offline(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+                # Zero-contribution from unused streaming expert for DDP compatibility
+                if self.training:
+                    # logging.warning(f"_________________ Zero-contribution from unused streaming expert for DDP compatibility")
+                    # unused = self.self_attn_streaming
+                    # x = x + 0.0 * (unused.linear_q.weight.sum() + unused.linear_k.weight.sum() + 
+                    #                unused.linear_v.weight.sum() + unused.linear_out.weight.sum())
+                    x_detached = x.detach()
+                    x = x + 0.0 * self.self_attn_streaming(query=x_detached, key=x_detached, value=x_detached, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            elif self_attention_moe == 'streaming':
+                x = self.self_attn_streaming(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+                # Zero-contribution from unused streaming expert for DDP compatibility
+                if self.training:
+                    # logging.warning(f"_________________ Zero-contribution from unused offline expert for DDP compatibility")
+                    # unused = self.self_attn_streaming
+                    # x = x + 0.0 * (unused.linear_q.weight.sum() + unused.linear_k.weight.sum() + 
+                    #                unused.linear_v.weight.sum() + unused.linear_out.weight.sum())
+                    x_detached = x.detach()
+                    x = x + 0.0 * self.self_attn_offline(query=x_detached, key=x_detached, value=x_detached, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            else:
+                raise ValueError(f"Invalid self_attention_moe: {self.self_attention_moe}")
         elif self.self_attention_model == 'rel_pos_local_attn':
             x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
         elif self.self_attention_model == 'abs_pos':

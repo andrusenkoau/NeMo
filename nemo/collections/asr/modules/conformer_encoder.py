@@ -652,6 +652,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             )
 
         dcc_chunk = None
+        self_attention_moe = 'offline'
         # select a random att_context_size with the distribution specified by att_context_probs during training
         # for non-validation cases like test, validation or inference, it uses the first mode in self.att_context_size
         if self.training and (len(self.att_context_size_all) > 1 or self.att_chunk_context_size is not None):
@@ -674,9 +675,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 if random.random() < self.unified_asr_prob:
                     # pure offline mode with full context
                     cur_att_context_size = [-1, -1, -1]
-                elif self.conv_context_style in ["dcc", "dcc_rc"]:
-                    # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
-                    dcc_chunk = cur_att_context_size[1]
+                else:
+                    self_attention_moe = 'streaming'
+                    if self.conv_context_style in ["dcc", "dcc_rc"]:
+                        # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
+                        dcc_chunk = cur_att_context_size[1]
         else:
             if self.att_context_style == "chunked_limited_with_rc":
                 if self.training:
@@ -767,6 +770,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
                 dcc_chunk=dcc_chunk,
+                self_attention_moe=self_attention_moe,
             )
 
             if cache_last_channel_cur is not None:
