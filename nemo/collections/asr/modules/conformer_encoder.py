@@ -653,6 +653,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         dcc_chunk = None
         self_attention_moe = 'offline'
+        # self_attention_moe = 'streaming'
         # select a random att_context_size with the distribution specified by att_context_probs during training
         # for non-validation cases like test, validation or inference, it uses the first mode in self.att_context_size
         if self.training and (len(self.att_context_size_all) > 1 or self.att_chunk_context_size is not None):
