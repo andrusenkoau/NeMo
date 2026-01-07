@@ -657,28 +657,28 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if self.training and (len(self.att_context_size_all) > 1 or self.att_chunk_context_size is not None):
             if self.att_context_style == "chunked_limited":
                 cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
-            if self.att_context_style == "chunked_limited_with_rc":
-                cur_att_context_size = [-1, -1, -1]
-            # elif self.att_context_style == "chunked_limited_with_rc":
-            #     left_context = random.choices(self.att_chunk_context_size[0])[0]
-            #     middle_context = random.choices(self.att_chunk_context_size[1])[0]
-            #     if self.att_rc_weights is not None:
-            #         right_context = random.choices(self.att_chunk_context_size[2], weights=self.att_rc_weights)[0]
-            #     else:
-            #         right_context = random.choices(self.att_chunk_context_size[2])[0]
-            #     cur_att_context_size = [left_context, middle_context, right_context]
+            elif self.att_context_style == "chunked_limited_with_rc":
+                left_context = random.choices(self.att_chunk_context_size[0])[0]
+                middle_context = random.choices(self.att_chunk_context_size[1])[0]
+                if self.att_rc_weights is not None:
+                    right_context = random.choices(self.att_chunk_context_size[2], weights=self.att_rc_weights)[0]
+                else:
+                    right_context = random.choices(self.att_chunk_context_size[2])[0]
+                cur_att_context_size = [left_context, middle_context, right_context]
+                cur_att_context_size_0rc = [left_context, middle_context, 0]
 
-            #     # logging.info(f"cur_att_context_size: {cur_att_context_size}")
-            #     # logging.info(f"self.att_rc_weights: {self.att_rc_weights}")
-            #     # logging.info(f"right_context: {right_context}")
-            #     # raise ValueError("Stop here")
+                # logging.info(f"cur_att_context_size: {cur_att_context_size}")
+                # logging.info(f"self.att_rc_weights: {self.att_rc_weights}")
+                # logging.info(f"right_context: {right_context}")
+                # raise ValueError("Stop here")
 
-            #     if random.random() < self.unified_asr_prob:
-            #         # pure offline mode with full context
-            #         cur_att_context_size = [-1, -1, -1]
-            #     elif self.conv_context_style in ["dcc", "dcc_rc"]:
-            #         # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
-            #         dcc_chunk = cur_att_context_size[1]
+                if random.random() < self.unified_asr_prob:
+                    # pure offline mode with full context
+                    cur_att_context_size = [-1, -1, -1]
+                elif self.conv_context_style in ["dcc", "dcc_rc"]:
+                    # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
+                    dcc_chunk = cur_att_context_size[1]
+
         else:
             if self.att_context_style == "chunked_limited_with_rc":
                 if self.training:
@@ -731,6 +731,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         # logging.warning("*********"*10)
         # logging.warning(f"audio_signal.shape: {audio_signal.shape}")
         # logging.warning(f"cur_att_context_size: {cur_att_context_size}")
+        # logging.warning(f"dcc_chunk: {dcc_chunk}")
+        # logging.warning(f"cur_att_context_size_0rc: {cur_att_context_size_0rc}")
         # logging.warning(f"padding_length: {padding_length}")
         # logging.warning(f"padding_length: {max_audio_length}")
         # logging.warning(f"offset: {offset}")
@@ -744,6 +746,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             offset=offset,
             device=audio_signal.device,
         )
+
+        if self.training and sum(cur_att_context_size) != -3:
+            # create a second attention mask for zero outting the right context every second layer
+            pad_mask_0rc, att_mask_0rc  = self._create_masks(
+                att_context_size=cur_att_context_size_0rc,
+                padding_length=padding_length,
+                max_audio_length=max_audio_length,
+                offset=offset,
+                device=audio_signal.device,
+            )
 
         if cache_last_channel is not None:
             pad_mask = pad_mask[:, cache_len:]
@@ -763,42 +775,21 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 cache_last_time_cur = None
             
             # training logic for unified offline/streaming training:
-            if self.training and self.att_context_style == "chunked_limited_with_rc":
-                if random.random() < self.unified_asr_prob:
-                    # pure offline mode with full context
-                    cur_att_context_size = [-1, -1, -1]
-                    dcc_chunk = None
-                else:
-                    # streaming mode with chunked context for attention and convolutions
-                    left_context = random.choices(self.att_chunk_context_size[0])[0]
-                    middle_context = random.choices(self.att_chunk_context_size[1])[0]
-                    right_context = random.choices(self.att_chunk_context_size[2])[0]
-                    cur_att_context_size = [left_context, middle_context, right_context]
-                    if self.conv_context_style in ["dcc", "dcc_rc"]:
-                        dcc_chunk = middle_context
-
-                    # we need to rebuild the masks for streaming mode
-                    pad_mask, att_mask = self._create_masks(
-                        att_context_size=cur_att_context_size,
-                        padding_length=padding_length,
-                        max_audio_length=max_audio_length,
-                        offset=offset,
-                        device=audio_signal.device,
-                    )
-            
-            # logging.warning("*********"*10)
+            layer_att_mask = att_mask
+            layer_pad_mask = pad_mask
             # logging.warning(f"lth: {lth}")
-            # logging.warning(f"cur_att_context_size: {cur_att_context_size}")
-            # logging.warning(f"dcc_chunk: {dcc_chunk}")
-            
-            # raise ValueError("Stop here")
+            if self.training and sum(cur_att_context_size) != -3 and cur_att_context_size[2] != 0 and lth % 2 == 1:
+                # streaming mode with chunked context for attention and convolutions
+                layer_att_mask = att_mask_0rc
+                layer_pad_mask = pad_mask_0rc
+                # logging.warning(f"______zeroing right context_____")
 
             
             audio_signal = layer(
                 x=audio_signal,
-                att_mask=att_mask,
+                att_mask=layer_att_mask,
                 pos_emb=pos_emb,
-                pad_mask=pad_mask,
+                pad_mask=layer_pad_mask,
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
                 dcc_chunk=dcc_chunk,
