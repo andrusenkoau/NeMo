@@ -100,15 +100,15 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
 
         # convolution module
-        self.norm_conv = LayerNorm(d_model)
-        self.conv = ConformerConvolution(
-            d_model=d_model,
-            kernel_size=conv_kernel_size,
-            conv_context_style=conv_context_style,
-            norm_type=conv_norm_type,
-            conv_context_size=conv_context_size,
-            use_bias=use_bias,
-        )
+        # self.norm_conv = LayerNorm(d_model)
+        # self.conv = ConformerConvolution(
+        #     d_model=d_model,
+        #     kernel_size=conv_kernel_size,
+        #     conv_context_style=conv_context_style,
+        #     norm_type=conv_norm_type,
+        #     conv_context_size=conv_context_size,
+        #     use_bias=use_bias,
+        # )
 
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
@@ -211,11 +211,11 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             pack_input = self.forward_enabled_adapters(pack_input)
             residual = pack_input['x']
 
-        x = self.norm_conv(residual)
-        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
-        if cache_last_time is not None:
-            (x, cache_last_time) = x
-        residual = residual + self.dropout(x)
+        # x = self.norm_conv(residual)
+        # x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
+        # if cache_last_time is not None:
+        #     (x, cache_last_time) = x
+        # residual = residual + self.dropout(x)
 
         x = self.norm_feed_forward2(residual)
         x = self.feed_forward2(x)
