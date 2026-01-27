@@ -309,6 +309,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_style='regular',
         att_zero_rc_weight=None,
         skip_att_chunk_rc_prob=0.0,
+        dual_mode_training=False,
         unified_asr_prob=None,
         xscaling=True,
         untie_biases=True,
@@ -339,6 +340,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self._feat_in = feat_in
         self.att_context_style = att_context_style
         self.skip_att_chunk_rc_prob = skip_att_chunk_rc_prob
+        self.dual_mode_training = dual_mode_training
         self.unified_asr_prob = unified_asr_prob
         self.subsampling_factor = subsampling_factor
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
@@ -692,8 +694,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 # cur_att_context_size = [-1,-1]
 
         # logging.info(f"self.att_chunk_context_size: {self.att_chunk_context_size}")
-        # logging.info(f"cur_att_context_size: {cur_att_context_size}")
-        # logging.info(f"dcc_chunk: {dcc_chunk}")
+        # logging.warning(f"cur_att_context_size: {cur_att_context_size}")
+        # logging.warning(f"dcc_chunk: {dcc_chunk}")
 
         if not bypass_pre_encode:
             audio_signal = torch.transpose(audio_signal, 1, 2)
