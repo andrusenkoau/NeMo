@@ -96,6 +96,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         self.offline_loss_weight = self.cfg.loss.get('offline_loss_weight', 1)
         self.streaming_loss_weight = self.cfg.loss.get('streaming_loss_weight', 1)
         self.consistency_loss_weight = self.cfg.loss.get('consistency_loss_weight', 0)
+        self.consistency_loss_reduction = self.cfg.loss.get('consistency_loss_reduction', 'mean_volume')
 
     @torch.no_grad()
     def transcribe(
@@ -533,8 +534,8 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
                         student_log_probs=streaming_log_probs,
                         teacher_lengths=offline_len,
                         student_lengths=streaming_len,
-                        target_lengths=transcript_len,  # Pass target lengths
-                        reduction='mean_volume',         # Match CTC normalization
+                        target_lengths=transcript_len,              # Pass target lengths
+                        reduction=self.consistency_loss_reduction,  # Match CTC normalization
                     )
                     tensorboard_logs['train_consistency_loss'] = consistency_loss
                 else:
@@ -730,9 +731,12 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         if reduction == 'mean_volume':
             assert target_lengths is not None, "target_lengths required for mean_volume reduction"
             consistency_loss = kl_per_frame_masked.sum() / target_lengths.sum().clamp(min=1)
-        else:  # 'mean_frame'
+        elif reduction == 'mean_frame':  # 'mean_frame'
             consistency_loss = kl_per_frame_masked.sum() / frame_mask.float().sum().clamp(min=1)
-        # consistency_loss = kl_per_frame_masked.sum()
+        elif reduction == "sum":
+            consistency_loss = kl_per_frame_masked.sum()
+        else:
+            raise ValueError(f"Invalid reduction type: {reduction}")
 
         return consistency_loss
 
