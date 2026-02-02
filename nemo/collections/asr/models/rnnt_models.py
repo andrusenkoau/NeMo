@@ -95,7 +95,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
         )
 
-        if consistency_loss_cfg := self.cfg.get("loss", {}).get("consistency", {}) is not None:
+        if (consistency_loss_cfg := self.cfg.get("loss", {}).get("consistency", {})) is not None:
             weight = consistency_loss_cfg.get("weight", None)
             if weight is not None and weight != 0.0:
                 if loss_name == "tdt":
