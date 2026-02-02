@@ -102,39 +102,19 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 if loss_name == "tdt":
                     raise NotImplementedError
                 self.use_double_batch = True
-                if consistency_loss_cfg.get("use_graph_rnnt", False):
-                    logging.info(f"Instantiated graph consistency loss with params: {consistency_loss_cfg}")
-                    self.consistency_loss = ConsistencyGraphRNNTLoss(
-                        blank_id=num_classes,
-                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
-                    )
-                elif consistency_loss_cfg.get("use_all_logits", False):
-                    logging.info(f"Instantiated full consistency loss with params: {consistency_loss_cfg}")
-                    self.consistency_loss = ConsistencyFullRNNTLoss(
-                        symmetrical=consistency_loss_cfg.get("symmetrical", False),
-                        reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
-                        use_triton=consistency_loss_cfg.get("use_triton", False),
-                    )
-                else:
-                    logging.info(f"Instantiated partial consistency loss with params: {consistency_loss_cfg}")
-                    self.consistency_loss = ConsistencyRNNTLoss(
-                        blank_id=num_classes,
-                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
-                        use_blank=consistency_loss_cfg.get("use_blank", False),
-                        complete_distribution=consistency_loss_cfg.get("complete_distribution", False),
-                        reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
-                    )
+                self.consistency_loss = ConsistencyRNNTLoss(
+                    blank_id=num_classes,
+                    symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                    use_blank=consistency_loss_cfg.get("use_blank", False),
+                    reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                )
                 self.consistency_loss_weight = weight
-                self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
             else:
                 self.use_double_batch = consistency_loss_cfg.get("force_double_batch", False)
                 self.consistency_loss = None
                 self.consistency_loss_weight = 0.0
-                self.consistency_loss_after_step = -1
         else:
             self.use_double_batch = False
-
-
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
@@ -755,6 +735,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 input_signal=input_signal,
                 length=input_signal_length,
             )
+
+        if self.use_double_batch:
+            processed_signal = torch.cat((processed_signal, processed_signal), dim=0)
+            processed_signal_length = torch.cat((processed_signal_length, processed_signal_length), dim=0)
 
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
