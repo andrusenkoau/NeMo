@@ -564,6 +564,7 @@ class GraphRnntLoss(GraphTransducerLossBase):
         source_lengths: torch.Tensor,
         target_lengths: torch.Tensor,
     ) -> torch.Tensor:
+        """Align from Joint logits"""
         target_fsas_vec = self.get_weighted_graphs(
             logits=logits,
             targets=targets,
