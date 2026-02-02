@@ -539,6 +539,40 @@ class GraphRnntLoss(GraphTransducerLossBase):
                 target_fsas_vec.scores = scores
         return target_fsas_vec
 
+    @torch.inference_mode(mode=False)
+    def align_graphs(
+        self,
+        target_fsas_vec: "k2.Fsa",
+    ) -> torch.Tensor:
+        # extract alignment
+        shortest_paths = k2.shortest_path(target_fsas_vec, use_double_scores=self.double_scores)
+        batch_size = shortest_paths.shape[0]
+        # TODO: speedup, avoid iteration
+        alignments = [
+            shortest_paths[i].aux_labels[(shortest_paths[i].labels != self.blank) & (shortest_paths[i].labels != -1)]
+            for i in range(batch_size)
+        ]
+        # assert [alignment.shape[0] for alignment in alignments] == target_lengths.tolist()
+        padded_alignments = torch.nn.utils.rnn.pad_sequence(alignments, batch_first=True, padding_value=0)
+        return padded_alignments
+
+    @torch.inference_mode(mode=False)
+    def align(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        source_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        target_fsas_vec = self.get_weighted_graphs(
+            logits=logits,
+            targets=targets,
+            source_lengths=source_lengths,
+            target_lengths=target_lengths,
+            use_graph_weight=False,
+        )
+        return self.align_graphs(target_fsas_vec=target_fsas_vec)
+
     def forward(
         self,
         acts: torch.Tensor,
