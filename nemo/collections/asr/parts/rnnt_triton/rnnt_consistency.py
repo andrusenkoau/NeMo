@@ -59,7 +59,7 @@ def consistency_rnnt_kld(
         tgt_lengths=tgt_lengths,
     )
     student_target_logprobs, student_blank_logprobs = rnnt_logprobs(
-        logits=teacher_logits,
+        logits=student_logits,
         targets=targets,
         blank_id=blank_id,
         src_lengths=src_lengths,

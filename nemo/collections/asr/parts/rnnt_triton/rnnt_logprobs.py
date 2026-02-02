@@ -40,6 +40,7 @@ def get_rnnt_mask(
         )
     else:
         mask_tgt_nb = torch.ones([batch_size, tgt_length_max_plus_1], dtype=torch.bool, device=device)
+        mask_tgt_nb[:, -1] = False
         mask_tgt_blank = torch.ones([batch_size, tgt_length_max_plus_1], dtype=torch.bool, device=device)
     mask_nb = mask_src[..., None] * mask_tgt_nb[:, None, :]
     mask_blank = mask_src[..., None] * mask_tgt_blank[:, None, :]
