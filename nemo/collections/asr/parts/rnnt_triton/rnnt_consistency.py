@@ -25,6 +25,30 @@ class ConsistencyRNNTReductionType(PrettyStrEnum):
     MEAN_VOLUME = "mean_volume"
 
 
+def _compute_kl_loss(
+    teacher_logprobs: torch.Tensor,
+    student_logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    symmetrical: bool,
+) -> torch.Tensor:
+    """Compute masked KL divergence loss."""
+    kl_s_to_t = F.kl_div(
+        input=student_logprobs,
+        target=teacher_logprobs.detach(),
+        reduction='none',
+        log_target=True,
+    )
+    if symmetrical:
+        kl_t_to_s = F.kl_div(
+            input=teacher_logprobs,
+            target=student_logprobs.detach(),
+            reduction='none',
+            log_target=True,
+        )
+        return 0.5 * (kl_s_to_t + kl_t_to_s) * mask
+    return kl_s_to_t * mask
+
+
 def consistency_rnnt_kld(
     teacher_logits: torch.Tensor,
     student_logits: torch.Tensor,
@@ -73,68 +97,21 @@ def consistency_rnnt_kld(
         src_lengths=src_lengths,
         tgt_lengths=tgt_lengths,
     )
-    if symmetrical:
-        kl_loss_nb = (
-            0.5
-            * (
-                F.kl_div(
-                    input=student_target_logprobs,
-                    target=teacher_target_logprobs.detach(),
-                    reduction='none',
-                    log_target=True,
-                )
-                + F.kl_div(
-                    input=teacher_target_logprobs,
-                    target=student_target_logprobs.detach(),
-                    reduction='none',
-                    log_target=True,
-                )
-            )
-            * mask_nb
+    kl_loss_nb = _compute_kl_loss(
+        teacher_logprobs=teacher_target_logprobs,
+        student_logprobs=student_target_logprobs,
+        mask=mask_nb,
+        symmetrical=symmetrical,
+    )
+    if use_blank:
+        kl_loss_blank = _compute_kl_loss(
+            teacher_logprobs=teacher_blank_logprobs,
+            student_logprobs=student_blank_logprobs,
+            mask=mask_blank,
+            symmetrical=symmetrical,
         )
-        if use_blank:
-            kl_loss_blank = (
-                0.5
-                * (
-                    F.kl_div(
-                        input=student_blank_logprobs,
-                        target=teacher_blank_logprobs.detach(),
-                        reduction='none',
-                        log_target=True,
-                    )
-                    + F.kl_div(
-                        input=teacher_blank_logprobs,
-                        target=student_blank_logprobs.detach(),
-                        reduction='none',
-                        log_target=True,
-                    )
-                )
-                * mask_blank
-            )
-        else:
-            kl_loss_blank = None
     else:
-        kl_loss_nb = (
-            F.kl_div(
-                input=student_target_logprobs,
-                target=teacher_target_logprobs.detach(),
-                reduction='none',
-                log_target=True,
-            )
-            * mask_nb
-        )
-        if use_blank:
-            kl_loss_blank = (
-                F.kl_div(
-                    input=student_blank_logprobs,
-                    target=teacher_blank_logprobs.detach(),
-                    reduction='none',
-                    log_target=True,
-                )
-                * mask_blank
-            )
-        else:
-            kl_loss_blank = None
+        kl_loss_blank = None
 
     match reduction:
         case ConsistencyRNNTReductionType.MEAN:
@@ -144,9 +121,10 @@ def consistency_rnnt_kld(
         case ConsistencyRNNTReductionType.MEAN_VOLUME:
             kl_loss_value = (kl_loss_nb.sum(dim=(1, 2)) / mask_nb.sum(dim=(1, 2)).clamp(min=1)).mean()
             if use_blank:
-                kl_loss_value = (
-                    0.5 * (kl_loss_value + kl_loss_blank.sum(dim=(1, 2)) / mask_blank.sum(dim=(1, 2)).clamp(min=1))
+                kl_loss_blank_value = (
+                    kl_loss_blank.sum(dim=(1, 2)) / mask_blank.sum(dim=(1, 2)).clamp(min=1)
                 ).mean()
+                kl_loss_value = 0.5 * (kl_loss_value + kl_loss_blank_value)
         case _:
             raise NotImplementedError(f"Unsupported reduction {reduction}")
 
