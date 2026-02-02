@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import get_rnnt_mask, rnnt_logprobs
@@ -150,3 +151,38 @@ def consistency_rnnt_kld(
             raise NotImplementedError(f"Unsupported reduction {reduction}")
 
     return kl_loss_value
+
+
+class ConsistencyRNNTLoss(nn.Module):
+    def __init__(
+        self,
+        blank_id: int,
+        symmetrical: bool = True,
+        use_blank: bool = False,
+        reduction: str | ConsistencyRNNTReductionType = 'mean_volume',
+    ):
+        super().__init__()
+        self.reduction = ConsistencyRNNTReductionType(reduction)
+        self.use_blank = use_blank
+        self.blank_id = blank_id
+        self.symmetrical = symmetrical
+
+    def forward(
+        self,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        targets: torch.Tensor,
+        src_lengths: torch.Tensor | None = None,
+        tgt_lengths: torch.Tensor | None = None,
+    ):
+        return consistency_rnnt_kld(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            targets=targets,
+            blank_id=self.blank_id,
+            src_lengths=src_lengths,
+            tgt_lengths=tgt_lengths,
+            symmetrical=self.symmetrical,
+            use_blank=self.use_blank,
+            reduction=self.reduction,
+        )
