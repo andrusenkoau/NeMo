@@ -32,6 +32,7 @@ def get_devices_for_testing(use_cpu_always: bool = False) -> list[torch.device]:
 
 
 DEVICES = get_devices_for_testing(use_cpu_always=False)
+DEVICES_WITH_CPU = get_devices_for_testing(use_cpu_always=True)
 
 
 @pytest.mark.unit
@@ -41,7 +42,7 @@ DEVICES = get_devices_for_testing(use_cpu_always=False)
 @pytest.mark.parametrize("reduction", ["mean_volume", "mean"])
 def test_single_frame_single_token(device: torch.device, symmetrical: bool, use_blank: bool, reduction: str):
     """Edge case: minimal tensor sizes (T=1, U=1)."""
-    torch.manual_seed(42)
+    torch.manual_seed(77)
     teacher_logits = torch.randn(1, 1, 2, 3, device=device)  # [B=1, T=1, U+1=2, V=3]
     student_logits = torch.randn(1, 1, 2, 3, device=device)
     targets = torch.randint(0, 2, (1, 1), device=device)  # blank_id=2
@@ -199,7 +200,7 @@ def test_gradient_flow(device: torch.device, symmetrical: bool, use_blank: bool,
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("device", DEVICES_WITH_CPU)
 @pytest.mark.parametrize("use_blank", [True, False])
 @pytest.mark.parametrize("reduction", ["mean_volume", "mean"])
 def test_gradient_numerical_check(device: torch.device, use_blank: bool, reduction: str):
