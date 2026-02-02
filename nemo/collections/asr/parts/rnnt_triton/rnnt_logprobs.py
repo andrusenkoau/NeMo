@@ -114,7 +114,8 @@ def rnnt_logprobs(
         Tuple of tensors with log probabilities for targets and blank labels, both of size [B, T, U+1].
         For the last non-existent target (U+1) output is zero.
     """
-    if TRITON_AVAILABLE:
+    device: torch.device = logits.device
+    if TRITON_AVAILABLE and device.type == "cuda":
         return rnnt_logprobs_triton(
             logits=logits,
             targets=targets,
