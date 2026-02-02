@@ -38,6 +38,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscriptionReturnType,
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.asr.parts.rnnt_triton import ConsistencyRNNTLoss
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -93,6 +94,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             loss_kwargs=loss_kwargs,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
         )
+
+        if consistency_loss_cfg := self.cfg.get("loss", {}).get("consistency", {}) is not None:
+            weight = consistency_loss_cfg.get("weight", None)
+            if weight is not None and weight != 0.0:
+                if loss_name == "tdt":
+                    raise NotImplementedError
+                self.use_double_batch = True
+                self.consistency_loss = ConsistencyRNNTLoss(
+                    blank_id=num_classes,
+                    symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                    use_blank=consistency_loss_cfg.get("use_blank", False),
+                    reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                )
+                self.consistency_loss_weight = weight
+            else:
+                self.use_double_batch = consistency_loss_cfg.get("force_double_batch", False)
+                self.consistency_loss = None
+                self.consistency_loss_weight = 0.0
+        else:
+            self.use_double_batch = False
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
@@ -709,6 +730,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 length=input_signal_length,
             )
 
+        if self.use_double_batch:
+            processed_signal = torch.cat((processed_signal, processed_signal), dim=0)
+            processed_signal_length = torch.cat((processed_signal_length, processed_signal_length), dim=0)
+
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
@@ -731,6 +756,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
+        if self.use_double_batch:
+            transcript = torch.cat((transcript, transcript), dim=0)
+            transcript_len = torch.cat((transcript_len, transcript_len), dim=0)
+
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
 
@@ -751,6 +780,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
+
+            if self.consistency_loss is not None:
+                batch_size_half = joint.shape[0] // 2
+                loss_value += self.consistency_loss_weight * self.consistency_loss(
+                    teacher_logits=joint[:batch_size_half],
+                    student_logits=joint[batch_size_half:],
+                    targets=transcript[:batch_size_half],
+                    src_lengths=encoded_len[:batch_size_half],
+                    tgt_lengths=target_length[:batch_size_half],
+                )
 
             # Reset access registry
             if AccessMixin.is_access_enabled(self.model_guid):
