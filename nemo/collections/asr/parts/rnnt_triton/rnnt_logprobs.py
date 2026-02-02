@@ -15,9 +15,20 @@
 import torch
 import torch.nn.functional as F
 
+from nemo.core.utils.optional_libs import TRITON_AVAILABLE
+from nemo.utils import logging
+from nemo.utils.nemo_logging import LogMode
+
+if TRITON_AVAILABLE:
+    from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs_triton import rnnt_logprobs_triton
+
 
 def rnnt_logprobs_torch(
-    logits: torch.Tensor, targets: torch.Tensor, blank_id: int
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    blank_id: int,
+    source_lengths: torch.Tensor | None = None,
+    target_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Given logits, calculate log probabilities for blank and target labels needed for transducer loss calculation.
@@ -27,6 +38,8 @@ def rnnt_logprobs_torch(
         logits: Joint tensor of size [B, T, U+1, D]
         targets: Targets of size [B, U]
         blank_id: id of the blank output
+        source_lengths: optional tensor with lengths for source utterances
+        target_lengths: optional tensor with lengths for targets
 
     Returns:
         Tuple of tensors with log probabilities for targets and blank labels, both of size [B, T, U+1].
@@ -41,4 +54,65 @@ def rnnt_logprobs_torch(
         log_probs, dim=-1, index=targets.unsqueeze(1).expand(log_probs.shape[:-1]).unsqueeze(-1)
     ).squeeze(-1)
     target_scores[:, :, -1] = 0.0
+    if source_lengths is not None or target_lengths is not None:
+        batch_size, source_length_max, target_length_max_plus_1, _ = logits.shape
+        if source_lengths is not None:
+            mask_src = torch.arange(source_length_max, device=device)[None, :] < source_lengths[:, None]
+        else:
+            mask_src = torch.ones([batch_size, source_length_max], dtype=torch.bool, device=device)
+        if target_lengths is not None:
+            mask_tgt_nb = torch.arange(target_length_max_plus_1, device=device)[None, :] < target_lengths[:, None]
+            mask_tgt_blank = (
+                torch.arange(target_length_max_plus_1, device=device)[None, :] < target_lengths[:, None] + 1
+            )
+        else:
+            mask_tgt_nb = torch.ones([batch_size, target_length_max_plus_1], dtype=torch.bool, device=device)
+            mask_tgt_blank = torch.ones([batch_size, target_length_max_plus_1], dtype=torch.bool, device=device)
+        mask_nb = mask_src[..., None] * mask_tgt_nb[:, None, :]
+        mask_blank = mask_src[..., None] * mask_tgt_blank[:, None, :]
+        target_scores *= mask_nb
+        blank_scores *= mask_blank
     return target_scores, blank_scores
+
+
+def rnnt_logprobs(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    blank_id: int,
+    source_lengths: torch.Tensor | None = None,
+    target_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given logits, calculate log probabilities for blank and target labels needed for transducer loss calculation.
+
+    Args:
+        logits: Joint tensor of size [B, T, U+1, D]
+        targets: Targets of size [B, U]
+        blank_id: id of the blank output
+        source_lengths: optional tensor with lengths for source utterances
+        target_lengths: optional tensor with lengths for targets
+
+    Returns:
+        Tuple of tensors with log probabilities for targets and blank labels, both of size [B, T, U+1].
+        For the last non-existent target (U+1) output is zero.
+    """
+    if TRITON_AVAILABLE:
+        return rnnt_logprobs_triton(
+            logits=logits,
+            targets=targets,
+            blank_id=blank_id,
+            source_lengths=source_lengths,
+            target_lengths=target_lengths,
+        )
+    logging.warning(
+        "Triton is unavailable, pure PyTorch implementation of `rnnt_logprobs` can use a lot of extra memory."
+        " Install triton for using memory-efficient implementation",
+        mode=LogMode.ONCE,
+    )
+    return rnnt_logprobs_torch(
+        logits=logits,
+        targets=targets,
+        blank_id=blank_id,
+        source_lengths=source_lengths,
+        target_lengths=target_lengths,
+    )
