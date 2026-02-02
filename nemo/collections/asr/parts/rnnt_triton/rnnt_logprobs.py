@@ -78,21 +78,15 @@ def rnnt_logprobs_torch(
     ).squeeze(-1)
     target_scores[:, :, -1] = 0.0
     if src_lengths is not None or tgt_lengths is not None:
-        batch_size, source_length_max, target_length_max_plus_1, _ = logits.shape
-        if src_lengths is not None:
-            mask_src = torch.arange(source_length_max, device=device)[None, :] < src_lengths[:, None]
-        else:
-            mask_src = torch.ones([batch_size, source_length_max], dtype=torch.bool, device=device)
-        if tgt_lengths is not None:
-            mask_tgt_nb = torch.arange(target_length_max_plus_1, device=device)[None, :] < tgt_lengths[:, None]
-            mask_tgt_blank = (
-                torch.arange(target_length_max_plus_1, device=device)[None, :] < tgt_lengths[:, None] + 1
-            )
-        else:
-            mask_tgt_nb = torch.ones([batch_size, target_length_max_plus_1], dtype=torch.bool, device=device)
-            mask_tgt_blank = torch.ones([batch_size, target_length_max_plus_1], dtype=torch.bool, device=device)
-        mask_nb = mask_src[..., None] * mask_tgt_nb[:, None, :]
-        mask_blank = mask_src[..., None] * mask_tgt_blank[:, None, :]
+        batch_size, src_length_max, tgt_length_max_plus_1, _ = logits.shape
+        mask_nb, mask_blank = get_rnnt_mask(
+            batch_size=batch_size,
+            src_length_max=src_length_max,
+            tgt_length_max_plus_1=tgt_length_max_plus_1,
+            device=device,
+            src_lengths=src_lengths,
+            tgt_lengths=tgt_lengths,
+        )
         target_scores *= mask_nb
         blank_scores *= mask_blank
     return target_scores, blank_scores
