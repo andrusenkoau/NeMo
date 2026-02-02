@@ -23,7 +23,7 @@ LATEST_RELEASE=0a09f67 # fix for PyTorch 2.6.0
 #    | cut -d '/' -f 3)
 # "cut --delimiter '/' --fields 3" doesn't work on macOS, use "-d ... -f ..." instead
 
-pip install wheel setuptools cmake
-K2_MAKE_ARGS="-j" pip install -v "git+${K2_REPO}@${LATEST_RELEASE}#egg=k2" || { echo "k2 could not be installed!"; exit 1; }
+pip install wheel setuptools "cmake<4"
+K2_MAKE_ARGS="-j" pip install --no-build-isolation -v "git+${K2_REPO}@${LATEST_RELEASE}#egg=k2" || { echo "k2 could not be installed!"; exit 1; }
 python3 -m k2.version > /dev/null || { echo "k2 installed with errors! Please check installation manually."; exit 1; }
 echo "k2 installed successfully!"
