@@ -16,11 +16,21 @@ import pytest
 import torch
 from nemo.collections.asr.parts.rnnt_triton import ConsistencyRNNTLoss
 
+
 @pytest.mark.unit
-def test_simple():
-    consistency_loss = ConsistencyRNNTLoss(blank_id=2)
+@pytest.mark.parametrize("symmetrical", [True, False])
+@pytest.mark.parametrize("use_blank", [True, False])
+@pytest.mark.parametrize("reduction", ["mean_volume", "mean"])
+def test_simple(symmetrical: bool, use_blank: bool, reduction: str):
+    consistency_loss = ConsistencyRNNTLoss(
+        blank_id=2,
+        symmetrical=symmetrical,
+        use_blank=use_blank,
+        reduction=reduction,
+    )
     loss_value = consistency_loss(
         teacher_logits=torch.rand([1, 1, 2, 3]),
         student_logits=torch.rand([1, 1, 2, 3]),
-        targets=torch.ones([1, 1], dtype=torch.long))
+        targets=torch.ones([1, 1], dtype=torch.long),
+    )
     print(loss_value)
