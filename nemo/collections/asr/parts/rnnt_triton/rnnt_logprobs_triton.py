@@ -30,10 +30,11 @@ def _rnnt_logprobs_fwd_kernel(
     target_scores_ptr,
     blank_scores_ptr,
     BLOCK_SIZE: tl.constexpr,
+    USE_FP64: tl.constexpr,
 ):
     """
     Forward kernel for RNN-T log probs. Stores result in `target_scores_ptr` and `blank_scores_ptr`.
-    Calculations are performed in float32 (but original tensors can use any precision).
+    Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
     source_i = tl.program_id(axis=1).to(tl.int64)
@@ -47,24 +48,26 @@ def _rnnt_logprobs_fwd_kernel(
         # no calculations required
         return
 
+    compute_dtype = tl.float64 if USE_FP64 else tl.float32
+
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits
     flat_index = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
     logits_ptr += flat_index
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < num_labels
-    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
     # stable log softmax calculation
     logits_max = tl.max(logits, axis=0)
     logits_minus_max = logits - logits_max
     denominator = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0))
-    blank_logit = tl.load(logits_ptr + blank_id).to(tl.float32)
+    blank_logit = tl.load(logits_ptr + blank_id).to(compute_dtype)
     flat_index_output = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
     tl.store(blank_scores_ptr + flat_index_output, blank_logit - logits_max - denominator)
 
     # calculate log prob for target if needed
     if target_i < target_len:
         target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i)
-        target_logit = tl.load(logits_ptr + target_id).to(tl.float32)
+        target_logit = tl.load(logits_ptr + target_id).to(compute_dtype)
         tl.store(target_scores_ptr + flat_index_output, target_logit - logits_max - denominator)
 
 
@@ -82,11 +85,12 @@ def _rnnt_logprobs_bwd_kernel(
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
     BLOCK_SIZE: tl.constexpr,
+    USE_FP64: tl.constexpr,
 ):
     """
     Backward kernel for RNN-T log probs. Stores result in `grad_target_scores_ptr` and `grad_blank_scores_ptr`.
     We recalculate part of the forward here to avoid using extra memory in forward.
-    Calculations are performed in float32 (but original tensors can use any precision).
+    Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
     source_i = tl.program_id(axis=1).to(tl.int64)
@@ -99,6 +103,8 @@ def _rnnt_logprobs_bwd_kernel(
         # no calculations required
         return
 
+    compute_dtype = tl.float64 if USE_FP64 else tl.float32
+
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits/grad_logits
     flat_index = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
     logits_ptr += flat_index
@@ -106,7 +112,7 @@ def _rnnt_logprobs_bwd_kernel(
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < num_labels
-    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
     # stable log softmax calculation
     logits_max = tl.max(logits, axis=0)
     logits_minus_max = logits - logits_max
@@ -116,9 +122,9 @@ def _rnnt_logprobs_bwd_kernel(
     softmax = tl.exp(log_softmax)
 
     flat_index_grad = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
-    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grad).to(tl.float32)
+    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grad).to(compute_dtype)
     target_i_valid = target_i < target_len
-    target_grad = tl.load(grad_target_scores_ptr + flat_index_grad, mask=target_i_valid, other=0.0).to(tl.float32)
+    target_grad = tl.load(grad_target_scores_ptr + flat_index_grad, mask=target_i_valid, other=0.0).to(compute_dtype)
     target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i, mask=target_i_valid, other=-1)
 
     grad_not_in_targets = (-softmax) * (blank_grad + target_grad)
@@ -157,7 +163,9 @@ class RnntLogProbs(torch.autograd.Function):
         assert logits.is_contiguous()  # logits are huge, so here we just check if logits are contiguous
         targets = targets.contiguous()
         device = logits.device
-        float_dtype = torch.float32
+        # Use float64 if input is float64, otherwise float32
+        use_fp64 = logits.dtype == torch.float64
+        float_dtype = torch.float64 if use_fp64 else torch.float32
 
         target_scores = torch.zeros(logits.shape[:-1], dtype=float_dtype, device=device)
         blank_scores = torch.zeros_like(target_scores)
@@ -185,11 +193,13 @@ class RnntLogProbs(torch.autograd.Function):
             target_scores_ptr=target_scores,
             blank_scores_ptr=blank_scores,
             BLOCK_SIZE=triton.next_power_of_2(logits.shape[-1]),
+            USE_FP64=use_fp64,
         )
 
         # saving for backward
         ctx.save_for_backward(logits, targets, src_lengths, tgt_lengths)
         ctx.blank_id = blank_id
+        ctx.use_fp64 = use_fp64
         return target_scores, blank_scores
 
     @staticmethod
@@ -207,6 +217,7 @@ class RnntLogProbs(torch.autograd.Function):
         """
         (logits, targets, src_lengths, tgt_lengths) = ctx.saved_tensors
         blank_id = ctx.blank_id
+        use_fp64 = ctx.use_fp64
         grad_logits = torch.zeros_like(logits)
         _rnnt_logprobs_bwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
             logits_ptr=logits,
@@ -221,6 +232,7 @@ class RnntLogProbs(torch.autograd.Function):
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             BLOCK_SIZE=triton.next_power_of_2(logits.shape[-1]),
+            USE_FP64=use_fp64,
         )
         return grad_logits, None, None, None, None
 
