@@ -21,8 +21,8 @@ import triton.language as tl
 def _rnnt_logprobs_fwd_kernel(
     logits_ptr,
     targets_ptr,
-    source_lengths_ptr,
-    target_lengths_ptr,
+    src_lengths_ptr,
+    tgt_lengths_ptr,
     max_source_len: int,
     max_target_len_plus_1: int,
     num_labels: int,  # vocab size (with blank)
@@ -40,8 +40,8 @@ def _rnnt_logprobs_fwd_kernel(
     target_i = tl.program_id(axis=2).to(tl.int64)
 
     # load lengths for source/target
-    source_len = tl.load(source_lengths_ptr + batch_i)
-    target_len = tl.load(target_lengths_ptr + batch_i)
+    source_len = tl.load(src_lengths_ptr + batch_i)
+    target_len = tl.load(tgt_lengths_ptr + batch_i)
 
     if source_i >= source_len or target_i > target_len:
         # no calculations required
@@ -73,8 +73,8 @@ def _rnnt_logprobs_bwd_kernel(
     logits_ptr,
     grad_logits_ptr,
     targets_ptr,
-    source_lengths_ptr,
-    target_lengths_ptr,
+    src_lengths_ptr,
+    tgt_lengths_ptr,
     max_source_len: int,
     max_target_len_plus_1: int,
     num_labels: int,
@@ -93,8 +93,8 @@ def _rnnt_logprobs_bwd_kernel(
     target_i = tl.program_id(axis=2).to(tl.int64)
 
     # load lengths for source/target
-    source_len = tl.load(source_lengths_ptr + batch_i)
-    target_len = tl.load(target_lengths_ptr + batch_i)
+    source_len = tl.load(src_lengths_ptr + batch_i)
+    target_len = tl.load(tgt_lengths_ptr + batch_i)
     if source_i >= source_len or target_i > target_len:
         # no calculations required
         return
@@ -138,8 +138,8 @@ class RnntLogProbs(torch.autograd.Function):
         logits: torch.Tensor,
         targets: torch.Tensor,
         blank_id: int,
-        source_lengths: torch.Tensor | None,
-        target_lengths: torch.Tensor | None,
+        src_lengths: torch.Tensor | None,
+        tgt_lengths: torch.Tensor | None,
     ):
         """
 
@@ -148,8 +148,8 @@ class RnntLogProbs(torch.autograd.Function):
             logits: Joint tensor of size [B, T, U+1, D]
             targets: Targets of size [B, U]
             blank_id: id of the blank output
-            source_lengths: optional tensor with lengths for source utterances
-            target_lengths: optional tensor with lengths for targets
+            src_lengths: optional tensor with lengths for source utterances
+            tgt_lengths: optional tensor with lengths for targets
 
         Returns:
 
@@ -161,23 +161,23 @@ class RnntLogProbs(torch.autograd.Function):
 
         target_scores = torch.zeros(logits.shape[:-1], dtype=float_dtype, device=device)
         blank_scores = torch.zeros_like(target_scores)
-        if source_lengths is None:
-            source_lengths = torch.full([logits.shape[0]], fill_value=logits.shape[1], dtype=torch.int, device=device)
+        if src_lengths is None:
+            src_lengths = torch.full([logits.shape[0]], fill_value=logits.shape[1], dtype=torch.int, device=device)
         else:
-            source_lengths = source_lengths.contiguous()
-        if target_lengths is None:
-            target_lengths = torch.full(
+            src_lengths = src_lengths.contiguous()
+        if tgt_lengths is None:
+            tgt_lengths = torch.full(
                 [logits.shape[0]], fill_value=logits.shape[2] - 1, dtype=torch.int, device=device
             )
         else:
-            target_lengths = target_lengths.contiguous()
+            tgt_lengths = tgt_lengths.contiguous()
 
         # run Triton kernel
         _rnnt_logprobs_fwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
             logits_ptr=logits,
             targets_ptr=targets,
-            source_lengths_ptr=source_lengths,
-            target_lengths_ptr=target_lengths,
+            src_lengths_ptr=src_lengths,
+            tgt_lengths_ptr=tgt_lengths,
             max_source_len=logits.shape[1],
             max_target_len_plus_1=logits.shape[2],
             num_labels=logits.shape[3],
@@ -188,7 +188,7 @@ class RnntLogProbs(torch.autograd.Function):
         )
 
         # saving for backward
-        ctx.save_for_backward(logits, targets, source_lengths, target_lengths)
+        ctx.save_for_backward(logits, targets, src_lengths, tgt_lengths)
         ctx.blank_id = blank_id
         return target_scores, blank_scores
 
@@ -205,14 +205,14 @@ class RnntLogProbs(torch.autograd.Function):
         Returns:
             gradient for logits, None for all other arguments for `forward`
         """
-        (logits, targets, source_lengths, target_lengths) = ctx.saved_tensors
+        (logits, targets, src_lengths, tgt_lengths) = ctx.saved_tensors
         blank_id = ctx.blank_id
         grad_logits = torch.zeros_like(logits)
         _rnnt_logprobs_bwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
             logits_ptr=logits,
             grad_logits_ptr=grad_logits,
-            source_lengths_ptr=source_lengths,
-            target_lengths_ptr=target_lengths,
+            src_lengths_ptr=src_lengths,
+            tgt_lengths_ptr=tgt_lengths,
             targets_ptr=targets,
             max_source_len=logits.shape[1],
             max_target_len_plus_1=logits.shape[2],
@@ -229,8 +229,8 @@ def rnnt_logprobs_triton(
     logits: torch.Tensor,
     targets: torch.Tensor,
     blank_id: int,
-    source_lengths: torch.Tensor | None = None,
-    target_lengths: torch.Tensor | None = None,
+    src_lengths: torch.Tensor | None = None,
+    tgt_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Given logits, calculate log probabilities for blank and target labels needed for transducer loss calculation.
@@ -240,11 +240,11 @@ def rnnt_logprobs_triton(
         logits: Joint tensor of size [B, T, U+1, D]
         targets: Targets of size [B, U]
         blank_id: id of the blank output
-        source_lengths: optional tensor with lengths for source utterances
-        target_lengths: optional tensor with lengths for targets
+        src_lengths: optional tensor with lengths for source utterances
+        tgt_lengths: optional tensor with lengths for targets
 
     Returns:
         Tuple of tensors with log probabilities for targets and blank labels, both of size [B, T, U+1].
-        For the non-existent targets (U+1 or beyond target_lengths) output is zero.
+        For the non-existent targets (U+1 or beyond tgt_lengths) output is zero.
     """
-    return RnntLogProbs.apply(logits, targets, blank_id, source_lengths, target_lengths)
+    return RnntLogProbs.apply(logits, targets, blank_id, src_lengths, tgt_lengths)
