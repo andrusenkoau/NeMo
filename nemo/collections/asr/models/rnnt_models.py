@@ -783,13 +783,23 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if self.consistency_loss is not None:
                 batch_size_half = joint.shape[0] // 2
-                loss_value += self.consistency_loss_weight * self.consistency_loss(
+                consistency_loss_value = self.consistency_loss(
                     teacher_logits=joint[:batch_size_half],
                     student_logits=joint[batch_size_half:],
                     targets=transcript[:batch_size_half],
                     src_lengths=encoded_len[:batch_size_half],
                     tgt_lengths=target_length[:batch_size_half],
                 )
+                rnnt_loss_value_item = loss_value.item()
+                loss_value += self.consistency_loss_weight * consistency_loss_value
+                consistency_loss_value_item = consistency_loss_value.item()
+                consistency_loss_logs = {
+                    "rnnt_loss": rnnt_loss_value_item,
+                    "consistency_loss": consistency_loss_value_item,
+                    "consistency_loss_scaled": self.consistency_loss_weight * consistency_loss_value_item,
+                }
+            else:
+                consistency_loss_logs = {}
 
             # Reset access registry
             if AccessMixin.is_access_enabled(self.model_guid):
@@ -800,6 +810,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
+            tensorboard_logs |= consistency_loss_logs
 
             if (sample_id + 1) % log_every_n_steps == 0:
                 self.wer.update(
