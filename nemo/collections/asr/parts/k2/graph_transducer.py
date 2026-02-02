@@ -518,8 +518,8 @@ class GraphRnntLoss(GraphTransducerLossBase):
                     logits=logits,
                     targets=targets,
                     blank_id=self.blank,
-                    source_lengths=source_lengths,
-                    target_lengths=target_lengths,
+                    src_lengths=source_lengths,
+                    tgt_lengths=target_lengths,
                 )
                 text_units_blank_mask = text_units == self.blank
                 scores = torch.where(
