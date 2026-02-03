@@ -557,7 +557,7 @@ class GraphRnntLoss(GraphTransducerLossBase):
         return padded_alignments
 
     @torch.inference_mode(mode=False)
-    def align(
+    def align_from_logits(
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
