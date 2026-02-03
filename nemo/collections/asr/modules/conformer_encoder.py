@@ -353,7 +353,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.sync_max_audio_length = sync_max_audio_length
 
-        assert conv_context_style in ["regular", "dcc", "dcc_rc"], f"Invalid conv_context_style: {conv_context_style}!"
+        assert conv_context_style in ["regular", "dcc", "dcc_rc", "causal"], f"Invalid conv_context_style: {conv_context_style}!"
         self.conv_context_style = conv_context_style
         self.conv_kernel_size = conv_kernel_size
 
@@ -652,6 +652,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             )
 
         dcc_chunk = None
+        use_causal_conv = False  # Default to offline (symmetric) convolution
         # select a random att_context_size with the distribution specified by att_context_probs during training
         # for non-validation cases like test, validation or inference, it uses the first mode in self.att_context_size
         if self.training and (len(self.att_context_size_all) > 1 or self.att_chunk_context_size is not None):
@@ -677,6 +678,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 elif self.conv_context_style in ["dcc", "dcc_rc"]:
                     # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
                     dcc_chunk = cur_att_context_size[1]
+                elif self.conv_context_style == "causal":
+                    # Use causal convolutions for streaming mode
+                    use_causal_conv = True
         else:
             if self.att_context_style == "chunked_limited_with_rc":
                 if self.training:
@@ -684,6 +688,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 else:
                     # cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
                     cur_att_context_size = [-1, -1, -1]
+                    use_causal_conv = False
                     # cur_att_context_size = self.att_context_size
                     # cur_att_context_size = [70,1000,13]
                 # logging.info(f"cur_att_context_size: {cur_att_context_size}")
@@ -767,6 +772,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
                 dcc_chunk=dcc_chunk,
+                use_causal_conv=use_causal_conv,
             )
 
             if cache_last_channel_cur is not None:

@@ -163,7 +163,8 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, dcc_chunk=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None,
+                cache_last_channel=None, cache_last_time=None, dcc_chunk=None, use_causal_conv=False):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -173,6 +174,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             cache_last_channel (torch.tensor) : cache for MHA layers (B, T_cache, d_model)
             cache_last_time (torch.tensor) : cache for convolutional layers (B, d_model, T_cache)
             dcc_chunk (int) : chunk size for dynamic chunked convolution
+            use_causal_conv (bool) : whether to use causal convolution
         Returns:
             x (torch.Tensor): (B, T, d_model)
             cache_last_channel (torch.tensor) : next cache for MHA layers (B, T_cache, d_model)
@@ -212,7 +214,8 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             residual = pack_input['x']
 
         x = self.norm_conv(residual)
-        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
+        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time,
+                      dcc_chunk=dcc_chunk, use_causal_conv=use_causal_conv)
         if cache_last_time is not None:
             (x, cache_last_time) = x
         residual = residual + self.dropout(x)
@@ -329,7 +332,7 @@ class ConformerConvolution(nn.Module):
             bias=self.use_bias,
         )
 
-    def forward(self, x, pad_mask=None, cache=None, dcc_chunk=None):
+    def forward(self, x, pad_mask=None, cache=None, dcc_chunk=None, use_causal_conv=False):
         
         if dcc_chunk is not None:
             
@@ -440,11 +443,10 @@ class ConformerConvolution(nn.Module):
                 x = x[:, :-final_chunk_padding, :]
 
         else:
-            # original Conformer convolution with standard and causal padding
+            # Regular convolution with optional causal mode
             x = x.transpose(1, 2)
             x = self.pointwise_conv1(x)
 
-            # Compute the activation function or use GLU for original Conformer
             if self.pointwise_activation == 'glu_':
                 x = nn.functional.glu(x, dim=1)
             else:
@@ -453,9 +455,36 @@ class ConformerConvolution(nn.Module):
             if pad_mask is not None:
                 x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
 
-            x = self.depthwise_conv(x, cache=cache)
-            if cache is not None:
-                x, cache = x
+            # Dynamic padding based on mode
+            if use_causal_conv:
+                # Streaming mode: causal convolution (no look-ahead)
+                # Manually apply padding and use raw conv weights
+                left_pad = self.kernel_size - 1
+                right_pad = 0
+                # logging.warning("*********"*10)
+                # logging.warning("Causal convolution")
+                # logging.warning(f"x.shape before padding: {x.shape}")
+                # logging.warning(f"self.kernel_size: {self.kernel_size}")
+                # logging.warning(f"left_pad: {left_pad}")
+                # logging.warning(f"right_pad: {right_pad}")                
+                x_padded = F.pad(x, (left_pad, right_pad), value=0.0)
+                # logging.warning(f"x_padded.shape: {x_padded.shape}")
+                x = F.conv1d(
+                    x_padded,
+                    weight=self.depthwise_conv.weight,
+                    bias=self.depthwise_conv.bias,
+                    stride=self.depthwise_conv.stride,
+                    padding=0,
+                    dilation=self.depthwise_conv.dilation,
+                    groups=self.depthwise_conv.groups,
+                )
+            else:
+                # logging.warning("*********"*10)
+                # logging.warning("Regular convolution")
+                # Offline mode: use standard symmetric padding from CausalConv1D
+                x = self.depthwise_conv(x, cache=cache)
+                if cache is not None:
+                    x, cache = x
 
             if self.norm_type == "layer_norm":
                 x = x.transpose(1, 2)
@@ -466,13 +495,7 @@ class ConformerConvolution(nn.Module):
 
             x = self.activation(x)
             x = self.pointwise_conv2(x)
-
             x = x.transpose(1, 2)
-
-
-        # # apply padding mask to the final convolution output
-        # if pad_mask is not None:
-        #     x = x.masked_fill(pad_mask.unsqueeze(2), 0.0)
 
         if cache is None:
             return x
