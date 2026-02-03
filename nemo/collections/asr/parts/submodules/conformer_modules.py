@@ -298,29 +298,57 @@ class ConformerConvolution(nn.Module):
             bias=self.use_bias,
         )
 
-        self.depthwise_conv = CausalConv1D(
-            in_channels=dw_conv_input_dim,
-            out_channels=dw_conv_input_dim,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=conv_context_size,
-            groups=dw_conv_input_dim,
-            bias=self.use_bias,
-        )
-
-        if norm_type == 'batch_norm':
-            self.batch_norm = nn.BatchNorm1d(dw_conv_input_dim)
-        elif norm_type == 'instance_norm':
-            self.batch_norm = nn.InstanceNorm1d(dw_conv_input_dim)
-        elif norm_type == 'layer_norm':
-            self.batch_norm = nn.LayerNorm(dw_conv_input_dim)
-        elif norm_type == 'fused_batch_norm':
-            self.batch_norm = FusedBatchNorm1d(dw_conv_input_dim)
-        elif norm_type.startswith('group_norm'):
-            num_groups = int(norm_type.replace("group_norm", ""))
-            self.batch_norm = nn.GroupNorm(num_groups=num_groups, num_channels=d_model)
+        if conv_context_style == "dual_conv":
+            # DUAL MODE: separate depthwise convs and BNs for offline and streaming
+            # Offline: symmetric padding (standard Conformer)
+            self.depthwise_conv_offline = nn.Conv1d(
+                in_channels=dw_conv_input_dim,
+                out_channels=dw_conv_input_dim,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=(kernel_size - 1) // 2,  # Symmetric padding
+                groups=dw_conv_input_dim,
+                bias=self.use_bias,
+            )
+            # Streaming: no padding (causal padding applied in forward)
+            self.depthwise_conv_streaming = nn.Conv1d(
+                in_channels=dw_conv_input_dim,
+                out_channels=dw_conv_input_dim,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=0,  # Causal padding applied manually in forward
+                groups=dw_conv_input_dim,
+                bias=self.use_bias,
+            )
+            # Separate BatchNorms for each mode
+            self.batch_norm_offline = self._create_norm(norm_type, dw_conv_input_dim)
+            self.batch_norm_streaming = self._create_norm(norm_type, dw_conv_input_dim)
         else:
-            raise ValueError(f"conv_norm_type={norm_type} is not valid!")
+            # Original single depthwise conv (for regular, dcc, dcc_rc, causal)
+            self.depthwise_conv = CausalConv1D(
+                in_channels=dw_conv_input_dim,
+                out_channels=dw_conv_input_dim,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=conv_context_size,
+                groups=dw_conv_input_dim,
+                bias=self.use_bias,
+            )
+            self.batch_norm = self._create_norm(norm_type, dw_conv_input_dim)
+
+        # if norm_type == 'batch_norm':
+        #     self.batch_norm = nn.BatchNorm1d(dw_conv_input_dim)
+        # elif norm_type == 'instance_norm':
+        #     self.batch_norm = nn.InstanceNorm1d(dw_conv_input_dim)
+        # elif norm_type == 'layer_norm':
+        #     self.batch_norm = nn.LayerNorm(dw_conv_input_dim)
+        # elif norm_type == 'fused_batch_norm':
+        #     self.batch_norm = FusedBatchNorm1d(dw_conv_input_dim)
+        # elif norm_type.startswith('group_norm'):
+        #     num_groups = int(norm_type.replace("group_norm", ""))
+        #     self.batch_norm = nn.GroupNorm(num_groups=num_groups, num_channels=d_model)
+        # else:
+        #     raise ValueError(f"conv_norm_type={norm_type} is not valid!")
 
         self.activation = Swish()
         self.pointwise_conv2 = nn.Conv1d(
@@ -331,6 +359,23 @@ class ConformerConvolution(nn.Module):
             padding=0,
             bias=self.use_bias,
         )
+
+    def _create_norm(self, norm_type, dw_conv_input_dim):
+        """Helper to create normalization layer."""
+        if norm_type == 'batch_norm':
+            return nn.BatchNorm1d(dw_conv_input_dim)
+        elif norm_type == 'instance_norm':
+            return nn.InstanceNorm1d(dw_conv_input_dim)
+        elif norm_type == 'layer_norm':
+            return nn.LayerNorm(dw_conv_input_dim)
+        elif norm_type == 'fused_batch_norm':
+            return FusedBatchNorm1d(dw_conv_input_dim)
+        elif norm_type.startswith('group_norm'):
+            num_groups = int(norm_type.replace("group_norm", ""))
+            return nn.GroupNorm(num_groups=num_groups, num_channels=dw_conv_input_dim)
+        else:
+            raise ValueError(f"conv_norm_type={norm_type} is not valid!")
+
 
     def forward(self, x, pad_mask=None, cache=None, dcc_chunk=None, use_causal_conv=False):
         
@@ -369,32 +414,12 @@ class ConformerConvolution(nn.Module):
             else:
                 x = self.pointwise_activation(x)
 
-            # if pad_mask is not None:
-            #     x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
-
-            # logging.warning("*********"*10)
-            # logging.warning(f"x.shape: {x.shape}")
-            # logging.warning(f"self.conv_context_size: {self.conv_context_size}")
-            # logging.warning(f"conv_context_size: {conv_context_size}")
-            # logging.warning(f"right_dcc_context: {right_dcc_context}")
-            # logging.warning(f"final_right_padding: {final_right_padding}")
-            # logging.warning(f"final_chunk_padding: {final_chunk_padding}")
-            # logging.warning(f"chunk_size: {chunk_size}")
-
-            # raise ValueError("Stop here")
-
-            x = F.pad(x, (conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
-            # logging.warning(f"x.shape after padding 1: {x.shape}")
+            x = F.pad(x, (conv_context_size, final_right_padding), value=0)
 
             # split the tensor into chunks
             x = x.unfold(2, size=conv_context_size + chunk_size + right_dcc_context, step=chunk_size)
 
-            # logging.warning(f"conv_context_size + chunk_size + right_dcc_context: {conv_context_size + chunk_size + right_dcc_context}")
-            # logging.warning(f"x.shape after unfold: {x.shape}")
-
-            # # -> [batch_size, in_channels, num_chunks, lc+chunk_size+rpad]
             x = F.pad(x, (0, conv_context_size), value=0)
-            # logging.warning(f"x.shape after padding 2: {x.shape}")
 
             # -> [batch_size, num_chunks, in_channels, lc+chunk_size+rpad]
             x = x.transpose(1, 2)
@@ -402,7 +427,7 @@ class ConformerConvolution(nn.Module):
             # -> [batch_size * num_chunks, in_channels, lc+chunk_size+rpad]
             x = x.flatten(start_dim=0, end_dim=1)
 
-            # we are using only weigth from depthwise convolution
+            # we are using only weight from depthwise convolution
             x = F.conv1d(
                 x,
                 weight=self.depthwise_conv.weight,
@@ -412,8 +437,6 @@ class ConformerConvolution(nn.Module):
                 dilation=self.depthwise_conv.dilation,
                 groups=self.depthwise_conv.groups,
             )
-
-            # logging.warning(f"x.shape after depthwise conv: {x.shape}")
 
             if self.norm_type == "layer_norm":
                 x = x.transpose(1, 2)
@@ -428,7 +451,7 @@ class ConformerConvolution(nn.Module):
             # -> [batch_size * num_chunks, chunk_size+right_context, out_channels]
             x = x.transpose(1, 2)
 
-            # # -> [batch_size * num_chunks, chunk_size, out_channels]
+            # -> [batch_size * num_chunks, chunk_size, out_channels]
             if self.conv_context_style == "dcc_rc":
                 x = x[:, :chunk_size, :]
 
@@ -442,8 +465,52 @@ class ConformerConvolution(nn.Module):
             if final_chunk_padding > 0:
                 x = x[:, :-final_chunk_padding, :]
 
+        elif self.conv_context_style == "dual_conv":
+            # DUAL CONV MODE: separate convs for offline and streaming
+            x = x.transpose(1, 2)  # [B, T, D] -> [B, D, T]
+            x = self.pointwise_conv1(x)
+
+            if self.pointwise_activation == 'glu_':
+                x = nn.functional.glu(x, dim=1)
+            else:
+                x = self.pointwise_activation(x)
+
+            if pad_mask is not None:
+                x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+
+            if use_causal_conv:
+                # logging.warning("*********"*10)
+                # logging.warning("Causal convolution")
+                # Streaming mode: use streaming conv with causal padding
+                left_pad = self.kernel_size - 1
+                x_padded = F.pad(x, (left_pad, 0), value=0.0)
+                x = self.depthwise_conv_streaming(x_padded)
+                
+                if self.norm_type == "layer_norm":
+                    x = x.transpose(1, 2)
+                    x = self.batch_norm_streaming(x)
+                    x = x.transpose(1, 2)
+                else:
+                    x = self.batch_norm_streaming(x)
+            else:
+                # logging.warning("*********"*10)
+                # logging.warning("Regular convolution")
+                # Offline mode: use offline conv with symmetric padding (built in)
+                x = self.depthwise_conv_offline(x)
+                
+                if self.norm_type == "layer_norm":
+                    x = x.transpose(1, 2)
+                    x = self.batch_norm_offline(x)
+                    x = x.transpose(1, 2)
+                else:
+                    x = self.batch_norm_offline(x)
+
+            x = self.activation(x)
+            x = self.pointwise_conv2(x)
+            x = x.transpose(1, 2)
+
         else:
-            # Regular convolution with optional causal mode
+            # Regular convolution with optional causal mode (for regular, dcc, dcc_rc, causal)
             x = x.transpose(1, 2)
             x = self.pointwise_conv1(x)
 
@@ -458,17 +525,9 @@ class ConformerConvolution(nn.Module):
             # Dynamic padding based on mode
             if use_causal_conv:
                 # Streaming mode: causal convolution (no look-ahead)
-                # Manually apply padding and use raw conv weights
                 left_pad = self.kernel_size - 1
                 right_pad = 0
-                # logging.warning("*********"*10)
-                # logging.warning("Causal convolution")
-                # logging.warning(f"x.shape before padding: {x.shape}")
-                # logging.warning(f"self.kernel_size: {self.kernel_size}")
-                # logging.warning(f"left_pad: {left_pad}")
-                # logging.warning(f"right_pad: {right_pad}")                
                 x_padded = F.pad(x, (left_pad, right_pad), value=0.0)
-                # logging.warning(f"x_padded.shape: {x_padded.shape}")
                 x = F.conv1d(
                     x_padded,
                     weight=self.depthwise_conv.weight,
@@ -479,8 +538,6 @@ class ConformerConvolution(nn.Module):
                     groups=self.depthwise_conv.groups,
                 )
             else:
-                # logging.warning("*********"*10)
-                # logging.warning("Regular convolution")
                 # Offline mode: use standard symmetric padding from CausalConv1D
                 x = self.depthwise_conv(x, cache=cache)
                 if cache is not None:
@@ -501,6 +558,177 @@ class ConformerConvolution(nn.Module):
             return x
         else:
             return x, cache
+
+
+    # def forward(self, x, pad_mask=None, cache=None, dcc_chunk=None, use_causal_conv=False):
+        
+    #     if dcc_chunk is not None:
+            
+    #         if dcc_chunk and self.conv_context_style == "regular":
+    #             raise ValueError("dcc_chunk is not supported for regular convolution context style!")
+            
+    #         # apply dynamic chunked convolution with the config (only during training)
+    #         chunk_size = dcc_chunk
+    #         batch_size = x.size(0)
+    #         if isinstance(self.conv_context_size, list):
+    #             conv_context_size = self.conv_context_size[0]
+    #         else:
+    #             conv_context_size = self.conv_context_size
+
+    #         if self.conv_context_style == "dcc_rc":
+    #             right_dcc_context = conv_context_size
+    #         else:
+    #             right_dcc_context = 0
+
+    #         # define right padding for the last chunk
+    #         if x.shape[1] % chunk_size != 0:
+    #             final_right_padding = chunk_size - (x.shape[1] % chunk_size) + right_dcc_context
+    #             final_chunk_padding = chunk_size - (x.shape[1] % chunk_size)
+    #         else:
+    #             final_right_padding = right_dcc_context
+    #             final_chunk_padding = 0
+
+    #         x = x.transpose(1, 2) # [B, T, D] -> [B, D, T]
+    #         x = self.pointwise_conv1(x)
+
+    #         # Compute the activation function or use GLU for original Conformer
+    #         if self.pointwise_activation == 'glu_':
+    #             x = nn.functional.glu(x, dim=1)
+    #         else:
+    #             x = self.pointwise_activation(x)
+
+    #         # if pad_mask is not None:
+    #         #     x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+
+    #         # logging.warning("*********"*10)
+    #         # logging.warning(f"x.shape: {x.shape}")
+    #         # logging.warning(f"self.conv_context_size: {self.conv_context_size}")
+    #         # logging.warning(f"conv_context_size: {conv_context_size}")
+    #         # logging.warning(f"right_dcc_context: {right_dcc_context}")
+    #         # logging.warning(f"final_right_padding: {final_right_padding}")
+    #         # logging.warning(f"final_chunk_padding: {final_chunk_padding}")
+    #         # logging.warning(f"chunk_size: {chunk_size}")
+
+    #         # raise ValueError("Stop here")
+
+    #         x = F.pad(x, (conv_context_size, final_right_padding), value=0) # [batch_size, in_channels, lc+t+final_right_padding]
+    #         # logging.warning(f"x.shape after padding 1: {x.shape}")
+
+    #         # split the tensor into chunks
+    #         x = x.unfold(2, size=conv_context_size + chunk_size + right_dcc_context, step=chunk_size)
+
+    #         # logging.warning(f"conv_context_size + chunk_size + right_dcc_context: {conv_context_size + chunk_size + right_dcc_context}")
+    #         # logging.warning(f"x.shape after unfold: {x.shape}")
+
+    #         # # -> [batch_size, in_channels, num_chunks, lc+chunk_size+rpad]
+    #         x = F.pad(x, (0, conv_context_size), value=0)
+    #         # logging.warning(f"x.shape after padding 2: {x.shape}")
+
+    #         # -> [batch_size, num_chunks, in_channels, lc+chunk_size+rpad]
+    #         x = x.transpose(1, 2)
+
+    #         # -> [batch_size * num_chunks, in_channels, lc+chunk_size+rpad]
+    #         x = x.flatten(start_dim=0, end_dim=1)
+
+    #         # we are using only weigth from depthwise convolution
+    #         x = F.conv1d(
+    #             x,
+    #             weight=self.depthwise_conv.weight,
+    #             bias=self.depthwise_conv.bias,
+    #             stride=self.depthwise_conv.stride,
+    #             padding=0,
+    #             dilation=self.depthwise_conv.dilation,
+    #             groups=self.depthwise_conv.groups,
+    #         )
+
+    #         # logging.warning(f"x.shape after depthwise conv: {x.shape}")
+
+    #         if self.norm_type == "layer_norm":
+    #             x = x.transpose(1, 2)
+    #             x = self.batch_norm(x)
+    #             x = x.transpose(1, 2)
+    #         else:
+    #             x = self.batch_norm(x)
+
+    #         x = self.activation(x)
+    #         x = self.pointwise_conv2(x)
+
+    #         # -> [batch_size * num_chunks, chunk_size+right_context, out_channels]
+    #         x = x.transpose(1, 2)
+
+    #         # # -> [batch_size * num_chunks, chunk_size, out_channels]
+    #         if self.conv_context_style == "dcc_rc":
+    #             x = x[:, :chunk_size, :]
+
+    #         # -> [batch_size, num_chunks, chunk_size, out_channels]
+    #         x = torch.unflatten(x, dim=0, sizes=(batch_size, -1))
+
+    #         # -> [batch_size, t + final_right_padding, out_channels]
+    #         x = torch.flatten(x, start_dim=1, end_dim=2)
+
+    #         # -> [batch_size, t, out_channels]
+    #         if final_chunk_padding > 0:
+    #             x = x[:, :-final_chunk_padding, :]
+
+    #     else:
+    #         # Regular convolution with optional causal mode
+    #         x = x.transpose(1, 2)
+    #         x = self.pointwise_conv1(x)
+
+    #         if self.pointwise_activation == 'glu_':
+    #             x = nn.functional.glu(x, dim=1)
+    #         else:
+    #             x = self.pointwise_activation(x)
+
+    #         if pad_mask is not None:
+    #             x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+
+    #         # Dynamic padding based on mode
+    #         if use_causal_conv:
+    #             # Streaming mode: causal convolution (no look-ahead)
+    #             # Manually apply padding and use raw conv weights
+    #             left_pad = self.kernel_size - 1
+    #             right_pad = 0
+    #             # logging.warning("*********"*10)
+    #             # logging.warning("Causal convolution")
+    #             # logging.warning(f"x.shape before padding: {x.shape}")
+    #             # logging.warning(f"self.kernel_size: {self.kernel_size}")
+    #             # logging.warning(f"left_pad: {left_pad}")
+    #             # logging.warning(f"right_pad: {right_pad}")                
+    #             x_padded = F.pad(x, (left_pad, right_pad), value=0.0)
+    #             # logging.warning(f"x_padded.shape: {x_padded.shape}")
+    #             x = F.conv1d(
+    #                 x_padded,
+    #                 weight=self.depthwise_conv.weight,
+    #                 bias=self.depthwise_conv.bias,
+    #                 stride=self.depthwise_conv.stride,
+    #                 padding=0,
+    #                 dilation=self.depthwise_conv.dilation,
+    #                 groups=self.depthwise_conv.groups,
+    #             )
+    #         else:
+    #             # logging.warning("*********"*10)
+    #             # logging.warning("Regular convolution")
+    #             # Offline mode: use standard symmetric padding from CausalConv1D
+    #             x = self.depthwise_conv(x, cache=cache)
+    #             if cache is not None:
+    #                 x, cache = x
+
+    #         if self.norm_type == "layer_norm":
+    #             x = x.transpose(1, 2)
+    #             x = self.batch_norm(x)
+    #             x = x.transpose(1, 2)
+    #         else:
+    #             x = self.batch_norm(x)
+
+    #         x = self.activation(x)
+    #         x = self.pointwise_conv2(x)
+    #         x = x.transpose(1, 2)
+
+    #     if cache is None:
+    #         return x
+    #     else:
+    #         return x, cache
 
     def reset_parameters_conv(self):
         pw1_max = pw2_max = self.d_model**-0.5

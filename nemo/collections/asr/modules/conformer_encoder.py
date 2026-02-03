@@ -353,7 +353,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.sync_max_audio_length = sync_max_audio_length
 
-        assert conv_context_style in ["regular", "dcc", "dcc_rc", "causal"], f"Invalid conv_context_style: {conv_context_style}!"
+        assert conv_context_style in ["regular", "dcc", "dcc_rc", "causal", "dual_conv"], f"Invalid conv_context_style: {conv_context_style}!"
         self.conv_context_style = conv_context_style
         self.conv_kernel_size = conv_kernel_size
 
@@ -678,8 +678,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 elif self.conv_context_style in ["dcc", "dcc_rc"]:
                     # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
                     dcc_chunk = cur_att_context_size[1]
-                elif self.conv_context_style == "causal":
-                    # Use causal convolutions for streaming mode
+                elif self.conv_context_style in ["causal", "dual_conv"]:
+                    # Use causal/streaming convolutions for streaming mode
                     use_causal_conv = True
         else:
             if self.att_context_style == "chunked_limited_with_rc":
