@@ -227,6 +227,7 @@ model:
       weight: 0.2
       symmetrical: true
       use_blank: false
+      complete_distribution: true
       reduction: mean_volume
 
     warprnnt_numba_kwargs:
