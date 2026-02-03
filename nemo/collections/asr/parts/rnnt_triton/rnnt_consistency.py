@@ -37,9 +37,10 @@ def _log1mexp(x: torch.Tensor) -> torch.Tensor:
 
 def _build_log_distribution(
     target_logprobs: torch.Tensor,
-    blank_logprobs: torch.Tensor | None,
-    mask: torch.Tensor,
-    min_log_prob: float = -1e4,
+    blank_logprobs: torch.Tensor | None = None,
+    complete_distribution: bool = True,
+    min_log_prob: float = -1e3,
+    eps: float = 1e-5,
 ) -> torch.Tensor:
     """
     Build log probability distribution staying in log space for numerical stability.
@@ -47,30 +48,27 @@ def _build_log_distribution(
     Args:
         target_logprobs: Log probabilities for target tokens [B, T, U+1]
         blank_logprobs: Log probabilities for blank token [B, T, U+1], or None
-        mask: Valid positions mask [B, T, U+1]
-        min_log_prob: Minimum log probability to avoid -inf (default: -1e4)
 
     Returns:
         Log probabilities of shape [B, T, U+1, 2] if blank_logprobs is None,
         or [B, T, U+1, 3] if blank_logprobs is provided.
         Distribution: [target, rest] or [target, blank, rest]
     """
-    # For masked positions, set to small valid log prob to avoid NaN in KL computation
-    # The final loss will be masked anyway, so these values don't affect the result
-    target_logprobs_masked = torch.where(mask, target_logprobs, min_log_prob)
-
+    if not complete_distribution:
+        if blank_logprobs is None:
+            return target_logprobs[..., None]
+        return torch.stack([target_logprobs, blank_logprobs], dim=-1)
     if blank_logprobs is not None:
-        blank_logprobs_masked = torch.where(mask, blank_logprobs, min_log_prob)
         # rest_logprob = log(1 - exp(target) - exp(blank))
         #              = log(1 - exp(logsumexp([target, blank])))
         #              = log1mexp(logsumexp([target, blank]))
-        sum_logprobs = torch.logsumexp(torch.stack([target_logprobs_masked, blank_logprobs_masked], dim=-1), dim=-1)
-        rest_logprobs = _log1mexp(sum_logprobs).clamp(min=min_log_prob)
-        log_dist = torch.stack([target_logprobs_masked, blank_logprobs_masked, rest_logprobs], dim=-1)
+        sum_logprobs = torch.logsumexp(torch.stack([target_logprobs, blank_logprobs], dim=-1), dim=-1)
+        rest_logprobs = _log1mexp(sum_logprobs).clamp(min=min_log_prob, max=-eps)
+        log_dist = torch.stack([target_logprobs, blank_logprobs, rest_logprobs], dim=-1)
     else:
         # rest_logprob = log(1 - exp(target)) = log1mexp(target)
-        rest_logprobs = _log1mexp(target_logprobs_masked).clamp(min=min_log_prob)
-        log_dist = torch.stack([target_logprobs_masked, rest_logprobs], dim=-1)
+        rest_logprobs = _log1mexp(target_logprobs).clamp(min=min_log_prob, max=-eps)
+        log_dist = torch.stack([target_logprobs, rest_logprobs], dim=-1)
 
     return log_dist
 
@@ -124,15 +122,27 @@ def consistency_rnnt_kld(
     tgt_lengths: torch.Tensor | None = None,
     symmetrical: bool = True,
     use_blank: bool = False,
+    complete_distribution: bool = True,
+    min_log_prob: float = -1e3,
+    eps: float = 1e-5,
     reduction: str | ConsistencyRNNTReductionType = 'mean_volume',  # 'mean' or 'mean_volume'
 ) -> torch.Tensor:
     """
     Compute Consistency-Regularized RNN-T KL Divergence loss using targets and (optional) blank probabilities.
 
     Args:
-        teacher_logits: Log probabilities from teacher (offline) mode [B, T, U+1, V]
-        student_logits: Log probabilities from student (streaming) mode [B, T, U+1, V]
-        reduction: 'mean' (normalize by frames) or 'mean_volume'
+        teacher_logits: Logits from teacher (offline) mode [B, T, U+1, V]
+        student_logits: Logits from student (streaming) mode [B, T, U+1, V]
+        targets: Target token indices [B, U]
+        blank_id: Index of the blank token in the vocabulary
+        src_lengths: Optional source (encoder) sequence lengths [B]
+        tgt_lengths: Optional target sequence lengths [B]
+        symmetrical: If True, compute symmetric KL (average of both directions)
+        use_blank: If True, include blank probabilities in the distribution
+        complete_distribution: If True, build complete probability distributions that sum to 1
+        min_log_prob: Minimum log probability value for numerical stability
+        eps: Small epsilon for numerical stability in clamping
+        reduction: 'mean' (normalize by frames) or 'mean_volume' (normalize per-sample then average)
 
     Returns:
         Scalar KL divergence loss
@@ -164,31 +174,43 @@ def consistency_rnnt_kld(
         tgt_lengths=tgt_lengths,
     )
 
+    # clean up logprobs
+    teacher_target_logprobs = torch.where(mask_nb, teacher_target_logprobs, min_log_prob)
+    teacher_blank_logprobs = torch.where(mask_blank, teacher_blank_logprobs, min_log_prob)
+    student_target_logprobs = torch.where(mask_nb, student_target_logprobs, min_log_prob)
+    student_blank_logprobs = torch.where(mask_blank, student_blank_logprobs, min_log_prob)
+
+    primary_mask = mask_blank if use_blank else mask_nb
+
     # Build proper probability distributions that sum to 1
     # This ensures KL divergence is always non-negative
     teacher_log_dist = _build_log_distribution(
         target_logprobs=teacher_target_logprobs,
         blank_logprobs=teacher_blank_logprobs if use_blank else None,
-        mask=mask_nb,
+        complete_distribution=complete_distribution,
+        min_log_prob=min_log_prob,
+        eps=eps,
     )
     student_log_dist = _build_log_distribution(
         target_logprobs=student_target_logprobs,
         blank_logprobs=student_blank_logprobs if use_blank else None,
-        mask=mask_nb,
+        complete_distribution=complete_distribution,
+        min_log_prob=min_log_prob,
+        eps=eps,
     )
 
     kl_loss = _compute_kl_loss(
         teacher_logprobs=teacher_log_dist,
         student_logprobs=student_log_dist,
-        mask=mask_nb,
+        mask=primary_mask,
         symmetrical=symmetrical,
     )
 
     match reduction:
         case ConsistencyRNNTReductionType.MEAN:
-            kl_loss_value = kl_loss.sum() / mask_nb.sum().clamp(min=1)
+            kl_loss_value = kl_loss.sum() / primary_mask.sum().clamp(min=1)
         case ConsistencyRNNTReductionType.MEAN_VOLUME:
-            kl_loss_value = (kl_loss.sum(dim=(1, 2)) / mask_nb.sum(dim=(1, 2)).clamp(min=1)).mean()
+            kl_loss_value = (kl_loss.sum(dim=(1, 2)) / primary_mask.sum(dim=(1, 2)).clamp(min=1)).mean()
         case _:
             raise NotImplementedError(f"Unsupported reduction {reduction}")
 
@@ -202,12 +224,18 @@ class ConsistencyRNNTLoss(nn.Module):
         symmetrical: bool = True,
         use_blank: bool = False,
         reduction: str | ConsistencyRNNTReductionType = 'mean_volume',
+        complete_distribution: bool = True,
+        min_log_prob: float = -1e3,
+        eps: float = 1e-5,
     ):
         super().__init__()
         self.reduction = ConsistencyRNNTReductionType(reduction)
         self.use_blank = use_blank
         self.blank_id = blank_id
         self.symmetrical = symmetrical
+        self.complete_distribution = complete_distribution
+        self.min_log_prob = min_log_prob
+        self.eps = eps
 
     def forward(
         self,
@@ -226,5 +254,8 @@ class ConsistencyRNNTLoss(nn.Module):
             tgt_lengths=tgt_lengths,
             symmetrical=self.symmetrical,
             use_blank=self.use_blank,
+            complete_distribution=self.complete_distribution,
+            min_log_prob=self.min_log_prob,
+            eps=self.eps,
             reduction=self.reduction,
         )

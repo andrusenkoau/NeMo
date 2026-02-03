@@ -105,6 +105,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     blank_id=num_classes,
                     symmetrical=consistency_loss_cfg.get("symmetrical", True),
                     use_blank=consistency_loss_cfg.get("use_blank", False),
+                    complete_distribution=consistency_loss_cfg.get("complete_distribution", False),
                     reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
                 )
                 self.consistency_loss_weight = weight
