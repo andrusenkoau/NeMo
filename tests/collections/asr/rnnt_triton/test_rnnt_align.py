@@ -18,8 +18,11 @@ import torch
 from nemo.collections.asr.parts.rnnt_triton.rnnt_align import align_from_logits, rnnt_best_path_align
 from nemo.core.utils.optional_libs import K2_AVAILABLE
 
+from tests.collections.asr.decoding.utils import avoid_sync_operations
+
 if K2_AVAILABLE:
     from nemo.collections.asr.parts.k2.graph_transducer import GraphRnntLoss
+
 
 def get_devices_for_testing():
     """Return list of available devices for testing, preferring CUDA > MPS > CPU."""
@@ -38,11 +41,30 @@ def get_devices_for_k2_testing():
         devices.insert(0, torch.device("cuda"))
     return devices
 
+
 DEVICES = get_devices_for_testing()
 DEVICES_FOR_K2 = get_devices_for_k2_testing()
 
+
 class TestRnntBestPathAlign:
     """Unit tests for rnnt_best_path_align function."""
+
+    @pytest.mark.unit
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+    def test_no_cuda_sync_operations(self):
+        """Verify no CUDA-CPU synchronization during alignment."""
+        batch_size, src_length, tgt_length, vocab_size = 4, 100, 20, 32
+        device = torch.device("cuda")
+
+        target_logprobs = torch.randn([batch_size, src_length, tgt_length + 1], device=device)
+        blank_logprobs = torch.randn([batch_size, src_length, tgt_length + 1], device=device)
+        src_lengths = torch.full([batch_size], src_length, device=device, dtype=torch.long)
+        tgt_lengths = torch.full([batch_size], tgt_length, device=device, dtype=torch.long)
+
+        with avoid_sync_operations(device):
+            alignments = rnnt_best_path_align(target_logprobs, blank_logprobs, src_lengths, tgt_lengths)
+
+        assert alignments.shape == (batch_size, tgt_length)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("device", DEVICES)
@@ -154,11 +176,15 @@ class TestRnntBestPathAlign:
         assert alignments.shape == (B, 0), f"Expected shape (2, 0), got {alignments.shape}"
 
     @pytest.mark.unit
-    @pytest.mark.parametrize("device", DEVICES)
-    def test_T_equals_0_and_U_greater_than_0_raises(self, device):
-        """Test that T=0 with U>0 raises an error (impossible alignment)."""
+    def test_T_equals_0_and_U_greater_than_0_raises(self):
+        """Test that T=0 with U>0 raises an error (impossible alignment).
+
+        Note: This validation only works on CPU. On GPU, the check is skipped to avoid
+        CUDA-CPU synchronization, and invalid results will be produced silently.
+        """
         B, T, U = 1, 5, 3
         dtype = torch.float32
+        device = torch.device("cpu")
 
         target_logprobs = torch.zeros([B, T, U + 1], dtype=dtype, device=device)
         blank_logprobs = torch.zeros([B, T, U + 1], dtype=dtype, device=device)

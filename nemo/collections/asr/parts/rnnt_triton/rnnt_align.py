@@ -51,78 +51,135 @@ def rnnt_best_path_align(
     """
     device = target_logprobs.device
     dtype = target_logprobs.dtype
-    batch_size, T_max, U_plus_1 = target_logprobs.shape
-    U_max = U_plus_1 - 1  # max target length
+    batch_size, src_length_max, tgt_length_max_plus_1 = target_logprobs.shape
+    tgt_length_max = tgt_length_max_plus_1 - 1
 
-    # Handle edge case: U == 0 (nothing to align)
-    if U_max == 0:
+    # Handle edge case: tgt_length_max == 0 (nothing to align)
+    if tgt_length_max == 0:
         return torch.zeros([batch_size, 0], dtype=torch.long, device=device)
 
     # Validate: T=0 with U>0 is impossible
-    impossible_mask = (src_lengths == 0) & (tgt_lengths > 0)
-    if impossible_mask.any():
-        raise ValueError("Cannot align sequences with T=0 and U>0: impossible alignment")
-
-    # Output alignments
-    alignments = torch.zeros([batch_size, U_max], dtype=torch.long, device=device)
+    # We check this by looking at whether any sequence has src_length=0 and tgt_length>0
+    # To avoid CUDA-CPU sync, we compute the mask and check only on CPU tensors
+    # or skip validation if inputs are on GPU (will produce invalid results silently)
+    if device.type == "cpu":
+        impossible_mask = (src_lengths == 0) & (tgt_lengths > 0)
+        if impossible_mask.any():
+            raise ValueError("Cannot align sequences with T=0 and U>0: impossible alignment")
 
     NEG_INF = float("-inf")
 
-    # Process each batch element separately to handle variable lengths correctly
-    for b in range(batch_size):
-        T_b = src_lengths[b].item()
-        U_b = tgt_lengths[b].item()
+    # Pre-allocate tensors for entire batch
+    # alpha[b, t, u] = max log-probability to reach state (t, u) for batch element b
+    # State (t, u) means: consumed t frames, emitted u symbols
+    alpha = torch.full([batch_size, src_length_max + 1, tgt_length_max + 1], NEG_INF, dtype=dtype, device=device)
+    alpha[:, 0, 0] = 0.0  # Start state for all batch elements
 
-        if U_b == 0:
-            continue  # Nothing to align
+    # Backpointers: 0 = came from blank (vertical move), 1 = came from emit (horizontal move)
+    backptr = torch.zeros([batch_size, src_length_max + 1, tgt_length_max + 1], dtype=torch.int8, device=device)
 
-        # alpha[t, u] = max log-probability to reach state (t, u)
-        # State (t, u) means: consumed t frames, emitted u symbols
-        # We need states from (0, 0) to (T_b, U_b)
-        alpha = torch.full([T_b + 1, U_b + 1], NEG_INF, dtype=dtype, device=device)
-        alpha[0, 0] = 0.0  # Start state
+    # Vectorized forward pass using diagonal wavefront
+    # States on the same anti-diagonal (where src_index + tgt_index = diagonal) are independent
+    for diagonal in range(1, src_length_max + tgt_length_max + 1):
+        # Compute valid (src_index, tgt_index) pairs on this diagonal
+        src_index_min = max(0, diagonal - tgt_length_max)
+        src_index_max = min(diagonal, src_length_max)
 
-        # Backpointers: 0 = came from blank (vertical), 1 = came from emit (horizontal)
-        backptr = torch.zeros([T_b + 1, U_b + 1], dtype=torch.int8, device=device)
+        src_on_diag = torch.arange(src_index_min, src_index_max + 1, device=device)
+        tgt_on_diag = diagonal - src_on_diag
 
-        # Forward pass: fill alpha row by row (frame by frame)
-        for t in range(T_b + 1):
-            for u in range(U_b + 1):
-                if t == 0 and u == 0:
-                    continue  # Start state already initialized
+        # Blank transition: (src_index-1, tgt_index) -> (src_index, tgt_index)
+        # Can only happen if src_index > 0
+        # Use clamped indices to avoid out-of-bounds, then mask invalid with NEG_INF
+        blank_src_prev = (src_on_diag - 1).clamp(min=0)
+        blank_valid_mask = src_on_diag >= 1  # [num_positions]
 
-                # Check if we can come from blank: (t-1, u) -> (t, u)
-                if t > 0:
-                    blank_score = alpha[t - 1, u] + blank_logprobs[b, t - 1, u]
-                    if blank_score > alpha[t, u]:
-                        alpha[t, u] = blank_score
-                        backptr[t, u] = 0  # blank
+        # Gather alpha and logprobs using clamped indices (all accesses are valid)
+        alpha_from_blank = alpha[:, blank_src_prev, tgt_on_diag]
+        blank_lp = blank_logprobs[:, blank_src_prev, tgt_on_diag]
+        blank_score = alpha_from_blank + blank_lp
 
-                # Check if we can come from emit: (t, u-1) -> (t, u)
-                if u > 0 and t < T_b:  # Can only emit at frames 0..T_b-1
-                    emit_score = alpha[t, u - 1] + target_logprobs[b, t, u - 1]
-                    if emit_score > alpha[t, u]:
-                        alpha[t, u] = emit_score
-                        backptr[t, u] = 1  # emit
+        # Emit transition: (src_index, tgt_index-1) -> (src_index, tgt_index)
+        # Can only happen if tgt_index > 0 and src_index < src_length_max
+        emit_tgt_prev = (tgt_on_diag - 1).clamp(min=0)
+        emit_src_clamped = src_on_diag.clamp(max=src_length_max - 1)
+        emit_valid_mask = (tgt_on_diag >= 1) & (src_on_diag < src_length_max)
 
-        # Backtracking: trace back from (T_b, U_b) to (0, 0)
-        t, u = T_b, U_b
-        alignment_list = []
+        # Gather alpha and logprobs using clamped indices
+        alpha_from_emit = alpha[:, emit_src_clamped, emit_tgt_prev]
+        target_lp = target_logprobs[:, emit_src_clamped, emit_tgt_prev]
+        emit_score = alpha_from_emit + target_lp
 
-        while u > 0:
-            bp = backptr[t, u].item()
-            if bp == 1:  # Came from emit: (t, u-1) -> (t, u)
-                alignment_list.append(t)  # Symbol u-1 was emitted at frame t
-                u -= 1
-            else:  # Came from blank: (t-1, u) -> (t, u)
-                t -= 1
+        # Create validity masks based on sequence lengths
+        # A state is valid if src_index <= src_lengths[b] and tgt_index <= tgt_lengths[b]
+        valid_src = src_on_diag[None, :] <= src_lengths[:, None]  # [batch_size, num_positions]
+        valid_tgt = tgt_on_diag[None, :] <= tgt_lengths[:, None]  # [batch_size, num_positions]
+        valid_state = valid_src & valid_tgt
 
-        # Reverse to get alignments in order
-        alignment_list = alignment_list[::-1]
+        # For blank transitions: source state (src-1, tgt) must be valid and src >= 1
+        blank_src_prev_unclamped = src_on_diag - 1
+        blank_src_valid = (blank_src_prev_unclamped[None, :] <= src_lengths[:, None]) & blank_valid_mask[None, :]
+        blank_score = torch.where(blank_src_valid & valid_state, blank_score, NEG_INF)
 
-        # Fill alignments tensor
-        for i, frame_idx in enumerate(alignment_list):
-            alignments[b, i] = frame_idx
+        # For emit transitions: source state (src, tgt-1) must be valid, src < src_lengths[b], and tgt >= 1
+        emit_tgt_prev_unclamped = tgt_on_diag - 1
+        emit_tgt_valid = (emit_tgt_prev_unclamped[None, :] <= tgt_lengths[:, None]) & emit_valid_mask[None, :]
+        emit_src_valid = src_on_diag[None, :] < src_lengths[:, None]
+        emit_score = torch.where(emit_tgt_valid & emit_src_valid & valid_state, emit_score, NEG_INF)
+
+        # Select max and update alpha and backptr
+        new_alpha = torch.maximum(blank_score, emit_score)
+        new_backptr = (emit_score > blank_score).to(torch.int8)
+
+        # Scatter to alpha and backptr tensors
+        alpha[:, src_on_diag, tgt_on_diag] = new_alpha
+        backptr[:, src_on_diag, tgt_on_diag] = new_backptr
+
+    # Vectorized backtracking: trace all paths in parallel
+    # We'll build alignments by iterating through target positions from U-1 down to 0
+    # and recording the frame at which each symbol was emitted
+    alignments = torch.zeros([batch_size, tgt_length_max], dtype=torch.long, device=device)
+    batch_indices = torch.arange(batch_size, device=device)
+
+    # Start at end state for each batch: (src_lengths[b], tgt_lengths[b])
+    cur_src = src_lengths.clone()
+    cur_tgt = tgt_lengths.clone()
+
+    # Maximum number of steps is src_length_max + tgt_length_max
+    for _ in range(src_length_max + tgt_length_max):
+        # Get backpointer at current position for all batch elements
+        bp = backptr[batch_indices, cur_src, cur_tgt]
+
+        # Determine active elements (still tracing)
+        active = (cur_src > 0) | (cur_tgt > 0)
+
+        # If emit (bp == 1), record frame index
+        # When backpointer is 1, we came from (cur_src, cur_tgt-1) via emit
+        # This means symbol at position cur_tgt-1 was emitted at frame cur_src
+        is_emit = (bp == 1) & active
+        emit_tgt_idx = cur_tgt - 1
+
+        # Create mask for valid emit positions
+        valid_emit = is_emit & (emit_tgt_idx >= 0) & (emit_tgt_idx < tgt_length_max)
+
+        # Update alignments for valid emits
+        # We need to set alignments[b, emit_tgt_idx[b]] = cur_src[b] for valid_emit[b]
+        # Use conditional scatter: only update where valid_emit is True
+        # To avoid overwriting with 0, we add cur_src only where valid_emit is True
+        emit_idx_clamped = emit_tgt_idx.clamp(min=0, max=tgt_length_max - 1)
+
+        # Get current values at the positions we might update
+        current_values = alignments.gather(dim=1, index=emit_idx_clamped.unsqueeze(1)).squeeze(1)
+
+        # Compute new values: keep current if not valid_emit, else use cur_src
+        new_values = torch.where(valid_emit, cur_src, current_values)
+
+        # Scatter the new values
+        alignments.scatter_(dim=1, index=emit_idx_clamped.unsqueeze(1), src=new_values.unsqueeze(1))
+
+        # Update position: blank (bp=0) -> src-=1, emit (bp=1) -> tgt-=1
+        cur_src = torch.where(active & (bp == 0), cur_src - 1, cur_src)
+        cur_tgt = torch.where(active & (bp == 1), cur_tgt - 1, cur_tgt)
 
     return alignments
 
