@@ -110,10 +110,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
                 )
                 self.consistency_loss_weight = weight
+                self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
             else:
                 self.use_double_batch = consistency_loss_cfg.get("force_double_batch", False)
                 self.consistency_loss = None
                 self.consistency_loss_weight = 0.0
+                self.consistency_loss_after_step = -1
         else:
             self.use_double_batch = False
 
