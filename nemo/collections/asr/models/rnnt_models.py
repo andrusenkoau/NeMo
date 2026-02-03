@@ -109,10 +109,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
                 )
                 self.consistency_loss_weight = weight
+                self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
             else:
                 self.use_double_batch = consistency_loss_cfg.get("force_double_batch", False)
                 self.consistency_loss = None
                 self.consistency_loss_weight = 0.0
+                self.consistency_loss_after_step = -1
         else:
             self.use_double_batch = False
 
@@ -782,7 +784,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
 
-            if self.consistency_loss is not None:
+            if self.consistency_loss is not None and self.trainer.global_step > self.consistency_loss_after_step:
                 batch_size_half = joint.shape[0] // 2
                 consistency_loss_value = self.consistency_loss(
                     teacher_logits=joint[:batch_size_half],
@@ -800,7 +802,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     "consistency_loss_scaled": self.consistency_loss_weight * consistency_loss_value_item,
                 }
             else:
-                consistency_loss_logs = {}
+                if self.consistency_loss is not None:
+                    consistency_loss_logs = {"rnnt_loss": loss_value.item()}
+                else:
+                    consistency_loss_logs = {}
 
             # Reset access registry
             if AccessMixin.is_access_enabled(self.model_guid):

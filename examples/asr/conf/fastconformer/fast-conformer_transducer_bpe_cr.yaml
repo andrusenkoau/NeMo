@@ -229,6 +229,7 @@ model:
       use_blank: false
       complete_distribution: true
       reduction: mean_volume
+      after_step: -1
 
     warprnnt_numba_kwargs:
       # FastEmit regularization: https://arxiv.org/abs/2010.11148
