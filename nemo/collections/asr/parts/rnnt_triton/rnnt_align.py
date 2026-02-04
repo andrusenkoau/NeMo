@@ -14,6 +14,7 @@
 
 import torch
 
+from nemo.collections.asr.modules.rnnt_abstract import AbstractRNNTJoint
 from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import rnnt_logprobs
 
 
@@ -233,3 +234,60 @@ def align_from_logits(
     )
 
     return alignments
+
+
+def align_with_joint_simple(
+    encoder_output: torch.Tensor,
+    predictor_output: torch.Tensor,
+    targets: torch.Tensor,
+    blank_id: int,
+    joint: AbstractRNNTJoint,
+    src_lengths: torch.Tensor | None = None,
+    tgt_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    ...
+    """
+    encoder_output = joint.project_encoder(encoder_output)
+    predictor_output = joint.project_prednet(predictor_output)
+
+    joint_output = joint.joint_after_projection(
+        f=encoder_output,
+        g=predictor_output,
+    )
+
+    return align_from_logits(
+        logits=joint_output,
+        targets=targets,
+        blank_id=blank_id,
+        src_lengths=src_lengths,
+        tgt_lengths=tgt_lengths,
+    )
+
+
+def align_with_joint(
+    encoder_output: torch.Tensor,
+    predictor_output: torch.Tensor,
+    targets: torch.Tensor,
+    blank_id: int,
+    joint: AbstractRNNTJoint,
+    src_lengths: torch.Tensor | None = None,
+    tgt_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    ...
+    """
+    encoder_output = joint.project_encoder(encoder_output)
+    predictor_output = joint.project_prednet(predictor_output)
+
+    device = encoder_output.device
+    batch_size, src_length_max, _ = encoder_output.shape
+    tgt_length_max_plus_1 = predictor_output.shape[1]
+    tgt_length_max = tgt_length_max_plus_1 - 1
+
+    if src_lengths is None:
+        src_lengths = torch.full([batch_size], fill_value=src_length_max, dtype=torch.long, device=device)
+    if tgt_lengths is None:
+        tgt_lengths = torch.full([batch_size], fill_value=tgt_length_max, dtype=torch.long, device=device)
+
+    raise NotImplementedError
