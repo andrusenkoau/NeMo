@@ -38,7 +38,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscriptionReturnType,
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
-from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, ConsistencyGraphRNNTLoss
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -101,7 +101,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 if loss_name == "tdt":
                     raise NotImplementedError
                 self.use_double_batch = True
-                if consistency_loss_cfg.get("use_all_logits", False):
+                if consistency_loss_cfg.get("use_graph_rnnt", False):
+                    logging.info(f"Instantiated graph consistency loss with params: {consistency_loss_cfg}")
+                    self.consistency_loss = ConsistencyGraphRNNTLoss(
+                        blank_id=num_classes,
+                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                    )
+                elif consistency_loss_cfg.get("use_all_logits", False):
                     logging.info(f"Instantiated full consistency loss with params: {consistency_loss_cfg}")
                     self.consistency_loss = ConsistencyFullRNNTLoss(
                         symmetrical=consistency_loss_cfg.get("symmetrical", True),
