@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import get_rnnt_mask, rnnt_logprobs
 from nemo.utils.enum import PrettyStrEnum
+from nemo.core.utils.optional_libs import K2_AVAILABLE
 
 
 class ConsistencyRNNTReductionType(PrettyStrEnum):
@@ -306,5 +307,61 @@ class ConsistencyFullRNNTLoss(nn.Module):
                 kl_loss_value = (kl_loss.sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp(min=1)).mean()
             case _:
                 raise NotImplementedError(f"Unsupported reduction {self.reduction}")
+
+        return kl_loss_value
+
+
+class ConsistencyGraphRNNTLoss(nn.Module):
+    def __init__(
+        self,
+        blank_id: int,
+        symmetrical: bool = True,
+    ):
+        super().__init__()
+        # TODO: move this loss to k2 library after experiments
+        self.symmetrical = symmetrical
+        self.blank_id = blank_id
+        if K2_AVAILABLE:
+            from nemo.collections.asr.parts.k2.graph_transducer import GraphRnntLoss
+
+            self.graph_rnnt = GraphRnntLoss(blank=blank_id)
+        else:
+            self.graph_rnnt = None
+
+    def forward(
+        self,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        targets: torch.Tensor,
+        src_lengths: torch.Tensor | None = None,
+        tgt_lengths: torch.Tensor | None = None,
+    ):
+        if self.graph_rnnt is None:
+            raise RuntimeError("K2 is not available, cannot compute loss")
+
+        batch_size, src_length_max, tgt_length_max_plus_1, _ = teacher_logits.shape
+        device = teacher_logits.device
+        tgt_length_max = tgt_length_max_plus_1 - 1
+
+        if src_lengths is None:
+            src_lengths = torch.full([batch_size], fill_value=src_length_max, dtype=torch.long, device=device)
+        if tgt_lengths is None:
+            tgt_lengths = torch.full([batch_size], fill_value=tgt_length_max, dtype=torch.long, device=device)
+
+        teacher_graphs = self.graph_rnnt.get_weighted_graphs(
+            logits=teacher_logits, targets=targets, source_lengths=src_lengths, target_lengths=tgt_lengths
+        )
+
+        student_graphs = self.graph_rnnt.get_weighted_graphs(
+            logits=student_logits, targets=targets, source_lengths=src_lengths, target_lengths=tgt_lengths
+        )
+
+        kl_loss_value = self.graph_rnnt.consistency_loss(
+            teacher_fsas_vec=teacher_graphs,
+            student_fsas_vec=student_graphs,
+            source_lengths=src_lengths,
+            target_lengths=tgt_lengths,
+            symmetrical=self.symmetrical,
+        )
 
         return kl_loss_value
