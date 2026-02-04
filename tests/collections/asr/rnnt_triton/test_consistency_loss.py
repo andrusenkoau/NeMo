@@ -14,7 +14,7 @@
 
 import pytest
 import torch
-from nemo.collections.asr.parts.rnnt_triton import ConsistencyRNNTLoss, consistency_rnnt_kld
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, consistency_rnnt_kld
 
 
 def get_devices_for_testing(use_cpu_always: bool = False) -> list[torch.device]:
@@ -416,6 +416,32 @@ def test_module_api(device: torch.device, symmetrical: bool, use_blank: bool, re
         blank_id=4,
         symmetrical=symmetrical,
         use_blank=use_blank,
+        reduction=reduction,
+    )
+
+    teacher_logits = torch.randn(2, 4, 3, 5, device=device)
+    student_logits = torch.randn(2, 4, 3, 5, device=device)
+    targets = torch.randint(0, 4, (2, 2), device=device)
+
+    loss = module(
+        teacher_logits=teacher_logits,
+        student_logits=student_logits,
+        targets=targets,
+    )
+    assert loss.ndim == 0
+    assert loss >= 0
+    assert torch.isfinite(loss)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("symmetrical", [True, False])
+@pytest.mark.parametrize("reduction", ["mean_volume", "mean"])
+def test_consistency_full_loss(device: torch.device, symmetrical: bool, reduction: str):
+    """Basic test"""
+    torch.manual_seed(42)
+    module = ConsistencyFullRNNTLoss(
+        symmetrical=symmetrical,
         reduction=reduction,
     )
 
