@@ -275,7 +275,7 @@ class ConsistencyFullRNNTLoss(nn.Module):
         self,
         teacher_logits: torch.Tensor,
         student_logits: torch.Tensor,
-        targets: torch.Tensor,  # not needed, but keep consistent for now with `ConsistencyRNNTLoss`
+        targets: torch.Tensor | None = None,  # not needed, but keep consistent for now with `ConsistencyRNNTLoss`
         src_lengths: torch.Tensor | None = None,
         tgt_lengths: torch.Tensor | None = None,
     ):
@@ -292,7 +292,7 @@ class ConsistencyFullRNNTLoss(nn.Module):
             src_lengths=src_lengths,
             tgt_lengths=tgt_lengths,
         )
-        mask = mask_blank[..., None]
+        mask = mask_blank
         kl_loss = _compute_kl_loss(
             teacher_logprobs=teacher_logprobs,
             student_logprobs=student_logprobs,
