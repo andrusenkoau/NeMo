@@ -101,12 +101,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 if loss_name == "tdt":
                     raise NotImplementedError
                 self.use_double_batch = True
-                if consistency_loss_cfg.cfg.get("use_all_logits", False):
+                if consistency_loss_cfg.get("use_all_logits", False):
+                    logging.info(f"Instantiated full consistency loss with params: {consistency_loss_cfg}")
                     self.consistency_loss = ConsistencyFullRNNTLoss(
                         symmetrical=consistency_loss_cfg.get("symmetrical", True),
                         reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
                     )
                 else:
+                    logging.info(f"Instantiated partial consistency loss with params: {consistency_loss_cfg}")
                     self.consistency_loss = ConsistencyRNNTLoss(
                         blank_id=num_classes,
                         symmetrical=consistency_loss_cfg.get("symmetrical", True),
