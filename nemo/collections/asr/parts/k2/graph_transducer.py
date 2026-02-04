@@ -633,7 +633,7 @@ class GraphRnntLoss(GraphTransducerLossBase):
                 )
             )
         kl_loss_full *= mask
-        norm_factor = (source_lengths + target_lengths - 1).clamp(min=1)[: batch_size // 2]
+        norm_factor = (source_lengths + target_lengths - 1).clamp(min=1)
         kl_loss = kl_loss_full.sum(dim=-1) / norm_factor
         kl_loss_value = kl_loss.mean()
         if sanity_check:
