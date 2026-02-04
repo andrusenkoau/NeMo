@@ -14,7 +14,8 @@
 
 import pytest
 import torch
-from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, consistency_rnnt_kld
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, consistency_rnnt_kld, ConsistencyGraphRNNTLoss
+from nemo.core.utils.optional_libs import K2_AVAILABLE
 
 
 def get_devices_for_testing(use_cpu_always: bool = False) -> list[torch.device]:
@@ -443,6 +444,33 @@ def test_consistency_full_loss(device: torch.device, symmetrical: bool, reductio
     module = ConsistencyFullRNNTLoss(
         symmetrical=symmetrical,
         reduction=reduction,
+    )
+
+    teacher_logits = torch.randn(2, 4, 3, 5, device=device)
+    student_logits = torch.randn(2, 4, 3, 5, device=device)
+    targets = torch.randint(0, 4, (2, 2), device=device)
+
+    loss = module(
+        teacher_logits=teacher_logits,
+        student_logits=student_logits,
+        targets=targets,
+    )
+    assert loss.ndim == 0
+    assert loss >= 0
+    assert torch.isfinite(loss)
+
+@pytest.mark.unit
+@pytest.mark.skipif(not K2_AVAILABLE, reason="k2 unavailable")
+@pytest.mark.parametrize("device", DEVICES_WITH_CPU)
+@pytest.mark.parametrize("symmetrical", [True, False])
+def test_consistency_graph_rnnt_loss(device: torch.device, symmetrical: bool):
+    """Basic test"""
+    if device.type == "mps":
+        pytest.skip(reason="k2 does not support mps")
+    torch.manual_seed(42)
+    module = ConsistencyGraphRNNTLoss(
+        blank_id=4,
+        symmetrical=symmetrical,
     )
 
     teacher_logits = torch.randn(2, 4, 3, 5, device=device)

@@ -600,26 +600,25 @@ class GraphRnntLoss(GraphTransducerLossBase):
 
     def consistency_loss(
         self,
-        target_fsas_vec: "k2.Fsa",
+        teacher_fsas_vec: "k2.Fsa",
+        student_fsas_vec: "k2.Fsa",
         source_lengths: torch.Tensor,
         target_lengths: torch.Tensor,
         symmetrical: bool = False,
         sanity_check: bool = False,
     ) -> torch.Tensor:
-        device = target_fsas_vec.device
-        arc_post_batch, arc_sizes = self.get_arc_post_batch(target_fsas_vec=target_fsas_vec)
+        device = teacher_fsas_vec.device
+        arc_post_batch_teacher, arc_sizes = self.get_arc_post_batch(target_fsas_vec=teacher_fsas_vec)
+        arc_post_batch_student, _ = self.get_arc_post_batch(target_fsas_vec=student_fsas_vec)
         arc_sizes_minus_2 = arc_sizes - 2  # ignore last 2 transitions - probability always 1
         batch_size = arc_sizes.shape[0]
-        batch_size_half = batch_size // 2
-        teacher_logits = arc_post_batch[:batch_size_half]
-        student_logits = arc_post_batch[batch_size_half:]
         mask = (
-            torch.arange(arc_post_batch.shape[1], dtype=torch.long, device=device)[None, :]
-            < arc_sizes_minus_2[:batch_size_half, None]
+            torch.arange(arc_post_batch_teacher.shape[1], dtype=torch.long, device=device)[None, :]
+            < arc_sizes_minus_2[:, None]
         )
         kl_loss_full = F.kl_div(
-            input=student_logits,
-            target=teacher_logits.detach(),
+            input=arc_post_batch_student,
+            target=arc_post_batch_teacher.detach(),
             log_target=True,
             reduction="none",
         )
@@ -627,8 +626,8 @@ class GraphRnntLoss(GraphTransducerLossBase):
             kl_loss_full = 0.5 * (
                 kl_loss_full
                 + F.kl_div(
-                    input=teacher_logits,
-                    target=student_logits.detach(),
+                    input=arc_post_batch_teacher,
+                    target=arc_post_batch_student.detach(),
                     log_target=True,
                     reduction="none",
                 )
@@ -640,13 +639,13 @@ class GraphRnntLoss(GraphTransducerLossBase):
         if sanity_check:
             with torch.no_grad():
                 assert kl_loss_value.item() >= 0.0
-                float_dtype = teacher_logits.dtype
+                float_dtype = arc_post_batch_teacher.dtype
                 assert torch.allclose(
-                    torch.logsumexp(torch.where(mask, teacher_logits, float("-inf")), dim=-1).exp(),
+                    torch.logsumexp(torch.where(mask, arc_post_batch_teacher, float("-inf")), dim=-1).exp(),
                     norm_factor.to(float_dtype),
                 )
                 assert torch.allclose(
-                    torch.logsumexp(torch.where(mask, student_logits, float("-inf")), dim=-1).exp(),
+                    torch.logsumexp(torch.where(mask, arc_post_batch_student, float("-inf")), dim=-1).exp(),
                     norm_factor.to(float_dtype),
                 )
         return kl_loss_value
