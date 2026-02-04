@@ -38,7 +38,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscriptionReturnType,
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
-from nemo.collections.asr.parts.rnnt_triton import ConsistencyRNNTLoss
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -101,13 +101,19 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 if loss_name == "tdt":
                     raise NotImplementedError
                 self.use_double_batch = True
-                self.consistency_loss = ConsistencyRNNTLoss(
-                    blank_id=num_classes,
-                    symmetrical=consistency_loss_cfg.get("symmetrical", True),
-                    use_blank=consistency_loss_cfg.get("use_blank", False),
-                    complete_distribution=consistency_loss_cfg.get("complete_distribution", False),
-                    reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
-                )
+                if consistency_loss_cfg.cfg.get("use_all_logits"):
+                    self.consistency_loss = ConsistencyFullRNNTLoss(
+                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                        reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                    )
+                else:
+                    self.consistency_loss = ConsistencyRNNTLoss(
+                        blank_id=num_classes,
+                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                        use_blank=consistency_loss_cfg.get("use_blank", False),
+                        complete_distribution=consistency_loss_cfg.get("complete_distribution", False),
+                        reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                    )
                 self.consistency_loss_weight = weight
                 self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
             else:

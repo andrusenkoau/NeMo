@@ -223,13 +223,15 @@ model:
     loss_name: "default"
 
     consistency:
+      use_all_logits: true
       force_double_batch: false  # if weight is not None/0.0, still use double batch
       weight: 0.2
       symmetrical: true
-      use_blank: false
-      complete_distribution: true
       reduction: mean_volume
       after_step: -1
+      # for use_all_logits: false
+      use_blank: false
+      complete_distribution: true
 
     warprnnt_numba_kwargs:
       # FastEmit regularization: https://arxiv.org/abs/2010.11148

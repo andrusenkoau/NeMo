@@ -259,3 +259,52 @@ class ConsistencyRNNTLoss(nn.Module):
             eps=self.eps,
             reduction=self.reduction,
         )
+
+
+class ConsistencyFullRNNTLoss(nn.Module):
+    def __init__(
+        self,
+        symmetrical: bool = True,
+        reduction: str | ConsistencyRNNTReductionType = 'mean_volume',
+    ):
+        super().__init__()
+        self.reduction = ConsistencyRNNTReductionType(reduction)
+        self.symmetrical = symmetrical
+
+    def forward(
+        self,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        targets: torch.Tensor,  # not needed, but keep consistent for now with `ConsistencyRNNTLoss`
+        src_lengths: torch.Tensor | None = None,
+        tgt_lengths: torch.Tensor | None = None,
+    ):
+        teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
+        student_logprobs = F.log_softmax(student_logits, dim=-1)
+
+        device = teacher_logits.device
+        batch_size, src_length_max, tgt_length_max_plus_1, _ = teacher_logits.shape
+        _, mask_blank = get_rnnt_mask(
+            batch_size=batch_size,
+            src_length_max=src_length_max,
+            tgt_length_max_plus_1=tgt_length_max_plus_1,
+            device=device,
+            src_lengths=src_lengths,
+            tgt_lengths=tgt_lengths,
+        )
+        mask = mask_blank[..., None]
+        kl_loss = _compute_kl_loss(
+            teacher_logprobs=teacher_logprobs,
+            student_logprobs=student_logprobs,
+            mask=mask,
+            symmetrical=self.symmetrical,
+        )
+        match self.reduction:
+            case ConsistencyRNNTReductionType.MEAN:
+                kl_loss_value = kl_loss.sum() / mask.sum().clamp(min=1)
+            case ConsistencyRNNTReductionType.MEAN_VOLUME:
+                kl_loss_value = (kl_loss.sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp(min=1)).mean()
+            case _:
+                raise NotImplementedError(f"Unsupported reduction {self.reduction}")
+
+        return kl_loss_value
