@@ -223,7 +223,7 @@ model:
     loss_name: "default"
 
     consistency:
-      use_all_logits: true
+      use_all_logits: false
       force_double_batch: false  # if weight is not None/0.0, still use double batch
       weight: 0.2
       symmetrical: true
