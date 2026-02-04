@@ -531,10 +531,16 @@ class TestRealModelAlignment:
             decoder_output, _, _ = model.decoder(targets=targets, target_length=tgt_lengths)
 
             # Joint: [B, T, U+1, V]
-            joint_output = model.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=decoder_output,
-            )
+            # Temporarily disable fuse_loss_wer to avoid needing to provide all loss inputs
+            original_fuse_loss_wer = model.joint._fuse_loss_wer
+            model.joint._fuse_loss_wer = False
+            try:
+                joint_output = model.joint(
+                    encoder_outputs=encoded,
+                    decoder_outputs=decoder_output,
+                )
+            finally:
+                model.joint._fuse_loss_wer = original_fuse_loss_wer
 
             # Get alignment
             src_lengths = encoded_lengths
