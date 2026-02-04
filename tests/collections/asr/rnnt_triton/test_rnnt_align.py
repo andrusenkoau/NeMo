@@ -485,11 +485,16 @@ class TestRealModelAlignment:
     """Integration tests with real ASR models."""
 
     @pytest.mark.unit
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for k2 comparison")
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() or torch.mps.is_available()), reason="Requires CUDA or MPS for k2 comparison"
+    )
     def test_real_model_alignment_validity(self, fast_conformer_transducer_model):
         """Test alignment validity with a real transducer model."""
         model = fast_conformer_transducer_model
-        device = torch.device("cuda")
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
+        k2_device = (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )  # k2 does not support MPS
 
         model = model.to(device)
         model.eval()
@@ -522,27 +527,25 @@ class TestRealModelAlignment:
             targets = torch.randint(0, blank_id, [B, U], device=device)
             tgt_lengths = torch.tensor([U, U - 2], device=device, dtype=torch.long)
 
-            # Get joint output
-            decoder_output, _ = model.decoder(targets=targets, target_length=tgt_lengths)
+            # Get predictor output
+            decoder_output, _, _ = model.decoder(targets=targets, target_length=tgt_lengths)
 
             # Joint: [B, T, U+1, V]
-            joint_input = model.joint(
+            joint_output = model.joint(
                 encoder_outputs=encoded,
                 decoder_outputs=decoder_output,
             )
 
             # Get alignment
             src_lengths = encoded_lengths
-            our_alignments = align_from_logits(joint_input, targets, blank_id, src_lengths, tgt_lengths)
+            our_alignments = align_from_logits(joint_output, targets, blank_id, src_lengths, tgt_lengths)
 
-            # Compare with k2 (only on CPU since k2 doesn't support MPS)
-            joint_cpu = joint_input.cpu()
-            targets_cpu = targets.cpu()
-            src_lengths_cpu = src_lengths.cpu()
-            tgt_lengths_cpu = tgt_lengths.cpu()
-
+            # Compare with k2
             k2_loss = GraphRnntLoss(blank=blank_id)
-            k2_alignments = k2_loss.align_from_logits(joint_cpu, targets_cpu, src_lengths_cpu, tgt_lengths_cpu)
+            k2_alignments = k2_loss.align_from_logits(
+                joint_output.to(k2_device), targets.to(k2_device), src_lengths.to(k2_device), tgt_lengths.to(k2_device)
+            )
+            k2_alignments = k2_alignments.to(device)
 
             # Check alignment properties
             for b in range(B):
@@ -563,5 +566,5 @@ class TestRealModelAlignment:
 
                 # Check matches k2
                 assert torch.equal(
-                    our_alignments[b, :U_b].cpu(), k2_alignments[b, :U_b]
+                    our_alignments[b, :U_b], k2_alignments[b, :U_b]
                 ), f"Alignment mismatch with k2 at batch {b}"
