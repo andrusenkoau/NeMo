@@ -473,9 +473,9 @@ def test_consistency_graph_rnnt_loss(device: torch.device, symmetrical: bool):
         symmetrical=symmetrical,
     )
 
-    teacher_logits = torch.randn(2, 4, 3, 5, device=device)
-    student_logits = torch.randn(2, 4, 3, 5, device=device)
-    targets = torch.randint(0, 4, (2, 2), device=device)
+    teacher_logits = torch.randn(4, 4, 3, 5, device=device)
+    student_logits = torch.randn(4, 4, 3, 5, device=device)
+    targets = torch.randint(0, 4, (4, 2), device=device)
 
     loss = module(
         teacher_logits=teacher_logits,
