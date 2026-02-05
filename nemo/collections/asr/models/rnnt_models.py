@@ -112,6 +112,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     self.consistency_loss = ConsistencyFullRNNTLoss(
                         symmetrical=consistency_loss_cfg.get("symmetrical", True),
                         reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                        use_triton=consistency_loss_cfg.get("use_triton", False),
                     )
                 else:
                     logging.info(f"Instantiated partial consistency loss with params: {consistency_loss_cfg}")

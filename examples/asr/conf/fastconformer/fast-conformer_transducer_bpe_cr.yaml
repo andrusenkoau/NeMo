@@ -225,6 +225,7 @@ model:
     consistency:
       use_graph_rnnt: false
       use_all_logits: false
+      use_triton: false
       force_double_batch: false  # if weight is not None/0.0, still use double batch
       weight: 0.2
       symmetrical: true

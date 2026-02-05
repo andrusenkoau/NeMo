@@ -269,13 +269,13 @@ class ConsistencyFullRNNTLoss(nn.Module):
     def __init__(
         self,
         symmetrical: bool = True,
-        use_triton: bool = False,
+        use_triton: bool | None = None,  # None -> auto
         reduction: str | ConsistencyRNNTReductionType = 'mean_volume',
     ):
         super().__init__()
         self.reduction = ConsistencyRNNTReductionType(reduction)
         self.symmetrical = symmetrical
-        self.use_triton = use_triton if TRITON_AVAILABLE else False
+        self.use_triton = TRITON_AVAILABLE if use_triton is None else use_triton
 
     def forward(
         self,
