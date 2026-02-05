@@ -37,7 +37,8 @@ class BenchmarkResults:
     symmetrical: bool
     use_triton: bool
     input_memory_gb: float
-    additional_memory_gb: float
+    forward_memory_gb: float
+    backward_peak_memory_gb: float
     forward_time_ms: float
     backward_time_ms: float
     total_time_ms: float
@@ -106,10 +107,11 @@ def benchmark_consistency_loss(
 
     # Measure input memory
     torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    input_memory = torch.cuda.max_memory_allocated()
+    input_memory = torch.cuda.memory_allocated()
 
-    # Warmup iterations
+    # Warmup iterations (use clone for warmup only)
     for _ in range(warmup_iters):
         student_logits_warmup = student_logits.detach().clone().requires_grad_(True)
         loss = module(
@@ -117,17 +119,21 @@ def benchmark_consistency_loss(
             student_logits=student_logits_warmup,
         )
         loss.backward()
+        del student_logits_warmup, loss
 
     torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
-    # Reset memory stats after warmup
+    # Reset memory stats after warmup - baseline is the input tensors
     torch.cuda.reset_peak_memory_stats()
     baseline_memory = torch.cuda.memory_allocated()
 
-    # Benchmark forward pass
+    # Benchmark forward pass timing
     forward_times = []
     for _ in range(bench_iters):
-        student_logits_bench = student_logits.detach().clone().requires_grad_(True)
+        # Zero grad instead of clone to avoid memory inflation
+        if student_logits.grad is not None:
+            student_logits.grad = None
 
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
@@ -136,23 +142,45 @@ def benchmark_consistency_loss(
         start.record()
         loss = module(
             teacher_logits=teacher_logits,
-            student_logits=student_logits_bench,
+            student_logits=student_logits,
         )
         end.record()
 
         torch.cuda.synchronize()
         forward_times.append(start.elapsed_time(end))
 
-    # Measure memory after forward
-    forward_peak_memory = torch.cuda.max_memory_allocated()
+        # Clean up for next iteration
+        loss.backward()
+        del loss
 
-    # Benchmark backward pass
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    # Measure memory for forward pass only (single iteration)
+    torch.cuda.reset_peak_memory_stats()
+    if student_logits.grad is not None:
+        student_logits.grad = None
+    loss = module(teacher_logits=teacher_logits, student_logits=student_logits)
+    torch.cuda.synchronize()
+    forward_memory = torch.cuda.max_memory_allocated() - baseline_memory
+
+    # Measure memory for backward pass
+    torch.cuda.reset_peak_memory_stats()
+    loss.backward()
+    torch.cuda.synchronize()
+    backward_peak_memory = torch.cuda.max_memory_allocated() - baseline_memory
+    del loss
+
+    # Benchmark backward pass timing
     backward_times = []
     for _ in range(bench_iters):
-        student_logits_bench = student_logits.detach().clone().requires_grad_(True)
+        # Zero grad instead of clone
+        if student_logits.grad is not None:
+            student_logits.grad = None
+
         loss = module(
             teacher_logits=teacher_logits,
-            student_logits=student_logits_bench,
+            student_logits=student_logits,
         )
 
         torch.cuda.synchronize()
@@ -165,9 +193,7 @@ def benchmark_consistency_loss(
 
         torch.cuda.synchronize()
         backward_times.append(start.elapsed_time(end))
-
-    # Measure total peak memory
-    total_peak_memory = torch.cuda.max_memory_allocated()
+        del loss
 
     # Calculate statistics
     avg_forward_time = sum(forward_times) / len(forward_times)
@@ -175,7 +201,8 @@ def benchmark_consistency_loss(
 
     # Memory calculations
     input_memory_gb = input_memory / (1024 ** 3)
-    additional_memory_gb = (total_peak_memory - baseline_memory) / (1024 ** 3)
+    forward_memory_gb = forward_memory / (1024 ** 3)
+    backward_peak_memory_gb = backward_peak_memory / (1024 ** 3)
 
     dtype_str = 'float32' if dtype == torch.float32 else 'bfloat16'
 
@@ -184,7 +211,8 @@ def benchmark_consistency_loss(
         symmetrical=symmetrical,
         use_triton=use_triton,
         input_memory_gb=input_memory_gb,
-        additional_memory_gb=additional_memory_gb,
+        forward_memory_gb=forward_memory_gb,
+        backward_peak_memory_gb=backward_peak_memory_gb,
         forward_time_ms=avg_forward_time,
         backward_time_ms=avg_backward_time,
         total_time_ms=avg_forward_time + avg_backward_time,
@@ -203,9 +231,10 @@ def print_results(results: BenchmarkResults):
     print(f"  - Implementation: {impl}")
     print(f"  - Dtype: {results.dtype}")
     print(f"  - Symmetrical: {sym}")
-    print(f"\nMemory Usage:")
+    print(f"\nMemory Usage (above input tensors):")
     print(f"  - Input Memory: {results.input_memory_gb:.3f} GB")
-    print(f"  - Additional Memory: {results.additional_memory_gb:.3f} GB")
+    print(f"  - Forward Peak: {results.forward_memory_gb:.3f} GB")
+    print(f"  - Backward Peak: {results.backward_peak_memory_gb:.3f} GB")
     print(f"\nTiming (averaged):")
     print(f"  - Forward: {results.forward_time_ms:.3f} ms")
     print(f"  - Backward: {results.backward_time_ms:.3f} ms")
