@@ -76,10 +76,12 @@ def _kl_div_fwd_kernel(
         student_softmax = tl.exp(student_log_softmax)
         prob_diff = teacher_softmax - student_softmax
         log_prob_diff = teacher_log_softmax - student_log_softmax
-        kl_loss_value = 0.5 * tl.sum(prob_diff * log_prob_diff, axis=0)
+        kl_per_vocab = prob_diff * log_prob_diff
+        kl_loss_value = 0.5 * tl.sum(tl.where(mask, kl_per_vocab, 0.0), axis=0)
     else:
         # non-symmetric KL: sum(P * (log P - log Q))
-        kl_loss_value = tl.sum(teacher_softmax * (teacher_log_softmax - student_log_softmax), axis=0)
+        kl_per_vocab = teacher_softmax * (teacher_log_softmax - student_log_softmax)
+        kl_loss_value = tl.sum(tl.where(mask, kl_per_vocab, 0.0), axis=0)
 
     tl.store(kl_loss_out_ptr + idx_no_vocab, kl_loss_value)
 
