@@ -20,6 +20,7 @@ from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import get_rnnt_mask, 
 from nemo.core.utils.optional_libs import K2_AVAILABLE, TRITON_AVAILABLE
 from nemo.utils.enum import PrettyStrEnum
 from nemo.core.utils.optional_libs import K2_AVAILABLE
+from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 
 if TRITON_AVAILABLE:
     from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
