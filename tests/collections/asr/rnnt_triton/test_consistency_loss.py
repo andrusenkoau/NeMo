@@ -753,13 +753,14 @@ class TestKLLossTriton:
 
     @pytest.mark.unit
     @requires_cuda
-    def test_kl_loss_triton_large_vocab(self):
-        """Test with large vocabulary size."""
+    @pytest.mark.parametrize("V", [4095, 4096])
+    def test_kl_loss_triton_large_vocab(self, V):
+        """Test with large vocabulary size (power-of-2 and non-power-of-2)."""
         from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
-        B, T, U_plus_1, V = 2, 4, 3, 4096
+        B, T, U_plus_1 = 2, 4, 3
 
         teacher_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32)
         student_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
@@ -771,6 +772,67 @@ class TestKLLossTriton:
         assert torch.isfinite(loss)
         assert student_logits.grad is not None
         assert torch.all(torch.isfinite(student_logits.grad))
+
+    @pytest.mark.unit
+    @requires_cuda
+    def test_kl_loss_triton_non_power_of_2_vocab(self):
+        """Test forward correctness with non-power-of-2 vocab size."""
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
+        import torch.nn.functional as F
+
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        B, T, U_plus_1, V = 2, 4, 3, 1025
+
+        teacher_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32)
+        student_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32)
+        mask = torch.ones(B, T, U_plus_1, dtype=torch.bool, device=device)
+
+        # Triton implementation
+        triton_loss = kl_loss_triton(teacher_logits, student_logits, mask, symmetrical=False)
+
+        # PyTorch reference
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_probs = teacher_log_probs.exp()
+        pytorch_loss = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
+
+        assert torch.all(torch.isfinite(triton_loss)), "Triton loss contains NaN/Inf"
+        assert torch.allclose(triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4), \
+            f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
+
+    @pytest.mark.unit
+    @requires_cuda
+    def test_kl_loss_triton_non_power_of_2_vocab_backward(self):
+        """Test backward correctness with non-power-of-2 vocab size."""
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
+        import torch.nn.functional as F
+
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        B, T, U_plus_1, V = 2, 4, 3, 1025
+
+        teacher_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32)
+
+        # Triton path
+        student_logits_triton = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
+        mask = torch.ones(B, T, U_plus_1, dtype=torch.bool, device=device)
+        triton_loss = kl_loss_triton(teacher_logits, student_logits_triton, mask, symmetrical=False).sum()
+        triton_loss.backward()
+        triton_grad = student_logits_triton.grad.clone()
+
+        # PyTorch reference path
+        student_logits_pytorch = student_logits_triton.detach().clone().requires_grad_(True)
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_logits_pytorch, dim=-1)
+        teacher_probs = teacher_log_probs.exp()
+        pytorch_loss = F.kl_div(student_log_probs, teacher_probs, reduction='sum')
+        pytorch_loss.backward()
+        pytorch_grad = student_logits_pytorch.grad.clone()
+
+        assert torch.all(torch.isfinite(triton_grad)), "Triton gradients contain NaN/Inf"
+        assert torch.allclose(triton_grad, pytorch_grad, atol=1e-5, rtol=1e-4), \
+            f"Max grad diff: {(triton_grad - pytorch_grad).abs().max()}"
 
 
 # =============================================================================
@@ -1026,13 +1088,14 @@ class TestFusedSymmetricKLDivTriton:
 
     @pytest.mark.unit
     @requires_cuda
-    def test_fused_symmetric_large_vocab(self):
-        """Test fused symmetric kernel with large vocabulary size."""
+    @pytest.mark.parametrize("V", [4095, 4096])
+    def test_fused_symmetric_large_vocab(self, V):
+        """Test fused symmetric kernel with large vocabulary size (power-of-2 and non-power-of-2)."""
         from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
-        B, T, U_plus_1, V = 2, 4, 3, 4096
+        B, T, U_plus_1 = 2, 4, 3
 
         teacher_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
         student_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
@@ -1046,6 +1109,44 @@ class TestFusedSymmetricKLDivTriton:
         assert student_logits.grad is not None
         assert torch.all(torch.isfinite(teacher_logits.grad))
         assert torch.all(torch.isfinite(student_logits.grad))
+
+    @pytest.mark.unit
+    @requires_cuda
+    def test_fused_symmetric_non_power_of_2_vocab(self):
+        """Test fused symmetric forward+backward with non-power-of-2 vocab size."""
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
+        import torch.nn.functional as F
+
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        B, T, U_plus_1, V = 2, 4, 3, 1025
+
+        teacher_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
+        student_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
+        mask = torch.ones(B, T, U_plus_1, dtype=torch.bool, device=device)
+
+        # Triton implementation
+        triton_loss = kl_loss_triton(teacher_logits, student_logits, mask, symmetrical=True)
+
+        # PyTorch reference
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_probs = teacher_log_probs.exp()
+        student_probs = student_log_probs.exp()
+        kl_ts = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
+        kl_st = F.kl_div(teacher_log_probs, student_probs, reduction='none').sum(dim=-1)
+        pytorch_loss = 0.5 * (kl_ts + kl_st)
+
+        assert torch.all(torch.isfinite(triton_loss)), "Triton loss contains NaN/Inf"
+        assert torch.allclose(triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4), \
+            f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
+
+        # Also verify backward
+        triton_loss.sum().backward()
+        assert teacher_logits.grad is not None
+        assert student_logits.grad is not None
+        assert torch.all(torch.isfinite(teacher_logits.grad)), "Teacher gradients contain NaN/Inf"
+        assert torch.all(torch.isfinite(student_logits.grad)), "Student gradients contain NaN/Inf"
 
     @pytest.mark.unit
     @requires_cuda
