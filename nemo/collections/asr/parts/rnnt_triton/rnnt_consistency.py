@@ -19,7 +19,10 @@ import torch.nn.functional as F
 from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import get_rnnt_mask, rnnt_logprobs
 from nemo.utils.enum import PrettyStrEnum
 from nemo.core.utils.optional_libs import K2_AVAILABLE
+from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 
+if TRITON_AVAILABLE:
+    from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
 class ConsistencyRNNTReductionType(PrettyStrEnum):
     MEAN = "mean"
@@ -266,11 +269,13 @@ class ConsistencyFullRNNTLoss(nn.Module):
     def __init__(
         self,
         symmetrical: bool = True,
+        use_triton: bool = False,
         reduction: str | ConsistencyRNNTReductionType = 'mean_volume',
     ):
         super().__init__()
         self.reduction = ConsistencyRNNTReductionType(reduction)
         self.symmetrical = symmetrical
+        self.use_triton = use_triton if TRITON_AVAILABLE else False
 
     def forward(
         self,
@@ -280,11 +285,15 @@ class ConsistencyFullRNNTLoss(nn.Module):
         src_lengths: torch.Tensor | None = None,
         tgt_lengths: torch.Tensor | None = None,
     ):
-        teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
-        student_logprobs = F.log_softmax(student_logits, dim=-1)
-
         device = teacher_logits.device
         batch_size, src_length_max, tgt_length_max_plus_1, _ = teacher_logits.shape
+        tgt_length_max = tgt_length_max_plus_1 - 1
+
+        if src_lengths is None:
+            src_lengths = torch.full([batch_size], fill_value=src_length_max, dtype=torch.long, device=device)
+        if tgt_lengths is None:
+            tgt_lengths = torch.full([batch_size], fill_value=tgt_length_max, dtype=torch.long, device=device)
+
         _, mask_blank = get_rnnt_mask(
             batch_size=batch_size,
             src_length_max=src_length_max,
@@ -294,12 +303,24 @@ class ConsistencyFullRNNTLoss(nn.Module):
             tgt_lengths=tgt_lengths,
         )
         mask = mask_blank
-        kl_loss = _compute_kl_loss(
-            teacher_logprobs=teacher_logprobs,
-            student_logprobs=student_logprobs,
-            mask=mask,
-            symmetrical=self.symmetrical,
-        )
+
+        if self.use_triton and device.type == "cuda":
+            kl_loss = kl_loss_triton(
+                teacher_logits=teacher_logits,
+                student_logits=student_logits,
+                mask=mask,
+                symmetrical=self.symmetrical,
+            )
+        else:
+            teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
+            student_logprobs = F.log_softmax(student_logits, dim=-1)
+
+            kl_loss = _compute_kl_loss(
+                teacher_logprobs=teacher_logprobs,
+                student_logprobs=student_logprobs,
+                mask=mask,
+                symmetrical=self.symmetrical,
+            )
         match self.reduction:
             case ConsistencyRNNTReductionType.MEAN:
                 kl_loss_value = kl_loss.sum() / mask.sum().clamp(min=1)
