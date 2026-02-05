@@ -28,9 +28,14 @@ def _kl_div_fwd_kernel(
     kl_loss_out_ptr,
     BLOCK_SIZE: tl.constexpr,
     USE_FP64: tl.constexpr,
+    SYMMETRIC: tl.constexpr,
 ):
     """
-    Forward kernel for RNN-T log probs. Stores result in `target_scores_ptr` and `blank_scores_ptr`.
+    Forward kernel for KL divergence loss.
+
+    When SYMMETRIC=False: computes KL(P||Q) = sum(P * (log P - log Q))
+    When SYMMETRIC=True: computes 0.5 * (KL(P||Q) + KL(Q||P)) = 0.5 * sum((P - Q) * (log P - log Q))
+
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
@@ -40,13 +45,11 @@ def _kl_div_fwd_kernel(
     idx_no_vocab = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
     mask_value = tl.load(mask_ptr + idx_no_vocab)
     if not mask_value:
-        # no calculations required
         return
 
-    # do all calculation at least in float32
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
-    # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits
+    # calculate offset in [B, T, U+1, V] tensor
     idx_vocab_start = idx_no_vocab * num_labels
     teacher_logits_ptr += idx_vocab_start
     student_logits_ptr += idx_vocab_start
@@ -54,20 +57,29 @@ def _kl_div_fwd_kernel(
     mask = col_offsets < num_labels
     teacher_logits = tl.load(teacher_logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
     student_logits = tl.load(student_logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
-    # stable log softmax calculation
+
+    # stable log softmax calculation for teacher
     teacher_logits_max = tl.max(teacher_logits, axis=0)
     teacher_logits_minus_max = teacher_logits - teacher_logits_max
     teacher_denominator = tl.log(tl.sum(tl.exp(teacher_logits_minus_max), axis=0))
+    teacher_log_softmax = teacher_logits_minus_max - teacher_denominator
+    teacher_softmax = tl.exp(teacher_log_softmax)
 
+    # stable log softmax calculation for student
     student_logits_max = tl.max(student_logits, axis=0)
     student_logits_minus_max = student_logits - student_logits_max
     student_denominator = tl.log(tl.sum(tl.exp(student_logits_minus_max), axis=0))
+    student_log_softmax = student_logits_minus_max - student_denominator
 
-    kl_loss_value = tl.sum(
-        tl.exp(teacher_logits_minus_max - teacher_denominator)
-        * ((teacher_logits_minus_max - teacher_denominator) - (student_logits_minus_max - student_denominator)),
-        axis=0,
-    )
+    if SYMMETRIC:
+        # symmetric KL: 0.5 * sum((P - Q) * (log P - log Q))
+        student_softmax = tl.exp(student_log_softmax)
+        prob_diff = teacher_softmax - student_softmax
+        log_prob_diff = teacher_log_softmax - student_log_softmax
+        kl_loss_value = 0.5 * tl.sum(prob_diff * log_prob_diff, axis=0)
+    else:
+        # non-symmetric KL: sum(P * (log P - log Q))
+        kl_loss_value = tl.sum(teacher_softmax * (teacher_log_softmax - student_log_softmax), axis=0)
 
     tl.store(kl_loss_out_ptr + idx_no_vocab, kl_loss_value)
 
@@ -76,18 +88,24 @@ def _kl_div_fwd_kernel(
 def _kl_div_bwd_kernel(
     teacher_logits_ptr,
     student_logits_ptr,
+    grad_kl_loss_ptr,  # upstream gradient [B, T, U+1]
     mask_ptr,
     max_source_len: int,
     max_target_len_plus_1: int,
     num_labels: int,  # vocab size (with blank)
-    teacher_grad_out_ptr,
+    teacher_grad_out_ptr,  # only used when SYMMETRIC=True
     student_grad_out_ptr,
     BLOCK_SIZE: tl.constexpr,
     USE_FP64: tl.constexpr,
+    SYMMETRIC: tl.constexpr,
 ):
     """
-    Backward kernel for RNN-T log probs. Stores result in `grad_target_scores_ptr` and `grad_blank_scores_ptr`.
-    We recalculate part of the forward here to avoid using extra memory in forward.
+    Backward kernel for KL divergence loss.
+
+    When SYMMETRIC=False: computes student_grad = upstream * (Q - P), teacher receives no gradient
+    When SYMMETRIC=True: computes student_grad = 0.5 * upstream * (Q - P), teacher_grad = -student_grad
+
+    We recalculate log-softmax in backward instead of storing it in memory.
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
@@ -97,14 +115,11 @@ def _kl_div_bwd_kernel(
     idx_no_vocab = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
     mask_value = tl.load(mask_ptr + idx_no_vocab)
     if not mask_value:
-        # no calculations required
         return
 
-    # do all calculation at least in float32
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
-    # recalculate log-softmax in backward instead of storing it in memory
-    # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits
+    # calculate offset in [B, T, U+1, V] tensor
     idx_vocab_start = idx_no_vocab * num_labels
     teacher_logits_ptr += idx_vocab_start
     student_logits_ptr += idx_vocab_start
@@ -112,45 +127,74 @@ def _kl_div_bwd_kernel(
     mask = col_offsets < num_labels
     teacher_logits = tl.load(teacher_logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
     student_logits = tl.load(student_logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
-    # stable log softmax calculation
+
+    # stable log softmax calculation for teacher
     teacher_logits_max = tl.max(teacher_logits, axis=0)
     teacher_logits_minus_max = teacher_logits - teacher_logits_max
     teacher_denominator = tl.log(tl.sum(tl.exp(teacher_logits_minus_max), axis=0))
+    teacher_softmax = tl.exp(teacher_logits_minus_max - teacher_denominator)
 
+    # stable log softmax calculation for student
     student_logits_max = tl.max(student_logits, axis=0)
     student_logits_minus_max = student_logits - student_logits_max
     student_denominator = tl.log(tl.sum(tl.exp(student_logits_minus_max), axis=0))
+    student_softmax = tl.exp(student_logits_minus_max - student_denominator)
 
-    # TODO
-    # calculate grad
+    # load upstream gradient
+    upstream_grad = tl.load(grad_kl_loss_ptr + idx_no_vocab).to(compute_dtype)
+
+    # compute gradient: (Q - P) where Q = student_softmax, P = teacher_softmax
+    prob_diff = student_softmax - teacher_softmax
+
+    if SYMMETRIC:
+        # symmetric: student_grad = 0.5 * upstream * (Q - P), teacher_grad = -student_grad
+        student_grad = 0.5 * upstream_grad * prob_diff
+        teacher_grad = -student_grad
+        # store teacher gradient
+        teacher_grad_out_ptr += idx_vocab_start
+        tl.store(teacher_grad_out_ptr + col_offsets, teacher_grad, mask=mask)
+    else:
+        # non-symmetric: student_grad = upstream * (Q - P), no teacher gradient
+        student_grad = upstream_grad * prob_diff
+
+    # store student gradient
+    student_grad_out_ptr += idx_vocab_start
+    tl.store(student_grad_out_ptr + col_offsets, student_grad, mask=mask)
 
 
 class FusedKLDivTriton(torch.autograd.Function):
     """
-    Function to calculate log probabilities for target and blank labels for RNN-T, supporting torch.autograd.
+    Function to calculate KL divergence for RNN-T, supporting torch.autograd.
+
+    When symmetric=False: computes KL(P||Q), only student receives gradients (teacher is detached)
+    When symmetric=True: computes 0.5 * (KL(P||Q) + KL(Q||P)), both teacher and student receive gradients
     """
 
     @staticmethod
-    def forward(ctx, teacher_logits: torch.Tensor, student_logits: torch.Tensor, mask: torch.Tensor):
+    def forward(
+        ctx,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        mask: torch.Tensor,
+        symmetric: bool = False,
+    ):
         """
-
         Args:
             ctx: ctx object for storing the context
             teacher_logits: Joint tensor of size [B, T, U+1, D]
             student_logits: Joint tensor of size [B, T, U+1, D]
-            mask: mask tensor
+            mask: mask tensor [B, T, U+1]
+            symmetric: if True, compute symmetric KL divergence
 
         Returns:
             loss of size [B, T, U+1]
         """
-        assert teacher_logits.is_contiguous()  # logits are huge, so here we just check if logits are contiguous
-        assert student_logits.is_contiguous()  # logits are huge, so here we just check if logits are contiguous
+        assert teacher_logits.is_contiguous()
+        assert student_logits.is_contiguous()
         assert teacher_logits.shape == student_logits.shape
-        # Use float64 if input is float64, otherwise float32
         use_fp64 = teacher_logits.dtype == torch.float64
 
         kl_loss = teacher_logits.new_zeros(teacher_logits.shape[:-1])
-        # run Triton kernel
         _kl_div_fwd_kernel[(teacher_logits.shape[0], teacher_logits.shape[1], teacher_logits.shape[2])](
             teacher_logits_ptr=teacher_logits,
             student_logits_ptr=student_logits,
@@ -161,32 +205,38 @@ class FusedKLDivTriton(torch.autograd.Function):
             kl_loss_out_ptr=kl_loss,
             BLOCK_SIZE=triton.next_power_of_2(teacher_logits.shape[-1]),
             USE_FP64=use_fp64,
+            SYMMETRIC=symmetric,
         )
 
-        # saving for backward
-        ctx.save_for_backward(teacher_logits, student_logits, mask, use_fp64)
+        ctx.save_for_backward(teacher_logits, student_logits, mask)
+        ctx.use_fp64 = use_fp64
+        ctx.symmetric = symmetric
         return kl_loss
 
     @staticmethod
     def backward(ctx, grad_kl_loss):
         """
-        Backward calculation for RNN-T log-probs.
+        Backward calculation for KL divergence loss.
 
         Args:
             ctx: ctx object for storing the context
-            grad_target_scores: upstream gradient for targets
-            grad_blank_scores:  upstream gradient for blank scores
+            grad_kl_loss: upstream gradient [B, T, U+1]
 
         Returns:
-            gradient for logits, None for all other arguments for `forward`
+            Gradients for teacher_logits (None if not symmetric), student_logits, mask (None), symmetric (None)
         """
-        (teacher_logits, student_logits, mask, use_fp64) = ctx.saved_tensors
-        teacher_grad_logits = torch.zeros_like(teacher_logits)
+        (teacher_logits, student_logits, mask) = ctx.saved_tensors
+        use_fp64 = ctx.use_fp64
+        symmetric = ctx.symmetric
+
         student_grad_logits = torch.zeros_like(student_logits)
-        # TODO; kernel
-        _kl_div_fwd_kernel[(teacher_logits.shape[0], teacher_logits.shape[1], teacher_logits.shape[2])](
+        teacher_grad_logits = torch.zeros_like(teacher_logits) if symmetric else student_grad_logits  # dummy if not symmetric
+        grad_kl_loss = grad_kl_loss.contiguous()
+
+        _kl_div_bwd_kernel[(teacher_logits.shape[0], teacher_logits.shape[1], teacher_logits.shape[2])](
             teacher_logits_ptr=teacher_logits,
             student_logits_ptr=student_logits,
+            grad_kl_loss_ptr=grad_kl_loss,
             mask_ptr=mask,
             max_source_len=teacher_logits.shape[1],
             max_target_len_plus_1=teacher_logits.shape[2],
@@ -195,8 +245,13 @@ class FusedKLDivTriton(torch.autograd.Function):
             student_grad_out_ptr=student_grad_logits,
             BLOCK_SIZE=triton.next_power_of_2(teacher_logits.shape[-1]),
             USE_FP64=use_fp64,
+            SYMMETRIC=symmetric,
         )
-        return teacher_grad_logits, student_grad_logits, None
+
+        if symmetric:
+            return teacher_grad_logits, student_grad_logits, None, None
+        else:
+            return None, student_grad_logits, None, None
 
 
 def kl_loss_triton(
@@ -217,9 +272,8 @@ def kl_loss_triton(
     Returns:
         tensor of size [B, T, U+1] with consistency loss
     """
-
-    kl_loss = FusedKLDivTriton.apply(teacher_logits.detach(), student_logits, mask)
     if symmetrical:
-        kl_loss = 0.5 * (kl_loss + FusedKLDivTriton.apply(student_logits.detach(), teacher_logits, mask))
-
-    return kl_loss
+        return FusedKLDivTriton.apply(teacher_logits, student_logits, mask, True)
+    else:
+        # Non-symmetric: only student receives gradients, teacher is detached
+        return FusedKLDivTriton.apply(teacher_logits.detach(), student_logits, mask, False)
