@@ -688,7 +688,19 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 else:
                     # cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
                     cur_att_context_size = [-1, -1, -1]
-                    use_causal_conv = False
+                    # cur_att_context_size = [140, 13, 13]
+                    # cur_att_context_size = [140, 7, 7]
+                    # cur_att_context_size = [140, 2, 5]
+                    # cur_att_context_size = [70, 2, 4]
+                    # cur_att_context_size = [70, 2, 3]
+                    # cur_att_context_size = [70, 7, 0]
+                    # cur_att_context_size = [140, 1, 3]
+                    # cur_att_context_size = [140, 1, 1]
+                    # cur_att_context_size = [140, 1, 4]
+
+                    if hasattr(self, 'conv_context_style') and self.conv_context_style in ["causal", "dual_conv"]:
+                        use_causal_conv = True
+
                     # cur_att_context_size = self.att_context_size
                     # cur_att_context_size = [70,1000,13]
                 # logging.info(f"cur_att_context_size: {cur_att_context_size}")
