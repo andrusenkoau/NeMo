@@ -15,6 +15,7 @@
 import copy
 import os
 from math import ceil
+import math
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -138,6 +139,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
 
+        # Setup unified ASR probability scheduling
+        self._setup_unified_asr_schedule()
+
+
     def setup_optim_normalization(self):
         """
         Helper method to setup normalization of certain parts of the model prior to the optimization step.
@@ -188,6 +193,85 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup normalized joint norm for model
         self._optim_normalize_joint_norm = self.cfg.get('normalize_joint_norm', False)
+
+
+    def _setup_unified_asr_schedule(self):
+        """Initialize unified ASR probability scheduling from config."""
+        schedule_cfg = self._cfg.get('unified_asr_schedule', None)
+        
+        if schedule_cfg is not None and schedule_cfg.get('enabled', False):
+            self._unified_asr_schedule_enabled = True
+            self._unified_asr_initial_prob = schedule_cfg.get('initial_prob', 0.5)
+            self._unified_asr_final_prob = schedule_cfg.get('final_prob', 0.1)
+            self._unified_asr_schedule_type = schedule_cfg.get('schedule_type', 'linear')
+            self._unified_asr_decay_start_step = schedule_cfg.get('decay_start_step', 0)
+            
+            logging.info(
+                f"Unified ASR schedule enabled: "
+                f"initial_prob={self._unified_asr_initial_prob}, "
+                f"final_prob={self._unified_asr_final_prob}, "
+                f"schedule_type={self._unified_asr_schedule_type}, "
+                f"decay_start_step={self._unified_asr_decay_start_step}"
+            )
+        else:
+            self._unified_asr_schedule_enabled = False
+
+
+    def _get_scheduled_unified_asr_prob(self) -> Optional[float]:
+        """Calculate unified_asr_prob based on training progress and schedule config."""
+        if not self._unified_asr_schedule_enabled:
+            return None
+        
+        global_step = self.trainer.global_step
+        max_steps = self.trainer.max_steps
+        
+        if max_steps <= 0:
+            return self._unified_asr_initial_prob
+        
+        # Before decay_start_step, use initial probability
+        if global_step < self._unified_asr_decay_start_step:
+            return self._unified_asr_initial_prob
+        
+        # Calculate progress within the decay phase
+        effective_step = global_step - self._unified_asr_decay_start_step
+        effective_max = max_steps - self._unified_asr_decay_start_step
+        progress = min(effective_step / effective_max, 1.0) if effective_max > 0 else 1.0
+        
+        initial_prob = self._unified_asr_initial_prob
+        final_prob = self._unified_asr_final_prob
+        
+        if self._unified_asr_schedule_type == 'linear':
+            return initial_prob - (initial_prob - final_prob) * progress
+        
+        elif self._unified_asr_schedule_type == 'cosine':
+            return final_prob + 0.5 * (initial_prob - final_prob) * (1 + math.cos(math.pi * progress))
+        
+        elif self._unified_asr_schedule_type == 'exponential':
+            decay_rate = -math.log(max(final_prob / initial_prob, 1e-6))
+            return initial_prob * math.exp(-decay_rate * progress)
+        
+        elif self._unified_asr_schedule_type == 'step':
+            if progress < 0.5:
+                return initial_prob
+            elif progress < 0.8:
+                return (initial_prob + final_prob) / 2
+            else:
+                return final_prob
+        
+        else:
+            logging.warning(f"Unknown schedule type: {self._unified_asr_schedule_type}, using initial_prob")
+            return initial_prob
+
+    def on_train_batch_start(self, batch, batch_idx):
+        """Update encoder's unified_asr_prob based on training schedule."""
+        if not hasattr(self, '_unified_asr_schedule_enabled'):
+            self._setup_unified_asr_schedule()
+        
+        if self._unified_asr_schedule_enabled and hasattr(self.encoder, 'unified_asr_prob'):
+            new_prob = self._get_scheduled_unified_asr_prob()
+            if new_prob is not None:
+                self.encoder.unified_asr_prob = new_prob
+
 
     def extract_rnnt_loss_cfg(self, cfg: Optional[DictConfig]):
         """
@@ -753,6 +837,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
+            # Log unified_asr_prob for monitoring
+            if hasattr(self.encoder, 'unified_asr_prob') and self.encoder.unified_asr_prob is not None:
+                tensorboard_logs['unified_asr_prob'] = self.encoder.unified_asr_prob
 
             if (sample_id + 1) % log_every_n_steps == 0:
                 self.wer.update(
@@ -794,6 +881,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
+            # Log unified_asr_prob for monitoring
+            if hasattr(self.encoder, 'unified_asr_prob') and self.encoder.unified_asr_prob is not None:
+                tensorboard_logs['unified_asr_prob'] = self.encoder.unified_asr_prob
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
