@@ -36,6 +36,7 @@ class TritonRnntLoss(nn.Module):
         """
         super().__init__()
         self.blank = blank
+        self.reduction = None
         if not TRITON_AVAILABLE:
             logging.warning("Triton is disabled, it will result error if using the loss")
 
