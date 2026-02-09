@@ -61,6 +61,8 @@ class TritonRnntLoss(nn.Module):
         """
         # argument names are consistent with NeMo, see RNNTLoss.forward:
         # self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
+        if acts.device.type != "cuda":
+            raise NotImplementedError("Triton loss supports only CUDA inputs")
         loss_batch = rnnt_loss_triton(
             blank_id=self.blank,
             logits=acts,

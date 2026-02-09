@@ -280,12 +280,12 @@ class TestTritonRnntLoss:
         labels = [[1, 2]]
 
         triton_rnnt = TritonRnntLoss(blank=0)
-        k2_cost, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
 
         fn_np = RNNTLoss_Numpy()
         np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
 
-        assert np.allclose(k2_cost, np_loss, rtol=1e-6), "small_random_test costs mismatch."
+        assert np.allclose(triton_loss, np_loss, rtol=1e-6), "small_random_test costs mismatch."
         # assert np.allclose(triton_grad, np_grad, atol=1e-6), "small_random_test gradient mismatch."
 
     @pytest.mark.unit
