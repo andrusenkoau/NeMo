@@ -31,7 +31,6 @@ def _rnnt_fwd_kernel(
     max_src_len,
     max_tgt_len_plus_1,
     BLOCK_SIZE: tl.constexpr,
-    MAX_DIAGS: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
@@ -53,9 +52,10 @@ def _rnnt_fwd_kernel(
     tl.store(alpha_ptr + batch_offset, 0.0)
 
     num_diags = src_len + tgt_len
+    max_diags = max_src_len + max_tgt_len_plus_1 - 1
     t_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
-    for d in tl.range(1, MAX_DIAGS):
+    for d in tl.range(1, max_diags):
         d_i64 = d.to(tl.int64)
         u_offsets = d_i64 - t_offsets
         # Mask: valid positions on this diagonal
@@ -106,7 +106,6 @@ def _rnnt_bwd_kernel(
     max_src_len,
     max_tgt_len_plus_1,
     BLOCK_SIZE: tl.constexpr,
-    MAX_DIAGS: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
@@ -136,10 +135,11 @@ def _rnnt_bwd_kernel(
     tl.store(blank_logprobs_grad_ptr + final_idx, -1.0)
 
     num_diags = src_len + tgt_len
+    max_diags = max_src_len + max_tgt_len_plus_1 - 1
     t_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     # Reverse diagonal loop: d from (num_diags - 2) down to 0
-    for d_rev in tl.range(0, MAX_DIAGS):
+    for d_rev in tl.range(0, max_diags):
         d = num_diags - 2 - d_rev.to(tl.int64)
         u_offsets = d - t_offsets
         mask = (d >= 0) & (t_offsets < src_len) & (u_offsets >= 0) & (u_offsets <= tgt_len)
@@ -220,7 +220,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
         loss_batch = torch.empty([batch_size], dtype=float_dtype, device=target_logprobs.device)
 
         BLOCK_SIZE = triton.next_power_of_2(src_max_length + tgt_max_length_plus_1)
-        MAX_DIAGS = src_max_length + tgt_max_length_plus_1 - 1
         _rnnt_fwd_kernel[(batch_size,)](
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
@@ -231,7 +230,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             BLOCK_SIZE=BLOCK_SIZE,
-            MAX_DIAGS=MAX_DIAGS,
             USE_FP64=use_fp64,
         )
 
@@ -265,7 +263,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
         )
 
         BLOCK_SIZE = triton.next_power_of_2(src_max_length + tgt_max_length_plus_1)
-        MAX_DIAGS = src_max_length + tgt_max_length_plus_1 - 1
         _rnnt_bwd_kernel[(batch_size,)](
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
@@ -278,7 +275,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             BLOCK_SIZE=BLOCK_SIZE,
-            MAX_DIAGS=MAX_DIAGS,
             USE_FP64=use_fp64,
         )
 
