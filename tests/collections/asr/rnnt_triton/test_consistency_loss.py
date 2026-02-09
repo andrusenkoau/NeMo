@@ -14,7 +14,13 @@
 
 import pytest
 import torch
-from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, consistency_rnnt_kld, ConsistencyGraphRNNTLoss
+
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import (
+    ConsistencyFullRNNTLoss,
+    ConsistencyGraphRNNTLoss,
+    ConsistencyRNNTLoss,
+    consistency_rnnt_kld,
+)
 from nemo.core.utils.optional_libs import K2_AVAILABLE
 
 
@@ -503,8 +509,9 @@ class TestKLLossTriton:
     @requires_cuda
     def test_kl_loss_triton_forward_matches_pytorch(self):
         """Compare Triton forward output to PyTorch F.kl_div."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -550,8 +557,9 @@ class TestKLLossTriton:
     @requires_cuda
     def test_kl_loss_triton_backward_matches_pytorch(self):
         """Compare Triton backward output to PyTorch reference."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -777,8 +785,9 @@ class TestKLLossTriton:
     @requires_cuda
     def test_kl_loss_triton_non_power_of_2_vocab(self):
         """Test forward correctness with non-power-of-2 vocab size."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -805,8 +814,9 @@ class TestKLLossTriton:
     @requires_cuda
     def test_kl_loss_triton_non_power_of_2_vocab_backward(self):
         """Test backward correctness with non-power-of-2 vocab size."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -871,8 +881,9 @@ class TestFusedSymmetricKLDivTriton:
     @requires_cuda
     def test_fused_symmetric_forward_matches_pytorch(self):
         """Verify fused symmetric kernel matches PyTorch reference."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -938,8 +949,9 @@ class TestFusedSymmetricKLDivTriton:
     @requires_cuda
     def test_fused_symmetric_backward_matches_pytorch(self):
         """Compare fused symmetric backward to PyTorch reference."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -1114,8 +1126,9 @@ class TestFusedSymmetricKLDivTriton:
     @requires_cuda
     def test_fused_symmetric_non_power_of_2_vocab(self):
         """Test fused symmetric forward+backward with non-power-of-2 vocab size."""
-        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
         import torch.nn.functional as F
+
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
 
         torch.manual_seed(42)
         device = torch.device("cuda")

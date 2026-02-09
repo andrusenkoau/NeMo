@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import consistency_rnnt_kld, ConsistencyRNNTLoss
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, consistency_rnnt_kld
 
 __all__ = ["consistency_rnnt_kld", "ConsistencyRNNTLoss"]
