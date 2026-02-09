@@ -27,7 +27,6 @@ class TritonRnntLoss(nn.Module):
         self,
         blank: int,
         fastemit_lambda: float = 0.0,
-        **kwargs,
     ):
         """
         Init method
