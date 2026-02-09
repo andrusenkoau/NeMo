@@ -38,6 +38,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscriptionReturnType,
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, ConsistencyGraphRNNTLoss
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -93,6 +94,47 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             loss_kwargs=loss_kwargs,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
         )
+
+        # consistency loss
+        if (consistency_loss_cfg := self.cfg.get("loss", {}).get("consistency", {})) is not None:
+            weight = consistency_loss_cfg.get("weight", None)
+            if weight is not None and weight != 0.0:
+                if loss_name == "tdt":
+                    raise NotImplementedError
+                self.use_double_batch = True
+                if consistency_loss_cfg.get("use_graph_rnnt", False):
+                    logging.info(f"Instantiated graph consistency loss with params: {consistency_loss_cfg}")
+                    self.consistency_loss = ConsistencyGraphRNNTLoss(
+                        blank_id=num_classes,
+                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                    )
+                elif consistency_loss_cfg.get("use_all_logits", False):
+                    logging.info(f"Instantiated full consistency loss with params: {consistency_loss_cfg}")
+                    self.consistency_loss = ConsistencyFullRNNTLoss(
+                        symmetrical=consistency_loss_cfg.get("symmetrical", False),
+                        reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                        use_triton=consistency_loss_cfg.get("use_triton", False),
+                    )
+                else:
+                    logging.info(f"Instantiated partial consistency loss with params: {consistency_loss_cfg}")
+                    self.consistency_loss = ConsistencyRNNTLoss(
+                        blank_id=num_classes,
+                        symmetrical=consistency_loss_cfg.get("symmetrical", True),
+                        use_blank=consistency_loss_cfg.get("use_blank", False),
+                        complete_distribution=consistency_loss_cfg.get("complete_distribution", False),
+                        reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
+                    )
+                self.consistency_loss_weight = weight
+                self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
+            else:
+                self.use_double_batch = consistency_loss_cfg.get("force_double_batch", False)
+                self.consistency_loss = None
+                self.consistency_loss_weight = 0.0
+                self.consistency_loss_after_step = -1
+        else:
+            self.use_double_batch = False
+
+
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
@@ -783,8 +825,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     log_probs=streaming_joint, targets=transcript,
                     input_lengths=streaming_len, target_lengths=target_length
                 )
-                
-
+            
                 # logging.warning(f"Offline loss: {offline_loss}, Streaming loss: {streaming_loss}")
                 # logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss}")
 
@@ -795,7 +836,25 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
                 
                 loss_value = self.add_auxiliary_losses(loss_value)
-                
+
+                # Consistency loss
+                if self.consistency_loss is not None and self.trainer.global_step > self.consistency_loss_after_step:
+                    consistency_loss_value = self.consistency_loss(
+                        teacher_logits=offline_encoded,
+                        student_logits=streaming_encoded,
+                        targets=transcript,
+                        src_lengths=offline_len,
+                        tgt_lengths=transcript_len,
+                    )
+                    tensorboard_logs['rnnt_consistency_loss'] = consistency_loss_value.item()
+                    tensorboard_logs['rnnt_consistency_loss_weighted'] = consistency_loss_value.item() * self.consistency_loss_weight
+                    loss_value += self.consistency_loss_weight * consistency_loss_value
+
+                logging.warning(f"Offline loss: {offline_loss}, Streaming loss: {streaming_loss}")
+                logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss}")
+                logging.warning(f"Consistency loss: {consistency_loss_value}, Weighted sum: {self.consistency_loss_weight * consistency_loss_value}")
+                logging.warning(f"Total loss: {loss_value}")
+
                 if AccessMixin.is_access_enabled(self.model_guid):
                     AccessMixin.reset_registry(self)
                 
