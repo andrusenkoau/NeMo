@@ -193,6 +193,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
         blank_logprobs: torch.Tensor,
         src_lengths: torch.Tensor,
         tgt_lengths: torch.Tensor,
+        fastemit_lambda: float = 0.0,
     ):
         """
         Args:
@@ -201,6 +202,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
             blank_logprobs: logprobs for blank labels of size [B, T, U+1]
             src_lengths: source lengths of size [B]
             tgt_lengths: target lengths of size [B]
+            fastemit_lambda: Float scaling factor for FastEmit regularization.
 
         Returns:
             loss of size [B]
@@ -233,8 +235,13 @@ class TritonRnntLossFunction(torch.autograd.Function):
             USE_FP64=use_fp64,
         )
 
+        # FastEmit regularization: loss = (1 + fastemit_lambda) * base_loss
+        if fastemit_lambda != 0.0:
+            loss_batch = loss_batch * (1.0 + fastemit_lambda)
+
         ctx.save_for_backward(target_logprobs, blank_logprobs, alpha, src_lengths, tgt_lengths)
         ctx.use_fp64 = use_fp64
+        ctx.fastemit_lambda = fastemit_lambda
         return loss_batch
 
     @staticmethod
@@ -242,6 +249,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
         """ """
         (target_logprobs, blank_logprobs, alpha, src_lengths, tgt_lengths) = ctx.saved_tensors
         use_fp64 = ctx.use_fp64
+        fastemit_lambda = ctx.fastemit_lambda
         float_dtype = torch.float64 if use_fp64 else torch.float32
         batch_size, src_max_length, tgt_max_length_plus_1 = target_logprobs.shape
 
@@ -278,12 +286,16 @@ class TritonRnntLossFunction(torch.autograd.Function):
             USE_FP64=use_fp64,
         )
 
+        # FastEmit: scale emit (target) gradients by (1 + fastemit_lambda), blank unchanged
+        if fastemit_lambda != 0.0:
+            target_logprobs_grad = target_logprobs_grad * (1.0 + fastemit_lambda)
+
         # Multiply by upstream gradient
         grad_rnnt_loss = grad_rnnt_loss.to(float_dtype).view(-1, 1, 1)
         target_logprobs_grad = target_logprobs_grad * grad_rnnt_loss
         blank_logprobs_grad = blank_logprobs_grad * grad_rnnt_loss
 
-        return target_logprobs_grad, blank_logprobs_grad, None, None
+        return target_logprobs_grad, blank_logprobs_grad, None, None, None
 
 
 def rnnt_loss_triton(
@@ -292,6 +304,7 @@ def rnnt_loss_triton(
     targets: torch.Tensor,
     src_lengths: torch.Tensor,
     tgt_lengths: torch.Tensor,
+    fastemit_lambda: float = 0.0,
 ) -> torch.Tensor:
     """
     RNN-T loss in Triton
@@ -302,6 +315,7 @@ def rnnt_loss_triton(
         targets: targets of size [B, U]
         src_lengths: source lengths of size [B]
         tgt_lengths: target lengths of size [B]
+        fastemit_lambda: Float scaling factor for FastEmit regularization. Default 0.0 (disabled).
     Returns:
         tensor of size [B] with RNN-T loss
     """
@@ -312,5 +326,7 @@ def rnnt_loss_triton(
         src_lengths=src_lengths,
         tgt_lengths=tgt_lengths,
     )
-    loss_batch = TritonRnntLossFunction.apply(target_logprobs, blank_logprobs, src_lengths, tgt_lengths)
+    loss_batch = TritonRnntLossFunction.apply(
+        target_logprobs, blank_logprobs, src_lengths, tgt_lengths, fastemit_lambda
+    )
     return loss_batch
