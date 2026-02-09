@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo.core.utils.optional_libs import TRITON_AVAILABLE
-import pytest
-from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import rnnt_logprobs_torch
-import torch
 import random
+
+import pytest
+import torch
+
+from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import rnnt_logprobs_torch
+from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 
 if TRITON_AVAILABLE:
     from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs_triton import rnnt_logprobs_triton

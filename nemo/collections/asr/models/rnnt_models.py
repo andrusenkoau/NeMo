@@ -38,7 +38,11 @@ from nemo.collections.asr.parts.mixins import (
     TranscriptionReturnType,
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
-from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import ConsistencyRNNTLoss, ConsistencyFullRNNTLoss, ConsistencyGraphRNNTLoss
+from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import (
+    ConsistencyFullRNNTLoss,
+    ConsistencyGraphRNNTLoss,
+    ConsistencyRNNTLoss,
+)
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
