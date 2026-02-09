@@ -289,6 +289,24 @@ class TestTritonRnntLoss:
         assert np.allclose(triton_grad, np_grad, atol=1e-6), "small_random_test gradient mismatch."
 
     @pytest.mark.unit
+    @pytest.mark.parametrize('src_length,tgt_length', [(10, 2), (1, 13)])
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_case_small_randomized(self, device, src_length: int, tgt_length: int):
+        rng = np.random.RandomState(0)
+        vocab_size = 5
+        acts = rng.randn(1, src_length, tgt_length + 1, vocab_size)
+        labels = rng.randint(low=1, high=vocab_size, size=[1, tgt_length])
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+
+        fn_np = RNNTLoss_Numpy()
+        np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
+
+        assert np.allclose(triton_loss, np_loss, rtol=1e-6), "small_random_test costs mismatch."
+        assert np.allclose(triton_grad, np_grad, atol=1e-6), "small_random_test gradient mismatch."
+
+    @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
     def test_case_medium_random(self, device):
         rng = np.random.RandomState(0)
