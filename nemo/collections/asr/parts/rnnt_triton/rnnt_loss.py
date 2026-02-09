@@ -26,6 +26,7 @@ class TritonRnntLoss(nn.Module):
     def __init__(
         self,
         blank: int,
+        fastemit_lambda: float = 0.0,
         **kwargs,
     ):
         """
@@ -33,9 +34,11 @@ class TritonRnntLoss(nn.Module):
 
         Args:
             blank: blank label index
+            fastemit_lambda: Float scaling factor for FastEmit regularization. Default 0.0 (disabled).
         """
         super().__init__()
         self.blank = blank
+        self.fastemit_lambda = fastemit_lambda
         self.reduction = None
         if not TRITON_AVAILABLE:
             logging.warning("Triton is disabled, it will result error if using the loss")
@@ -70,5 +73,6 @@ class TritonRnntLoss(nn.Module):
             targets=labels,
             src_lengths=act_lens,
             tgt_lengths=label_lens,
+            fastemit_lambda=self.fastemit_lambda,
         )
         return loss_batch
