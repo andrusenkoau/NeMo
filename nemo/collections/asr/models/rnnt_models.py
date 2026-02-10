@@ -853,27 +853,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 
                 loss_value = self.add_auxiliary_losses(loss_value)
 
-                # Consistency loss
-                if self.consistency_loss is not None and self.trainer.global_step > self.consistency_loss_after_step:
-                    consistency_loss_value = self.consistency_loss(
-                        teacher_logits=offline_encoded,
-                        student_logits=streaming_encoded,
-                        targets=transcript,
-                        src_lengths=offline_len,
-                        tgt_lengths=transcript_len,
-                    )
-                    tensorboard_logs['rnnt_consistency_loss'] = consistency_loss_value.item()
-                    tensorboard_logs['rnnt_consistency_loss_weighted'] = consistency_loss_value.item() * self.consistency_loss_weight
-                    loss_value += self.consistency_loss_weight * consistency_loss_value
-
-                logging.warning(f"Offline loss: {offline_loss}, Streaming loss: {streaming_loss}")
-                logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss}")
-                logging.warning(f"Consistency loss: {consistency_loss_value}, Weighted sum: {self.consistency_loss_weight * consistency_loss_value}")
-                logging.warning(f"Total loss: {loss_value}")
-
-                if AccessMixin.is_access_enabled(self.model_guid):
-                    AccessMixin.reset_registry(self)
-                
                 tensorboard_logs = {
                     'train_loss': loss_value,
                     'train_offline_loss': offline_loss,
@@ -881,6 +860,28 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     'learning_rate': self._optimizer.param_groups[0]['lr'],
                     'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
                 }
+
+                # Consistency loss
+                if self.consistency_loss is not None and self.trainer.global_step > self.consistency_loss_after_step:
+                    consistency_loss_value = self.consistency_loss(
+                        teacher_logits=offline_joint,
+                        student_logits=streaming_joint,
+                        targets=transcript,
+                        src_lengths=offline_len,
+                        tgt_lengths=target_length,
+                    )
+                    tensorboard_logs['rnnt_consistency_loss'] = consistency_loss_value.item()
+                    tensorboard_logs['rnnt_consistency_loss_weighted'] = consistency_loss_value.item() * self.consistency_loss_weight
+                    loss_value += self.consistency_loss_weight * consistency_loss_value
+
+                logging.warning(f"Offline loss: {offline_loss:.2f}, Streaming loss: {streaming_loss:.2f}")
+                logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss:.2f}")
+                logging.warning(f"Consistency loss: {consistency_loss_value:.2f}, Weighted sum: {self.consistency_loss_weight * consistency_loss_value:.2f}")
+                logging.warning(f"Total loss: {loss_value:.2f}")
+
+                if AccessMixin.is_access_enabled(self.model_guid):
+                    AccessMixin.reset_registry(self)
+            
                 
                 if (sample_id + 1) % log_every_n_steps == 0:
                     self.wer.update(
