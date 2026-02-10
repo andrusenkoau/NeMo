@@ -19,7 +19,7 @@ import json
 import os
 from abc import ABC
 from functools import partial
-from typing import List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import hydra
 import sacrebleu
@@ -40,7 +40,10 @@ from nemo.collections.multimodal.speech_llm.data.build_dataset import (
     build_speechllm_dataloader,
     build_speechllm_dataset,
 )
-from nemo.collections.multimodal.speech_llm.modules.common.audio_text_generation_utils import generate
+
+if TYPE_CHECKING:
+    from nemo.collections.multimodal.speech_llm.modules.common.audio_text_generation_utils import generate
+
 from nemo.collections.multimodal.speech_llm.modules.perception_modules import (
     AudioPerceptionModule,
     MultiAudioPerceptionModule,
@@ -55,18 +58,18 @@ except (ImportError, ModuleNotFoundError):
     MegatronGPTModel = ABC
     MegatronGPTSFTModel = ABC
 
+from nemo.collections.multimodal.speech_llm.modules.common.text_generation_utils import get_computeprob_response
 from nemo.collections.multimodal.speech_llm.parts.peft_config import PEFT_CONFIG_MAP
-from nemo.collections.nlp.modules.common.megatron.utils import (
-    average_losses_across_data_parallel_group,
-    build_position_ids,
-    get_iterator_k_split,
-)
-from nemo.collections.nlp.modules.common.text_generation_utils import get_computeprob_response
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import AppState, logging, model_utils
+from nemo.utils.megatron_utils import (
+    average_losses_across_data_parallel_group,
+    build_position_ids,
+    get_iterator_k_split,
+)
 from nemo.utils.model_utils import inject_model_parallel_rank
 
 try:
@@ -1089,7 +1092,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 peft_cfg_cls = PEFT_CONFIG_MAP[model_cfg.peft.peft_scheme]
                 model.load_adapters(cfg.model.peft.restore_from_path, peft_cfg_cls(model_cfg), map_location="cpu")
             else:
-                torch_state_dict = torch.load(cfg.model.peft.restore_from_path, weights_only=False)['state_dict']
+                torch_state_dict = torch.load(cfg.model.peft.restore_from_path)['state_dict']
                 model.load_state_dict(torch_state_dict, strict=False)
         elif cfg.model.peft.restore_from_ckpt.checkpoint_dir and cfg.model.peft.restore_from_ckpt.checkpoint_name:
             checkpoint_path = os.path.join(
@@ -1108,7 +1111,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                     peft_cfg_cls = PEFT_CONFIG_MAP[cfg.model.peft.peft_scheme]
                     model.load_adapters(checkpoint_path, peft_cfgs=peft_cfg_cls(model_cfg), map_location="cpu")
                 else:
-                    model.load_state_dict(torch.load(checkpoint_path, weights_only=False), strict=False)
+                    model.load_state_dict(torch.load(checkpoint_path), strict=False)
             else:
                 raise NotImplementedError("distributed checkpointing of PEFT weights is not supported")
         elif model_cfg.peft.get("peft_scheme", None):

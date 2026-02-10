@@ -58,7 +58,6 @@ try:
     from megatron.core.dist_checkpointing.validation import StrictHandling
     from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig
-    from megatron.core.utils import get_torch_version, is_torch_min_version
 
     HAVE_MEGATRON_CORE = True
 except (ImportError, ModuleNotFoundError):
@@ -145,6 +144,7 @@ class ParallelismConfig:
     num_distributed_optimizer_instances: int = 1
     nccl_communicator_config_path: str = None
     use_sharp: bool = False
+    create_all_gather_group: bool = False
     pipeline_model_parallel_layout: Optional[Union[str, List[List[str]]]] = None
     use_gloo_process_groups: bool = True
 
@@ -216,11 +216,6 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             If not None, overwrites the `strict` flag passed to `load_checkpoint`.
             Defaults to None. For a list of supported values, refer to the Megatron Core documentation:
             https://github.com/NVIDIA/Megatron-LM/blob/d4e72c0d33edc0c53aeb624f617eb77cebce6ae9/megatron/core/dist_checkpointing/validation.py#L46
-        ckpt_save_pre_mcore_014 (bool, optional): if True, brings back sharded state dict definition from
-            before Megatron-Core v0.14 versions for checkpoint saving. It doesn't affect loading as the
-            loading format is determined based on metadata stored in the checkpoint. This flag  is provided
-            temporarily as a fallback to previous behavior in case of unexpected issues with the new formats.
-            Defaults to False.
         ckpt_optim_fully_reshardable (bool, optional): switches to a fully reshardable (TP/PP/DP/EP)
             optimizer format. Defaults to False, in which case a DP-only reshardable format is used.
         distrib_optim_fully_reshardable_mem_efficient (bool, optional): minimizes CUDA and host memory
@@ -247,6 +242,8 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         nccl_communicator_config_path (Optional[str]): Path to the yaml file of NCCL communicator configurations.
             `min_ctas`, `max_ctas`, and `cga_cluster_size` can be set for each communicator.
         use_sharp (bool): Whether to use SHARP. Defaults to False.
+        create_all_gather_group (bool): Whether to create a separate process group for all-gather operations
+            to overlap reduce-scatter and all-gather operations. Defaults to False.
         pipeline_model_parallel_layout (Optional[Union[str, List[List[str]]]]): The layout of all layers among
             different PP and VP stages.
         use_gloo_process_groups (bool): Whether to use Gloo process groups. Defaults to True.
@@ -291,6 +288,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         pipeline_dtype: Optional[torch.dtype] = None,
         use_te_rng_tracker: bool = False,
         use_sharp: bool = False,
+        create_all_gather_group: bool = False,
         save_ckpt_format: str = "torch_dist",
         ckpt_async_save: bool = True,
         ckpt_torch_dist_multiproc: int = None,  ## TODO(ashors): put elsewhere?
@@ -301,7 +299,6 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         ckpt_parallel_save_optim: Optional[bool] = None,
         ckpt_load_directly_on_device: bool = True,
         ckpt_load_strictness: Optional['StrictHandling'] = None,
-        ckpt_save_pre_mcore_014: bool = False,
         ckpt_optim_fully_reshardable: bool = False,
         distrib_optim_fully_reshardable_mem_efficient: bool = False,
         setup_optimizers: bool = True,
@@ -352,11 +349,11 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         self.ckpt_save_optimizer = ckpt_save_optimizer
         self.ckpt_load_main_params = ckpt_load_main_params
         self.ckpt_load_strictness = ckpt_load_strictness
-        self.ckpt_save_pre_mcore_014 = ckpt_save_pre_mcore_014
         self.ckpt_optim_fully_reshardable = ckpt_optim_fully_reshardable
         self.distrib_optim_fully_reshardable_mem_efficient = distrib_optim_fully_reshardable_mem_efficient
         self.use_te_rng_tracker = use_te_rng_tracker
         self.use_sharp = use_sharp
+        self.create_all_gather_group = create_all_gather_group
         self._pipeline_dtype = pipeline_dtype
         self._setup_optimizers = setup_optimizers
         self._init_model_parallel = init_model_parallel
@@ -442,11 +439,10 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         if self.ckpt_load_optimizer and self.ckpt_load_main_params:
             raise ValueError("ckpt_load_optimizer and ckpt_load_main_params cannot be both set to True.")
 
-        if self.parallel_save_optim is not None and not self.ckpt_save_pre_mcore_014:
+        if self.parallel_save_optim is not None:
             logging.warning(
                 "`ckpt_parallel_save_optim` argument is replaced with"
                 " `ckpt_optim_fully_reshardable` and does not have any effect"
-                " (unless used together with `ckpt_save_pre_mcore_014=True`)"
             )
 
         if isinstance(self.ddp_config, DistributedDataParallelConfig):
@@ -1124,7 +1120,10 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         torch.save(state_dict, os.path.join(ckpt_dir, "common.pt"))
 
     def _load_fsdp_dtensor_common_state(self, ckpt_dir):
-        return torch.load(os.path.join(ckpt_dir, "common.pt"), weights_only=False)
+        # Note: set to weights_only=True for safety reason
+        # It should be switching to safetensor but NeMo is deprecated.
+        # Please use Megatron-Bridge for better checkpointing support.
+        return torch.load(os.path.join(ckpt_dir, "common.pt"), weights_only=True)
 
     def _load_fsdp_dtensor_checkpoint(self, path, sharded_state_dict, strict):
         from torch.distributed.checkpoint import default_planner
@@ -1228,28 +1227,14 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         if use_distributed_optimizer and use_megatron_fsdp:
             metadata["distrib_optim_sharding_type"] = "fsdp_dtensor"
 
-        force_pre_mcore_014 = not is_torch_min_version("2.6a0")
-        if force_pre_mcore_014:
-            logging.warning(
-                f"PyTorch version {get_torch_version()} below 2.6 detected."
-                f" Forcing ckpt_save_pre_mcore_014 behavior."
-            )
-
-        if self.ckpt_save_pre_mcore_014 or force_pre_mcore_014:
-            if use_distributed_optimizer and not use_megatron_fsdp:
-                if self.parallel_save_optim:
-                    metadata["distrib_optim_sharding_type"] = "fully_sharded_model_space"
-                else:
-                    metadata["distrib_optim_sharding_type"] = "dp_zero_gather_scatter"
-        else:
-            if use_distributed_optimizer and not use_megatron_fsdp:
-                if self.ckpt_optim_fully_reshardable:
-                    metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
-                    metadata['distrib_optim_fully_reshardable_mem_efficient'] = (
-                        self.distrib_optim_fully_reshardable_mem_efficient
-                    )
-                else:
-                    metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+        if use_distributed_optimizer and not use_megatron_fsdp:
+            if self.ckpt_optim_fully_reshardable:
+                metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+                metadata['distrib_optim_fully_reshardable_mem_efficient'] = (
+                    self.distrib_optim_fully_reshardable_mem_efficient
+                )
+            else:
+                metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
         return metadata
 
     def selective_restore(self) -> None:
@@ -1427,6 +1412,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             num_distributed_optimizer_instances=self.num_distributed_optimizer_instances,
             nccl_communicator_config_path=self.nccl_communicator_config_path,
             use_sharp=self.use_sharp,
+            create_all_gather_group=self.create_all_gather_group,
             pipeline_model_parallel_layout=self.pipeline_model_parallel_layout,
             use_gloo_process_groups=self.use_gloo_process_groups,
         )

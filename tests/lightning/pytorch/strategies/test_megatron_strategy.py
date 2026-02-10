@@ -22,7 +22,6 @@ from nemo.lightning.pytorch.strategies import MegatronStrategy
 
 
 def get_metadata(
-    ckpt_save_pre_mcore_014: bool = None,
     ckpt_parallel_save_optim: bool = None,
     ckpt_optim_fully_reshardable: bool = None,
 ) -> dict:
@@ -30,17 +29,11 @@ def get_metadata(
         'singleton_local_shards': False,
         'chained_optim_avoid_prefix': True,
     }
-    if ckpt_save_pre_mcore_014:
-        if ckpt_parallel_save_optim:
-            metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
-        else:
-            metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
+    if ckpt_optim_fully_reshardable:
+        metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+        metadata['distrib_optim_fully_reshardable_mem_efficient'] = False
     else:
-        if ckpt_optim_fully_reshardable:
-            metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
-            metadata['distrib_optim_fully_reshardable_mem_efficient'] = False
-        else:
-            metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+        metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
     return metadata
 
@@ -95,17 +88,9 @@ class TestMegatronStrategy:
         strategy.optimizers[0].reload_model_params.assert_called_once_with(checkpoint)
 
     def test_sharded_state_dict_metadata(self):
-        strategy = MegatronStrategy(ckpt_save_pre_mcore_014=False, ckpt_parallel_save_optim=True)
+        strategy = MegatronStrategy(ckpt_parallel_save_optim=True)
 
         ddp = DistributedDataParallelConfig(use_distributed_optimizer=True)
-
-        strategy = MegatronStrategy(ckpt_save_pre_mcore_014=True, ckpt_parallel_save_optim=True, ddp=ddp)
-        metadata = strategy.sharded_state_dict_metadata
-        assert metadata == get_metadata(ckpt_save_pre_mcore_014=True, ckpt_parallel_save_optim=True)
-
-        strategy = MegatronStrategy(ckpt_save_pre_mcore_014=True, ddp=ddp)
-        metadata = strategy.sharded_state_dict_metadata
-        assert metadata == get_metadata(ckpt_save_pre_mcore_014=True)
 
         strategy = MegatronStrategy(ckpt_optim_fully_reshardable=True, ddp=ddp)
         metadata = strategy.sharded_state_dict_metadata
@@ -154,3 +139,48 @@ class TestMegatronStrategy:
 
         with pytest.raises(AttributeError):
             strategy._update_step_kwargs(1, kwargs={"data_step": None, "forward_step": None}, step_name="first")
+
+    def test_create_all_gather_group_default(self):
+        """Test that create_all_gather_group defaults to False."""
+        strategy = MegatronStrategy()
+        assert strategy.create_all_gather_group == False
+
+    def test_create_all_gather_group_enabled(self):
+        """Test that create_all_gather_group can be set to True."""
+        strategy = MegatronStrategy(create_all_gather_group=True)
+        assert strategy.create_all_gather_group == True
+
+    def test_create_all_gather_group_in_parallelism_config(self):
+        """Test that create_all_gather_group can be configured via ParallelismConfig."""
+        import torch
+
+        from nemo.lightning.pytorch.strategies.megatron_strategy import ParallelismConfig
+
+        parallel_config = ParallelismConfig(
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=None,
+            microbatch_group_size_per_vp_stage=1,
+            context_parallel_size=1,
+            sequence_parallel=False,
+            expert_model_parallel_size=1,
+            moe_extended_tp=False,
+            pipeline_dtype=torch.float32,
+            create_all_gather_group=True,
+        )
+
+        assert parallel_config.create_all_gather_group == True
+
+        # Test default value
+        parallel_config_default = ParallelismConfig(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+            microbatch_group_size_per_vp_stage=1,
+            context_parallel_size=1,
+            sequence_parallel=False,
+            expert_model_parallel_size=1,
+            moe_extended_tp=False,
+            pipeline_dtype=torch.float32,
+        )
+        assert parallel_config_default.create_all_gather_group == False

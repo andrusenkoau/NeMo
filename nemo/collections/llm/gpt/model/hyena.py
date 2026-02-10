@@ -775,7 +775,7 @@ class PyTorchHyenaImporter(io.ModelConnector["HyenaModel", HyenaModel]):
         Returns:
             Tokenizer instance
         """
-        from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
+        from nemo.collections.common.tokenizers.tokenizer_utils import get_nmt_tokenizer
 
         tokenizer = get_nmt_tokenizer(
             library=self.model_config.tokenizer_library,
@@ -811,7 +811,7 @@ class HuggingFaceSavannaHyenaImporter(PyTorchHyenaImporter):
 
         if os.path.exists(str(self)):
             logging.info(f"Loading model from local path {str(self)}")
-            return torch.load(str(self), map_location='cpu', weights_only=False)
+            return torch.load(str(self), map_location='cpu')
         else:
             if ":" in str(self):
                 repo_id, revision = str(self).split(":")
@@ -870,7 +870,7 @@ class HuggingFaceSavannaHyenaImporter(PyTorchHyenaImporter):
                             print(f"Error removing {part}: {e}")
                         print("Cleaned up shards, final checkpoint saved to", weights_path)
 
-        return torch.load(weights_path, map_location='cpu', weights_only=False)
+        return torch.load(weights_path, map_location='cpu')
 
 
 HYENA_MODEL_OPTIONS: dict[str, Type[HyenaConfig]] = {
