@@ -527,10 +527,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
             logging.info(f"{total_res}")
 
-    logging.info(f"The whole streaming inference process took: {round(end_time - start_time, 2)}s")
-    if set_duration is not None:
-        # compte RTFx
-        logging.info(f"RTFx: {int(set_duration / (end_time - start_time))}")
+    logging.info(f"The whole streaming inference process took: {timer.total_sec():.2f}s")
     
     return cfg
 
