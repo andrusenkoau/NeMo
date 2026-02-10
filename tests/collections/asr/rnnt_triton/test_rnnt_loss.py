@@ -101,7 +101,7 @@ class TestTritonRnntLoss:
         )
 
         assert np.allclose(triton_loss, expected_loss, rtol=1e-6), "small_test costs mismatch."
-        # assert np.allclose(triton_grad, expected_grad, atol=1e-6), "small_test gradient mismatch."
+        assert np.allclose(triton_grad, expected_grad, atol=1e-6), "small_test gradient mismatch."
 
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
@@ -161,7 +161,7 @@ class TestTritonRnntLoss:
         )
 
         assert np.allclose(triton_loss, expected_loss, rtol=1e-6), "small_test_blank_last costs mismatch."
-        # assert np.allclose(triton_grad, expected_grad, atol=1e-6), "small_test_blank_last gradient mismatch."
+        assert np.allclose(triton_grad, expected_grad, atol=1e-6), "small_test_blank_last gradient mismatch."
 
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
@@ -270,7 +270,7 @@ class TestTritonRnntLoss:
         triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
 
         assert np.allclose(triton_loss, expected_loss), "big_test average costs mismatch."
-        # assert np.allclose(triton_grad, expected_grad, rtol=1e-3), "big_test grads for average cost mismatch."
+        assert np.allclose(triton_grad, expected_grad, rtol=1e-3), "big_test grads for average cost mismatch."
 
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
@@ -280,13 +280,31 @@ class TestTritonRnntLoss:
         labels = [[1, 2]]
 
         triton_rnnt = TritonRnntLoss(blank=0)
-        k2_cost, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
 
         fn_np = RNNTLoss_Numpy()
         np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
 
-        assert np.allclose(k2_cost, np_loss, rtol=1e-6), "small_random_test costs mismatch."
-        # assert np.allclose(triton_grad, np_grad, atol=1e-6), "small_random_test gradient mismatch."
+        assert np.allclose(triton_loss, np_loss, rtol=1e-6), "small_random_test costs mismatch."
+        assert np.allclose(triton_grad, np_grad, atol=1e-6), "small_random_test gradient mismatch."
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('src_length,tgt_length', [(10, 2), (1, 13)])
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_case_small_randomized(self, device, src_length: int, tgt_length: int):
+        rng = np.random.RandomState(0)
+        vocab_size = 5
+        acts = rng.randn(1, src_length, tgt_length + 1, vocab_size)
+        labels = rng.randint(low=1, high=vocab_size, size=[1, tgt_length])
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+
+        fn_np = RNNTLoss_Numpy()
+        np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
+
+        assert np.allclose(triton_loss, np_loss, rtol=1e-6), "small_random_test costs mismatch."
+        assert np.allclose(triton_grad, np_grad, atol=1e-6), "small_random_test gradient mismatch."
 
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
@@ -306,14 +324,270 @@ class TestTritonRnntLoss:
         fn_np = RNNTLoss_Numpy()
         np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
 
-        assert np.allclose(triton_loss, np_loss, atol=1e-5, rtol=1e-3), "large_random_test costs mismatch."
-        # assert np.allclose(triton_grad, np_grad, atol=1e-5, rtol=1e-3), "large_random_test gradient mismatch."
+        # numpy reference returns sum of all losses as a single scalar
+        assert np.allclose(triton_loss.sum(), np_loss.sum(), atol=1e-5, rtol=1e-3), "large_random_test costs mismatch."
+        assert np.allclose(triton_grad, np_grad, atol=1e-5, rtol=1e-3), "large_random_test gradient mismatch."
 
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
-    def test_case_large_random(self, device):
-        # TODO: test with large logits of size [16, 129, 65, 1024] and [16, 129, 65, 1025]
-        ...
+    @pytest.mark.parametrize('vocab_size', [1024, 1025])
+    def test_case_large_random(self, device, vocab_size):
+        rng = np.random.RandomState(42)
+        B, T, U_plus_1 = 16, 129, 65
+        U = U_plus_1 - 1
+        acts = rng.randn(B, T, U_plus_1, vocab_size).astype(np.float32)
+        labels = rng.randint(1, vocab_size, size=(B, U)).tolist()
+
+        acts_tensor = torch.from_numpy(acts).cuda().requires_grad_(True)
+        labels_tensor = torch.LongTensor(labels).cuda()
+        lengths = torch.full([B], T, dtype=torch.long).cuda()
+        label_lengths = torch.full([B], U, dtype=torch.long).cuda()
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+        triton_costs = triton_rnnt(acts_tensor, labels_tensor, lengths, label_lengths)
+        triton_total = triton_costs.sum()
+        triton_total.backward()
+        torch.cuda.synchronize()
+        triton_loss = triton_costs.detach().cpu().numpy()
+        triton_grad = acts_tensor.grad.data.cpu().numpy()
+
+        fn_np = RNNTLoss_Numpy()
+        np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
+
+        # numpy reference returns sum of all losses as a single scalar
+        assert np.allclose(triton_loss.sum(), np_loss.sum(), atol=1e-4, rtol=1e-3), (
+            f"large_random_test (vocab={vocab_size}) costs mismatch: "
+            f"triton_sum={triton_loss.sum()}, np_sum={np_loss.sum()}"
+        )
+        assert np.allclose(triton_grad, np_grad, atol=1e-4, rtol=1e-3), (
+            f"large_random_test (vocab={vocab_size}) gradient mismatch: "
+            f"max_diff={np.max(np.abs(triton_grad - np_grad))}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_case_single_frame(self, device):
+        """B=1, T=1, U+1=2 — minimal non-trivial case."""
+        rng = np.random.RandomState(123)
+        acts = rng.randn(1, 1, 2, 3).astype(np.float32)
+        labels = [[1]]
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+
+        fn_np = RNNTLoss_Numpy()
+        np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
+
+        assert np.allclose(triton_loss, np_loss, rtol=1e-6), "single_frame_test costs mismatch."
+        assert np.allclose(triton_grad, np_grad, atol=1e-6), "single_frame_test gradient mismatch."
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_case_variable_lengths(self, device):
+        """B=4 with different src_lengths and tgt_lengths per element."""
+        rng = np.random.RandomState(456)
+        B, T_max, U_max_plus_1, V = 4, 8, 6, 5
+        U_max = U_max_plus_1 - 1
+        acts = rng.randn(B, T_max, U_max_plus_1, V).astype(np.float32)
+
+        src_lengths = [3, 5, 8, 4]
+        tgt_lengths = [2, 4, 5, 1]
+        labels_list = []
+        for b in range(B):
+            u = tgt_lengths[b]
+            lab = rng.randint(1, V, size=U_max).tolist()
+            labels_list.append(lab[:U_max])
+
+        acts_tensor = torch.from_numpy(acts).cuda().requires_grad_(True)
+        labels_tensor = torch.LongTensor(labels_list).cuda()
+        lengths_tensor = torch.LongTensor(src_lengths).cuda()
+        label_lengths_tensor = torch.LongTensor(tgt_lengths).cuda()
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+        triton_costs = triton_rnnt(acts_tensor, labels_tensor, lengths_tensor, label_lengths_tensor)
+        triton_total = triton_costs.sum()
+        triton_total.backward()
+        torch.cuda.synchronize()
+        triton_loss_vals = triton_costs.detach().cpu().numpy()
+        triton_grad_vals = acts_tensor.grad.data.cpu().numpy()
+
+        # Compare per-element against numpy reference
+        fn_np = RNNTLoss_Numpy()
+        for b in range(B):
+            t = src_lengths[b]
+            u = tgt_lengths[b] + 1
+            single_acts = acts[b : b + 1, :t, :u, :]
+            single_labels = [labels_list[b][: u - 1]]
+
+            np_loss, np_grad = wrap_and_call(fn_np, single_acts, single_labels, device)
+            assert np.allclose(
+                triton_loss_vals[b], np_loss[0], atol=1e-5, rtol=1e-3
+            ), f"variable_lengths_test costs mismatch for batch element {b}"
+            assert np.allclose(
+                triton_grad_vals[b, :t, :u, :], np_grad[0], atol=1e-5, rtol=1e-3
+            ), f"variable_lengths_test gradient mismatch for batch element {b}"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_case_bfloat16(self, device):
+        """Verify bfloat16 inputs produce reasonable results (wider tolerance)."""
+        rng = np.random.RandomState(789)
+        acts = rng.randn(2, 4, 3, 5).astype(np.float32)
+        labels = [[1, 2], [3, 1]]
+
+        # Reference in float32
+        fn_np = RNNTLoss_Numpy()
+        np_loss, _ = wrap_and_call(fn_np, acts, labels, device)
+
+        # Triton with bfloat16
+        acts_tensor = torch.from_numpy(acts).to(torch.bfloat16).cuda().requires_grad_(True)
+        labels_tensor = torch.LongTensor(labels).cuda()
+        lengths = torch.LongTensor([4, 4]).cuda()
+        label_lengths = torch.LongTensor([2, 2]).cuda()
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+        triton_costs = triton_rnnt(acts_tensor, labels_tensor, lengths, label_lengths)
+        triton_total = triton_costs.sum()
+        triton_total.backward()
+        torch.cuda.synchronize()
+        triton_loss = triton_costs.detach().cpu().float().numpy()
+
+        # numpy reference returns sum of all losses as a single scalar
+        assert np.allclose(
+            triton_loss.sum(), np_loss.sum(), atol=0.1, rtol=0.05
+        ), f"bfloat16_test costs mismatch: triton_sum={triton_loss.sum()}, np_sum={np_loss.sum()}"
+        assert acts_tensor.grad is not None, "bfloat16_test: gradients were not computed"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_no_cuda_sync_operations(self, device):
+        """Verify no CPU-GPU sync during loss computation."""
+        from tests.collections.asr.decoding.utils import avoid_sync_operations
+
+        rng = np.random.RandomState(101)
+        acts = rng.randn(2, 4, 3, 5).astype(np.float32)
+        labels = [[1, 2], [3, 1]]
+
+        acts_tensor = torch.from_numpy(acts).cuda().requires_grad_(True)
+        labels_tensor = torch.LongTensor(labels).cuda()
+        lengths = torch.LongTensor([4, 4]).cuda()
+        label_lengths = torch.LongTensor([2, 2]).cuda()
+
+        triton_rnnt = TritonRnntLoss(blank=0)
+
+        with avoid_sync_operations(acts_tensor.device):
+            triton_costs = triton_rnnt(acts_tensor, labels_tensor, lengths, label_lengths)
+            triton_total = triton_costs.sum()
+            triton_total.backward()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    @pytest.mark.parametrize('fastemit_lambda', [0.001, 0.01, 0.1])
+    def test_fastemit_small_random(self, device, fastemit_lambda):
+        """Compare FastEmit loss and gradients against numpy reference."""
+        rng = np.random.RandomState(0)
+        acts = rng.randn(1, 4, 3, 3).astype(np.float32)
+        labels = [[1, 2]]
+
+        triton_rnnt = TritonRnntLoss(blank=0, fastemit_lambda=fastemit_lambda)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+
+        fn_np = RNNTLoss_Numpy(fastemit_lambda=fastemit_lambda)
+        np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
+
+        assert np.allclose(triton_loss, np_loss, rtol=1e-5), (
+            f"fastemit_small_random (lambda={fastemit_lambda}) costs mismatch: " f"triton={triton_loss}, np={np_loss}"
+        )
+        assert np.allclose(triton_grad, np_grad, atol=1e-5), (
+            f"fastemit_small_random (lambda={fastemit_lambda}) gradient mismatch: "
+            f"max_diff={np.max(np.abs(triton_grad - np_grad))}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_fastemit_medium_random(self, device):
+        """Compare FastEmit with multi-batch against numpy reference."""
+        rng = np.random.RandomState(42)
+        acts = rng.randn(4, 8, 5, 6).astype(np.float32)
+        labels = [[1, 2, 3, 4], [2, 3, 1, 5], [4, 1, 2, 3], [3, 5, 1, 2]]
+        fastemit_lambda = 0.01
+
+        triton_rnnt = TritonRnntLoss(blank=0, fastemit_lambda=fastemit_lambda)
+        triton_loss, triton_grad = wrap_and_call(triton_rnnt, acts, labels, device)
+
+        fn_np = RNNTLoss_Numpy(fastemit_lambda=fastemit_lambda)
+        np_loss, np_grad = wrap_and_call(fn_np, acts, labels, device)
+
+        # numpy reference returns sum of all losses as a single scalar
+        assert np.allclose(triton_loss.sum(), np_loss.sum(), atol=1e-4, rtol=1e-3), (
+            f"fastemit_medium_random costs mismatch: " f"triton_sum={triton_loss.sum()}, np_sum={np_loss.sum()}"
+        )
+        assert np.allclose(triton_grad, np_grad, atol=1e-4, rtol=1e-3), (
+            f"fastemit_medium_random gradient mismatch: " f"max_diff={np.max(np.abs(triton_grad - np_grad))}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    @pytest.mark.parametrize('fastemit_lambda', [0.01, 0.1])
+    def test_fastemit_variable_lengths(self, device, fastemit_lambda):
+        """B=4 with different src_lengths and tgt_lengths per element + FastEmit."""
+        rng = np.random.RandomState(456)
+        B, T_max, U_max_plus_1, V = 4, 8, 6, 5
+        U_max = U_max_plus_1 - 1
+        acts = rng.randn(B, T_max, U_max_plus_1, V).astype(np.float32)
+
+        src_lengths = [3, 5, 8, 4]
+        tgt_lengths = [2, 4, 5, 1]
+        labels_list = []
+        for b in range(B):
+            lab = rng.randint(1, V, size=U_max).tolist()
+            labels_list.append(lab[:U_max])
+
+        acts_tensor = torch.from_numpy(acts).cuda().requires_grad_(True)
+        labels_tensor = torch.LongTensor(labels_list).cuda()
+        lengths_tensor = torch.LongTensor(src_lengths).cuda()
+        label_lengths_tensor = torch.LongTensor(tgt_lengths).cuda()
+
+        triton_rnnt = TritonRnntLoss(blank=0, fastemit_lambda=fastemit_lambda)
+        triton_costs = triton_rnnt(acts_tensor, labels_tensor, lengths_tensor, label_lengths_tensor)
+        triton_total = triton_costs.sum()
+        triton_total.backward()
+        torch.cuda.synchronize()
+        triton_loss_vals = triton_costs.detach().cpu().numpy()
+        triton_grad_vals = acts_tensor.grad.data.cpu().numpy()
+
+        # Compare per-element against numpy reference
+        fn_np = RNNTLoss_Numpy(fastemit_lambda=fastemit_lambda)
+        for b in range(B):
+            t = src_lengths[b]
+            u = tgt_lengths[b] + 1
+            single_acts = acts[b : b + 1, :t, :u, :]
+            single_labels = [labels_list[b][: u - 1]]
+
+            np_loss, np_grad = wrap_and_call(fn_np, single_acts, single_labels, device)
+            assert np.allclose(
+                triton_loss_vals[b], np_loss[0], atol=1e-5, rtol=1e-3
+            ), f"fastemit_variable_lengths (lambda={fastemit_lambda}) costs mismatch for batch element {b}"
+            assert np.allclose(
+                triton_grad_vals[b, :t, :u, :], np_grad[0], atol=1e-5, rtol=1e-3
+            ), f"fastemit_variable_lengths (lambda={fastemit_lambda}) gradient mismatch for batch element {b}"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
+    def test_fastemit_zero_lambda_unchanged(self, device):
+        """Verify that fastemit_lambda=0.0 gives identical results to no FastEmit."""
+        rng = np.random.RandomState(7)
+        acts = rng.randn(2, 5, 4, 6).astype(np.float32)
+        labels = [[1, 2, 3], [4, 1, 2]]
+
+        triton_no_fe = TritonRnntLoss(blank=0)
+        loss_no_fe, grad_no_fe = wrap_and_call(triton_no_fe, acts, labels, device)
+
+        triton_fe_zero = TritonRnntLoss(blank=0, fastemit_lambda=0.0)
+        loss_fe_zero, grad_fe_zero = wrap_and_call(triton_fe_zero, acts, labels, device)
+
+        assert np.array_equal(loss_no_fe, loss_fe_zero), "fastemit_lambda=0.0 should give identical loss"
+        assert np.array_equal(grad_no_fe, grad_fe_zero), "fastemit_lambda=0.0 should give identical gradients"
 
 
 if __name__ == "__main__":
