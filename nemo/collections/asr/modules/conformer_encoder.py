@@ -686,8 +686,15 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 if self.training:
                     cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
                 else:
+                    cur_att_context_size = self.att_context_size
                     # cur_att_context_size = [self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]
-                    cur_att_context_size = [-1, -1, -1]
+                    
+                    # logging.warning("*********"*10)
+                    # logging.warning(f"self.att_context_size: {self.att_context_size}")
+
+                    # cur_att_context_size = [-1, -1, -1]
+                    # logging.warning(f"cur_att_context_size: {cur_att_context_size}")
+                    # raise ValueError("Stop here")
                     # cur_att_context_size = [140, 1, 3]
                     # cur_att_context_size = [140, 1, 4]
                     # cur_att_context_size = [140, 1, 1]
@@ -1032,7 +1039,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             att_context_size_all = [[-1, -1]]
 
         if att_context_style == "chunked_limited_with_rc":
-            att_context_size_all = [[self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]]
+            # att_context_size_all = [[self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]]
+            att_context_size_all = [[-1, -1, -1]]
 
         if att_context_probs:
             if len(att_context_probs) != len(att_context_size_all):
