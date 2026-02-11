@@ -849,9 +849,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 loss_value = self.add_auxiliary_losses(loss_value)
 
                 tensorboard_logs = {
-                    'train_loss': loss_value,
-                    'train_offline_loss': offline_loss,
-                    'train_streaming_loss': streaming_loss,
+                    'train_loss': loss_value.item(),
+                    'train_offline_loss': offline_loss.item(),
+                    'train_streaming_loss': streaming_loss.item(),
                     'learning_rate': self._optimizer.param_groups[0]['lr'],
                     'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
                 }
@@ -865,9 +865,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                         src_lengths=offline_len,
                         tgt_lengths=target_length,
                     )
+                    loss_value += self.consistency_loss_weight * consistency_loss_value
                     tensorboard_logs['rnnt_consistency_loss'] = consistency_loss_value.item()
                     tensorboard_logs['rnnt_consistency_loss_weighted'] = consistency_loss_value.item() * self.consistency_loss_weight
-                    loss_value += self.consistency_loss_weight * consistency_loss_value
+                    tensorboard_logs['train_loss'] = loss_value.item()
+
 
                 # logging.warning(f"Offline loss: {offline_loss:.2f}, Streaming loss: {streaming_loss:.2f}")
                 # logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss:.2f}")
