@@ -103,6 +103,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if (consistency_loss_cfg := self.cfg.get("loss", {}).get("consistency", {})) is not None:
             weight = consistency_loss_cfg.get("weight", None)
             if weight is not None and weight != 0.0:
+                # check that it is not fused joint
+                if self.joint.fuse_loss_wer or self.joint.fused_batch_size > 0:
+                    raise NotImplementedError("Consistency loss is not supported for fused joint")
                 if loss_name == "tdt":
                     raise NotImplementedError
                 self.use_double_batch = True
@@ -117,7 +120,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     self.consistency_loss = ConsistencyFullRNNTLoss(
                         symmetrical=consistency_loss_cfg.get("symmetrical", False),
                         reduction=consistency_loss_cfg.get("reduction", "mean_volume"),
-                        use_triton=consistency_loss_cfg.get("use_triton", False),
+                        use_triton=consistency_loss_cfg.get("use_triton", True),
                     )
                 else:
                     logging.info(f"Instantiated partial consistency loss with params: {consistency_loss_cfg}")
@@ -131,13 +134,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 self.consistency_loss_weight = weight
                 self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
             else:
-                self.use_double_batch = consistency_loss_cfg.get("force_double_batch", False)
                 self.consistency_loss = None
                 self.consistency_loss_weight = 0.0
                 self.consistency_loss_after_step = -1
-        else:
-            self.use_double_batch = False
-
 
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
@@ -760,10 +759,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 length=input_signal_length,
             )
 
-        if self.use_double_batch:
-            processed_signal = torch.cat((processed_signal, processed_signal), dim=0)
-            processed_signal_length = torch.cat((processed_signal_length, processed_signal_length), dim=0)
-
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
@@ -874,10 +869,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     tensorboard_logs['rnnt_consistency_loss_weighted'] = consistency_loss_value.item() * self.consistency_loss_weight
                     loss_value += self.consistency_loss_weight * consistency_loss_value
 
-                logging.warning(f"Offline loss: {offline_loss:.2f}, Streaming loss: {streaming_loss:.2f}")
-                logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss:.2f}")
-                logging.warning(f"Consistency loss: {consistency_loss_value:.2f}, Weighted sum: {self.consistency_loss_weight * consistency_loss_value:.2f}")
-                logging.warning(f"Total loss: {loss_value:.2f}")
+                # logging.warning(f"Offline loss: {offline_loss:.2f}, Streaming loss: {streaming_loss:.2f}")
+                # logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss:.2f}")
+                # logging.warning(f"Consistency loss: {consistency_loss_value:.2f}, Weighted sum: {self.consistency_loss_weight * consistency_loss_value:.2f}")
+                # logging.warning(f"Total loss: {loss_value:.2f}")
 
                 if AccessMixin.is_access_enabled(self.model_guid):
                     AccessMixin.reset_registry(self)
