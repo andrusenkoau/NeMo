@@ -196,6 +196,8 @@ class TritonRnntLossFunction(torch.autograd.Function):
         fastemit_lambda: float = 0.0,
     ):
         """
+        RNN-T loss calculation from target/blank log-probs. Forward pass.
+
         Args:
             ctx: ctx object for storing the context
             target_logprobs: logprobs for target labels of size [B, T, U+1]
@@ -246,7 +248,9 @@ class TritonRnntLossFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_rnnt_loss):
-        """ """
+        """
+        Backward pass for RNN-T loss
+        """
         (target_logprobs, blank_logprobs, alpha, src_lengths, tgt_lengths) = ctx.saved_tensors
         use_fp64 = ctx.use_fp64
         fastemit_lambda = ctx.fastemit_lambda
