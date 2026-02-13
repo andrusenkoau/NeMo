@@ -29,6 +29,7 @@ def _rnnt_logprobs_fwd_kernel(
     blank_id: int,
     target_scores_out_ptr,
     blank_scores_out_ptr,
+    log_sum_exp_scores_out_ptr,
     BLOCK_SIZE: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
@@ -51,24 +52,26 @@ def _rnnt_logprobs_fwd_kernel(
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits
-    flat_index = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
-    logits_ptr += flat_index
+    flat_index_grid = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
+    flat_index_logits = flat_index_grid * num_labels
+    logits_ptr += flat_index_logits
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < num_labels
     logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
     # stable log softmax calculation
     logits_max = tl.max(logits, axis=0)
     logits_minus_max = logits - logits_max
-    denominator = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0))
+    log_sum_exp = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0)) + logits_max
     blank_logit = tl.load(logits_ptr + blank_id).to(compute_dtype)
-    flat_index_output = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
-    tl.store(blank_scores_out_ptr + flat_index_output, blank_logit - logits_max - denominator)
+
+    tl.store(blank_scores_out_ptr + flat_index_grid, blank_logit - log_sum_exp)
+    tl.store(log_sum_exp_scores_out_ptr + flat_index_grid, log_sum_exp)
 
     # calculate log prob for target if needed
     if target_i < target_len:
         target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i)
         target_logit = tl.load(logits_ptr + target_id).to(compute_dtype)
-        tl.store(target_scores_out_ptr + flat_index_output, target_logit - logits_max - denominator)
+        tl.store(target_scores_out_ptr + flat_index_grid, target_logit - log_sum_exp)
 
 
 @triton.jit
@@ -76,6 +79,7 @@ def _rnnt_logprobs_bwd_kernel(
     logits_ptr,
     grad_logits_out_ptr,
     targets_ptr,
+    log_sum_exp_scores_ptr,
     src_lengths_ptr,
     tgt_lengths_ptr,
     max_source_len: int,
@@ -106,25 +110,23 @@ def _rnnt_logprobs_bwd_kernel(
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits/grad_logits
-    flat_index = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
-    logits_ptr += flat_index
-    grad_logits_out_ptr += flat_index
+    flat_index_grid = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
+    flat_index_logits = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
+    logits_ptr += flat_index_logits
+    grad_logits_out_ptr += flat_index_logits
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < num_labels
     logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(compute_dtype)
     # stable log softmax calculation
-    logits_max = tl.max(logits, axis=0)
-    logits_minus_max = logits - logits_max
-    denominator = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0))
-    log_softmax = logits_minus_max - denominator
+    log_sum_exp = tl.load(log_sum_exp_scores_ptr + flat_index_grid)
+    log_softmax = logits - log_sum_exp
     # softmax for gradient
     softmax = tl.exp(log_softmax)
 
-    flat_index_grad = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
-    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grad).to(compute_dtype)
+    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grid).to(compute_dtype)
     target_i_valid = target_i < target_len
-    target_grad = tl.load(grad_target_scores_ptr + flat_index_grad, mask=target_i_valid, other=0.0).to(compute_dtype)
+    target_grad = tl.load(grad_target_scores_ptr + flat_index_grid, mask=target_i_valid, other=0.0).to(compute_dtype)
     target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i, mask=target_i_valid, other=-1)
 
     grad_not_in_targets = (-softmax) * (blank_grad + target_grad)
@@ -169,6 +171,7 @@ class RnntLogProbs(torch.autograd.Function):
 
         target_scores = torch.zeros(logits.shape[:-1], dtype=float_dtype, device=device)
         blank_scores = torch.zeros_like(target_scores)
+        log_sum_exp_scores = torch.empty_like(target_scores)
         if src_lengths is None:
             src_lengths = torch.full([logits.shape[0]], fill_value=logits.shape[1], dtype=torch.int, device=device)
         else:
@@ -192,12 +195,13 @@ class RnntLogProbs(torch.autograd.Function):
             blank_id=blank_id,
             target_scores_out_ptr=target_scores,
             blank_scores_out_ptr=blank_scores,
+            log_sum_exp_scores_out_ptr=log_sum_exp_scores,
             BLOCK_SIZE=triton.next_power_of_2(logits.shape[-1]),
             USE_FP64=use_fp64,
         )
 
         # saving for backward
-        ctx.save_for_backward(logits, targets, src_lengths, tgt_lengths)
+        ctx.save_for_backward(logits, targets, src_lengths, tgt_lengths, log_sum_exp_scores)
         ctx.blank_id = blank_id
         ctx.use_fp64 = use_fp64
         return target_scores, blank_scores
@@ -215,7 +219,7 @@ class RnntLogProbs(torch.autograd.Function):
         Returns:
             gradient for logits, None for all other arguments for `forward`
         """
-        (logits, targets, src_lengths, tgt_lengths) = ctx.saved_tensors
+        (logits, targets, src_lengths, tgt_lengths, log_sum_exp_scores) = ctx.saved_tensors
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
         grad_logits = torch.zeros_like(logits)
@@ -225,6 +229,7 @@ class RnntLogProbs(torch.autograd.Function):
             src_lengths_ptr=src_lengths,
             tgt_lengths_ptr=tgt_lengths,
             targets_ptr=targets,
+            log_sum_exp_scores_ptr=log_sum_exp_scores,
             max_source_len=logits.shape[1],
             max_target_len_plus_1=logits.shape[2],
             num_labels=logits.shape[3],
