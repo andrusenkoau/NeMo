@@ -26,8 +26,8 @@ def _rnnt_fwd_kernel(
     blank_logprobs_ptr,
     src_lengths_ptr,
     tgt_lengths_ptr,
-    alpha_ptr,
-    loss_batch_ptr,
+    alpha_out_ptr,
+    loss_batch_out_ptr,
     max_src_len,
     max_tgt_len_plus_1,
     BLOCK_SIZE: tl.constexpr,
@@ -49,7 +49,7 @@ def _rnnt_fwd_kernel(
     batch_offset = batch_i * max_src_len * max_tgt_len_plus_1
 
     # alpha[0, 0] = 0.0
-    tl.store(alpha_ptr + batch_offset, 0.0)
+    tl.store(alpha_out_ptr + batch_offset, 0.0)
 
     num_diags = src_len + tgt_len
     max_diags = max_src_len + max_tgt_len_plus_1 - 1
@@ -64,14 +64,14 @@ def _rnnt_fwd_kernel(
         # Blank predecessor: alpha[t-1, u] + blank_logprobs[t-1, u] (valid when t > 0)
         blank_mask = mask & (t_offsets > 0)
         blank_pred_idx = batch_offset + (t_offsets - 1) * max_tgt_len_plus_1 + u_offsets
-        blank_alpha = tl.load(alpha_ptr + blank_pred_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
+        blank_alpha = tl.load(alpha_out_ptr + blank_pred_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
         blank_lp = tl.load(blank_logprobs_ptr + blank_pred_idx, mask=blank_mask, other=0.0).to(compute_dtype)
         blank_score = tl.where(blank_mask, blank_alpha + blank_lp, NEG_INF)
 
         # Emit predecessor: alpha[t, u-1] + target_logprobs[t, u-1] (valid when u > 0)
         emit_mask = mask & (u_offsets > 0)
         emit_pred_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + (u_offsets - 1)
-        emit_alpha = tl.load(alpha_ptr + emit_pred_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
+        emit_alpha = tl.load(alpha_out_ptr + emit_pred_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
         emit_lp = tl.load(target_logprobs_ptr + emit_pred_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_alpha + emit_lp, NEG_INF)
 
@@ -81,16 +81,16 @@ def _rnnt_fwd_kernel(
 
         # Store alpha values
         cur_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + u_offsets
-        tl.store(alpha_ptr + cur_idx, alpha_val, mask=mask)
+        tl.store(alpha_out_ptr + cur_idx, alpha_val, mask=mask)
         # Barrier needed: cross-warp store-load dependency between consecutive diagonals
         tl.debug_barrier()
 
     # Loss = -(alpha[src_len-1, tgt_len] + blank_logprobs[src_len-1, tgt_len])
     final_idx = batch_offset + (src_len - 1) * max_tgt_len_plus_1 + tgt_len
-    final_alpha = tl.load(alpha_ptr + final_idx).to(compute_dtype)
+    final_alpha = tl.load(alpha_out_ptr + final_idx).to(compute_dtype)
     final_blank_lp = tl.load(blank_logprobs_ptr + final_idx).to(compute_dtype)
     loss = -(final_alpha + final_blank_lp)
-    tl.store(loss_batch_ptr + batch_i, loss)
+    tl.store(loss_batch_out_ptr + batch_i, loss)
 
 
 @triton.jit
@@ -98,11 +98,11 @@ def _rnnt_bwd_kernel(
     target_logprobs_ptr,
     blank_logprobs_ptr,
     alpha_ptr,
-    beta_ptr,
+    beta_out_ptr,
     src_lengths_ptr,
     tgt_lengths_ptr,
-    target_logprobs_grad_ptr,
-    blank_logprobs_grad_ptr,
+    target_logprobs_grad_out_ptr,
+    blank_logprobs_grad_out_ptr,
     max_src_len,
     max_tgt_len_plus_1,
     BLOCK_SIZE: tl.constexpr,
@@ -125,14 +125,14 @@ def _rnnt_bwd_kernel(
     # Initialize beta[src_len-1, tgt_len] = blank_logprobs[src_len-1, tgt_len]
     final_idx = batch_offset + (src_len - 1) * max_tgt_len_plus_1 + tgt_len
     final_blank_lp = tl.load(blank_logprobs_ptr + final_idx).to(compute_dtype)
-    tl.store(beta_ptr + final_idx, final_blank_lp)
+    tl.store(beta_out_ptr + final_idx, final_blank_lp)
 
     # log_like = alpha[src_len-1, tgt_len] + blank_logprobs[src_len-1, tgt_len]
     final_alpha = tl.load(alpha_ptr + final_idx).to(compute_dtype)
     log_like = final_alpha + final_blank_lp
 
     # Gradient at final state: blank_grad[src_len-1, tgt_len] = -1.0
-    tl.store(blank_logprobs_grad_ptr + final_idx, -1.0)
+    tl.store(blank_logprobs_grad_out_ptr + final_idx, -1.0)
 
     num_diags = src_len + tgt_len
     max_diags = max_src_len + max_tgt_len_plus_1 - 1
@@ -147,7 +147,7 @@ def _rnnt_bwd_kernel(
         # Blank successor: beta[t+1, u] + blank_logprobs[t, u] (valid when t+1 < src_len)
         blank_mask = mask & (t_offsets + 1 < src_len)
         blank_succ_idx = batch_offset + (t_offsets + 1) * max_tgt_len_plus_1 + u_offsets
-        blank_beta = tl.load(beta_ptr + blank_succ_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
+        blank_beta = tl.load(beta_out_ptr + blank_succ_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
         cur_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + u_offsets
         blank_lp = tl.load(blank_logprobs_ptr + cur_idx, mask=blank_mask, other=0.0).to(compute_dtype)
         blank_score = tl.where(blank_mask, blank_beta + blank_lp, NEG_INF)
@@ -155,14 +155,14 @@ def _rnnt_bwd_kernel(
         # Emit successor: beta[t, u+1] + target_logprobs[t, u] (valid when u+1 <= tgt_len)
         emit_mask = mask & (u_offsets + 1 <= tgt_len)
         emit_succ_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + (u_offsets + 1)
-        emit_beta = tl.load(beta_ptr + emit_succ_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
+        emit_beta = tl.load(beta_out_ptr + emit_succ_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
         emit_lp = tl.load(target_logprobs_ptr + cur_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_beta + emit_lp, NEG_INF)
 
         # Beta: logaddexp
         max_score = tl.maximum(blank_score, emit_score)
         beta_val = max_score + tl.log(tl.exp(blank_score - max_score) + tl.exp(emit_score - max_score))
-        tl.store(beta_ptr + cur_idx, beta_val, mask=mask)
+        tl.store(beta_out_ptr + cur_idx, beta_val, mask=mask)
 
         # Fused gradient computation
         # blank_grad[t, u] = -exp(alpha[t, u] + beta[t+1, u] + blank_logprobs[t, u] - log_like)
@@ -172,7 +172,7 @@ def _rnnt_bwd_kernel(
             -tl.exp(alpha_val + blank_beta + blank_lp - log_like),
             0.0,
         )
-        tl.store(blank_logprobs_grad_ptr + cur_idx, blank_grad, mask=mask)
+        tl.store(blank_logprobs_grad_out_ptr + cur_idx, blank_grad, mask=mask)
 
         # target_grad[t, u] = -exp(alpha[t, u] + beta[t, u+1] + target_logprobs[t, u] - log_like)
         target_grad = tl.where(
@@ -180,7 +180,7 @@ def _rnnt_bwd_kernel(
             -tl.exp(alpha_val + emit_beta + emit_lp - log_like),
             0.0,
         )
-        tl.store(target_logprobs_grad_ptr + cur_idx, target_grad, mask=mask)
+        tl.store(target_logprobs_grad_out_ptr + cur_idx, target_grad, mask=mask)
         # Barrier needed: cross-warp store-load dependency between consecutive diagonals
         tl.debug_barrier()
 
@@ -229,8 +229,8 @@ class TritonRnntLossFunction(torch.autograd.Function):
             blank_logprobs_ptr=blank_logprobs,
             src_lengths_ptr=src_lengths,
             tgt_lengths_ptr=tgt_lengths,
-            alpha_ptr=alpha,
-            loss_batch_ptr=loss_batch,
+            alpha_out_ptr=alpha,
+            loss_batch_out_ptr=loss_batch,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             BLOCK_SIZE=BLOCK_SIZE,
@@ -279,11 +279,11 @@ class TritonRnntLossFunction(torch.autograd.Function):
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
             alpha_ptr=alpha,
-            beta_ptr=beta,
+            beta_out_ptr=beta,
             src_lengths_ptr=src_lengths,
             tgt_lengths_ptr=tgt_lengths,
-            target_logprobs_grad_ptr=target_logprobs_grad,
-            blank_logprobs_grad_ptr=blank_logprobs_grad,
+            target_logprobs_grad_out_ptr=target_logprobs_grad,
+            blank_logprobs_grad_out_ptr=blank_logprobs_grad,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             BLOCK_SIZE=BLOCK_SIZE,

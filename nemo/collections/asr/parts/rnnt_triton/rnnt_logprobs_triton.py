@@ -27,13 +27,13 @@ def _rnnt_logprobs_fwd_kernel(
     max_target_len_plus_1: int,
     num_labels: int,  # vocab size (with blank)
     blank_id: int,
-    target_scores_ptr,
-    blank_scores_ptr,
+    target_scores_out_ptr,
+    blank_scores_out_ptr,
     BLOCK_SIZE: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
-    Forward kernel for RNN-T log probs. Stores result in `target_scores_ptr` and `blank_scores_ptr`.
+    Forward kernel for RNN-T log probs. Stores result in `target_scores_out_ptr` and `blank_scores_out_ptr`.
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
@@ -62,19 +62,19 @@ def _rnnt_logprobs_fwd_kernel(
     denominator = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0))
     blank_logit = tl.load(logits_ptr + blank_id).to(compute_dtype)
     flat_index_output = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
-    tl.store(blank_scores_ptr + flat_index_output, blank_logit - logits_max - denominator)
+    tl.store(blank_scores_out_ptr + flat_index_output, blank_logit - logits_max - denominator)
 
     # calculate log prob for target if needed
     if target_i < target_len:
         target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i)
         target_logit = tl.load(logits_ptr + target_id).to(compute_dtype)
-        tl.store(target_scores_ptr + flat_index_output, target_logit - logits_max - denominator)
+        tl.store(target_scores_out_ptr + flat_index_output, target_logit - logits_max - denominator)
 
 
 @triton.jit
 def _rnnt_logprobs_bwd_kernel(
     logits_ptr,
-    grad_logits_ptr,
+    grad_logits_out_ptr,
     targets_ptr,
     src_lengths_ptr,
     tgt_lengths_ptr,
@@ -108,7 +108,7 @@ def _rnnt_logprobs_bwd_kernel(
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits/grad_logits
     flat_index = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
     logits_ptr += flat_index
-    grad_logits_ptr += flat_index
+    grad_logits_out_ptr += flat_index
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < num_labels
@@ -130,7 +130,7 @@ def _rnnt_logprobs_bwd_kernel(
     grad_not_in_targets = (-softmax) * (blank_grad + target_grad)
     grad = tl.where(col_offsets == blank_id, blank_grad + grad_not_in_targets, grad_not_in_targets)
     grad = tl.where(col_offsets == target_id, target_grad + grad_not_in_targets, grad)
-    tl.store(grad_logits_ptr + col_offsets, grad, mask=mask)
+    tl.store(grad_logits_out_ptr + col_offsets, grad, mask=mask)
 
 
 class RnntLogProbs(torch.autograd.Function):
@@ -190,8 +190,8 @@ class RnntLogProbs(torch.autograd.Function):
             max_target_len_plus_1=logits.shape[2],
             num_labels=logits.shape[3],
             blank_id=blank_id,
-            target_scores_ptr=target_scores,
-            blank_scores_ptr=blank_scores,
+            target_scores_out_ptr=target_scores,
+            blank_scores_out_ptr=blank_scores,
             BLOCK_SIZE=triton.next_power_of_2(logits.shape[-1]),
             USE_FP64=use_fp64,
         )
@@ -221,7 +221,7 @@ class RnntLogProbs(torch.autograd.Function):
         grad_logits = torch.zeros_like(logits)
         _rnnt_logprobs_bwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
             logits_ptr=logits,
-            grad_logits_ptr=grad_logits,
+            grad_logits_out_ptr=grad_logits,
             src_lengths_ptr=src_lengths,
             tgt_lengths_ptr=tgt_lengths,
             targets_ptr=targets,
