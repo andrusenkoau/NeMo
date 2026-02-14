@@ -62,14 +62,14 @@ def _rnnt_fwd_kernel(
     num_diags = src_len + tgt_len
     offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
-    for diag_i32 in tl.range(1, num_diags):
-        diag = diag_i32.to(tl.int64)
+    for diag_i_i32 in tl.range(1, num_diags):
+        diag_i = diag_i_i32.to(tl.int64)
         if PARALLELIZE_OVER_SRC:
             src_offsets = offsets
-            tgt_offsets = diag - offsets
+            tgt_offsets = diag_i - offsets
         else:
             tgt_offsets = offsets
-            src_offsets = diag - offsets
+            src_offsets = diag_i - offsets
         # Mask: valid positions on this diagonal
         mask = (src_offsets >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
@@ -87,11 +87,11 @@ def _rnnt_fwd_kernel(
         emit_lp = tl.load(target_logprobs_ptr + emit_pred_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_alpha + emit_lp, NEG_INF)
 
-        alpha_val = _log_add_exp(blank_score, emit_score)
+        alpha_diag = _log_add_exp(blank_score, emit_score)
 
         # Store alpha values
         cur_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + tgt_offsets
-        tl.store(alpha_out_ptr + cur_idx, alpha_val, mask=mask)
+        tl.store(alpha_out_ptr + cur_idx, alpha_diag, mask=mask)
         # Barrier needed: cross-warp store-load dependency between consecutive diagonals
         tl.debug_barrier()
 
@@ -150,14 +150,14 @@ def _rnnt_bwd_kernel(
     offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     # Reverse diagonal loop: d from (num_diags - 2) down to 0
-    for diag_rev_i32 in tl.range(0, num_diags - 1):
-        diag = num_diags - 2 - diag_rev_i32.to(tl.int64)
+    for diag_rev_i_i32 in tl.range(0, num_diags - 1):
+        diag_i = num_diags - 2 - diag_rev_i_i32.to(tl.int64)
         if PARALLELIZE_OVER_SRC:
             src_offsets = offsets
-            tgt_offsets = diag - offsets
+            tgt_offsets = diag_i - offsets
         else:
             tgt_offsets = offsets
-            src_offsets = diag - offsets
+            src_offsets = diag_i - offsets
         mask = (src_offsets >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank successor: beta[t+1, u] + blank_logprobs[t, u] (valid when t+1 < src_len)
@@ -175,8 +175,8 @@ def _rnnt_bwd_kernel(
         emit_lp = tl.load(target_logprobs_ptr + cur_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_beta + emit_lp, NEG_INF)
 
-        beta_val = _log_add_exp(blank_score, emit_score)
-        tl.store(beta_out_ptr + cur_idx, beta_val, mask=mask)
+        beta_diag = _log_add_exp(blank_score, emit_score)
+        tl.store(beta_out_ptr + cur_idx, beta_diag, mask=mask)
 
         # Fused gradient computation
         # blank_grad[t, u] = -exp(alpha[t, u] + beta[t+1, u] + blank_logprobs[t, u] - log_like)
