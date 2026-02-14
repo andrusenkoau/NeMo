@@ -31,12 +31,14 @@ def _rnnt_fwd_kernel(
     max_src_len,
     max_tgt_len_plus_1,
     BLOCK_SIZE: tl.constexpr,
+    PARALLELIZE_OVER_SRC: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
     Forward kernel for RNN-T loss.
 
     Calculations are performed in float32 or float64 based on USE_FP64.
+    PARALLELIZE_OVER_SRC: if True, offsets enumerate src positions; if False, tgt positions.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
@@ -52,13 +54,18 @@ def _rnnt_fwd_kernel(
     tl.store(alpha_out_ptr + batch_offset, 0.0)
 
     num_diags = src_len + tgt_len
-    src_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     for diag_i32 in tl.range(1, num_diags):
         diag = diag_i32.to(tl.int64)
-        tgt_offsets = diag - src_offsets
+        if PARALLELIZE_OVER_SRC:
+            src_offsets = offsets
+            tgt_offsets = diag - offsets
+        else:
+            tgt_offsets = offsets
+            src_offsets = diag - offsets
         # Mask: valid positions on this diagonal
-        mask = (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
+        mask = (src_offsets >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank predecessor: alpha[t-1, u] + blank_logprobs[t-1, u] (valid when t > 0)
         blank_mask = mask & (src_offsets > 0)
@@ -105,12 +112,14 @@ def _rnnt_bwd_kernel(
     max_src_len,
     max_tgt_len_plus_1,
     BLOCK_SIZE: tl.constexpr,
+    PARALLELIZE_OVER_SRC: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
     Backward kernel for RNN-T loss.
 
     Calculations are performed in float32 or float64 based on USE_FP64.
+    PARALLELIZE_OVER_SRC: if True, offsets enumerate src positions; if False, tgt positions.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
@@ -134,13 +143,18 @@ def _rnnt_bwd_kernel(
     tl.store(blank_logprobs_grad_out_ptr + final_idx, -1.0)
 
     num_diags = src_len + tgt_len
-    src_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     # Reverse diagonal loop: d from (num_diags - 2) down to 0
     for diag_rev_i32 in tl.range(0, num_diags - 1):
         diag = num_diags - 2 - diag_rev_i32.to(tl.int64)
-        tgt_offsets = diag - src_offsets
-        mask = (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
+        if PARALLELIZE_OVER_SRC:
+            src_offsets = offsets
+            tgt_offsets = diag - offsets
+        else:
+            tgt_offsets = offsets
+            src_offsets = diag - offsets
+        mask = (src_offsets >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank successor: beta[t+1, u] + blank_logprobs[t, u] (valid when t+1 < src_len)
         blank_mask = mask & (src_offsets + 1 < src_len)
@@ -221,7 +235,8 @@ class TritonRnntLossFunction(torch.autograd.Function):
         )
         loss_batch = torch.empty([batch_size], dtype=float_dtype, device=target_logprobs.device)
 
-        BLOCK_SIZE = triton.next_power_of_2(src_max_length)
+        parallelize_over_src = src_max_length <= tgt_max_length_plus_1
+        BLOCK_SIZE = triton.next_power_of_2(min(src_max_length, tgt_max_length_plus_1))
         _rnnt_fwd_kernel[(batch_size,)](
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
@@ -232,6 +247,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             BLOCK_SIZE=BLOCK_SIZE,
+            PARALLELIZE_OVER_SRC=parallelize_over_src,
             USE_FP64=use_fp64,
         )
 
@@ -272,7 +288,8 @@ class TritonRnntLossFunction(torch.autograd.Function):
             device=target_logprobs.device,
         )
 
-        BLOCK_SIZE = triton.next_power_of_2(src_max_length)
+        parallelize_over_src = src_max_length <= tgt_max_length_plus_1
+        BLOCK_SIZE = triton.next_power_of_2(min(src_max_length, tgt_max_length_plus_1))
         _rnnt_bwd_kernel[(batch_size,)](
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
@@ -285,6 +302,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             BLOCK_SIZE=BLOCK_SIZE,
+            PARALLELIZE_OVER_SRC=parallelize_over_src,
             USE_FP64=use_fp64,
         )
 
