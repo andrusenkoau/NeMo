@@ -53,24 +53,24 @@ def _rnnt_fwd_kernel(
 
     num_diags = src_len + tgt_len
     max_diags = max_src_len + max_tgt_len_plus_1 - 1
-    t_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    src_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
-    for d in tl.range(1, max_diags):
-        d_i64 = d.to(tl.int64)
-        u_offsets = d_i64 - t_offsets
+    for diag_i32 in tl.range(1, max_diags):
+        diag = diag_i32.to(tl.int64)
+        tgt_offsets = diag - src_offsets
         # Mask: valid positions on this diagonal
-        mask = (d_i64 < num_diags) & (t_offsets < src_len) & (u_offsets >= 0) & (u_offsets <= tgt_len)
+        mask = (diag < num_diags) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank predecessor: alpha[t-1, u] + blank_logprobs[t-1, u] (valid when t > 0)
-        blank_mask = mask & (t_offsets > 0)
-        blank_pred_idx = batch_offset + (t_offsets - 1) * max_tgt_len_plus_1 + u_offsets
+        blank_mask = mask & (src_offsets > 0)
+        blank_pred_idx = batch_offset + (src_offsets - 1) * max_tgt_len_plus_1 + tgt_offsets
         blank_alpha = tl.load(alpha_out_ptr + blank_pred_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
         blank_lp = tl.load(blank_logprobs_ptr + blank_pred_idx, mask=blank_mask, other=0.0).to(compute_dtype)
         blank_score = tl.where(blank_mask, blank_alpha + blank_lp, NEG_INF)
 
         # Emit predecessor: alpha[t, u-1] + target_logprobs[t, u-1] (valid when u > 0)
-        emit_mask = mask & (u_offsets > 0)
-        emit_pred_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + (u_offsets - 1)
+        emit_mask = mask & (tgt_offsets > 0)
+        emit_pred_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + (tgt_offsets - 1)
         emit_alpha = tl.load(alpha_out_ptr + emit_pred_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
         emit_lp = tl.load(target_logprobs_ptr + emit_pred_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_alpha + emit_lp, NEG_INF)
@@ -80,7 +80,7 @@ def _rnnt_fwd_kernel(
         alpha_val = max_score + tl.log(tl.exp(blank_score - max_score) + tl.exp(emit_score - max_score))
 
         # Store alpha values
-        cur_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + u_offsets
+        cur_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + tgt_offsets
         tl.store(alpha_out_ptr + cur_idx, alpha_val, mask=mask)
         # Barrier needed: cross-warp store-load dependency between consecutive diagonals
         tl.debug_barrier()
@@ -136,25 +136,25 @@ def _rnnt_bwd_kernel(
 
     num_diags = src_len + tgt_len
     max_diags = max_src_len + max_tgt_len_plus_1 - 1
-    t_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    src_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     # Reverse diagonal loop: d from (num_diags - 2) down to 0
-    for d_rev in tl.range(0, max_diags):
-        d = num_diags - 2 - d_rev.to(tl.int64)
-        u_offsets = d - t_offsets
-        mask = (d >= 0) & (t_offsets < src_len) & (u_offsets >= 0) & (u_offsets <= tgt_len)
+    for diag_rev_i32 in tl.range(0, max_diags):
+        diag = num_diags - 2 - diag_rev_i32.to(tl.int64)
+        tgt_offsets = diag - src_offsets
+        mask = (diag >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank successor: beta[t+1, u] + blank_logprobs[t, u] (valid when t+1 < src_len)
-        blank_mask = mask & (t_offsets + 1 < src_len)
-        blank_succ_idx = batch_offset + (t_offsets + 1) * max_tgt_len_plus_1 + u_offsets
+        blank_mask = mask & (src_offsets + 1 < src_len)
+        blank_succ_idx = batch_offset + (src_offsets + 1) * max_tgt_len_plus_1 + tgt_offsets
         blank_beta = tl.load(beta_out_ptr + blank_succ_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
-        cur_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + u_offsets
+        cur_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + tgt_offsets
         blank_lp = tl.load(blank_logprobs_ptr + cur_idx, mask=blank_mask, other=0.0).to(compute_dtype)
         blank_score = tl.where(blank_mask, blank_beta + blank_lp, NEG_INF)
 
         # Emit successor: beta[t, u+1] + target_logprobs[t, u] (valid when u+1 <= tgt_len)
-        emit_mask = mask & (u_offsets + 1 <= tgt_len)
-        emit_succ_idx = batch_offset + t_offsets * max_tgt_len_plus_1 + (u_offsets + 1)
+        emit_mask = mask & (tgt_offsets + 1 <= tgt_len)
+        emit_succ_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + (tgt_offsets + 1)
         emit_beta = tl.load(beta_out_ptr + emit_succ_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
         emit_lp = tl.load(target_logprobs_ptr + cur_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_beta + emit_lp, NEG_INF)
@@ -274,7 +274,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
             device=target_logprobs.device,
         )
 
-        BLOCK_SIZE = triton.next_power_of_2(src_max_length + tgt_max_length_plus_1)
+        BLOCK_SIZE = triton.next_power_of_2(src_max_length)
         _rnnt_bwd_kernel[(batch_size,)](
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
