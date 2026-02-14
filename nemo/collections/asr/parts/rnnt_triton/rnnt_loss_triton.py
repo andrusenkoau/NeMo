@@ -52,14 +52,13 @@ def _rnnt_fwd_kernel(
     tl.store(alpha_out_ptr + batch_offset, 0.0)
 
     num_diags = src_len + tgt_len
-    max_diags = max_src_len + max_tgt_len_plus_1 - 1
     src_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
-    for diag_i32 in tl.range(1, max_diags):
+    for diag_i32 in tl.range(1, num_diags):
         diag = diag_i32.to(tl.int64)
         tgt_offsets = diag - src_offsets
         # Mask: valid positions on this diagonal
-        mask = (diag < num_diags) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
+        mask = (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank predecessor: alpha[t-1, u] + blank_logprobs[t-1, u] (valid when t > 0)
         blank_mask = mask & (src_offsets > 0)
@@ -135,14 +134,13 @@ def _rnnt_bwd_kernel(
     tl.store(blank_logprobs_grad_out_ptr + final_idx, -1.0)
 
     num_diags = src_len + tgt_len
-    max_diags = max_src_len + max_tgt_len_plus_1 - 1
     src_offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     # Reverse diagonal loop: d from (num_diags - 2) down to 0
-    for diag_rev_i32 in tl.range(0, max_diags):
+    for diag_rev_i32 in tl.range(0, num_diags - 1):
         diag = num_diags - 2 - diag_rev_i32.to(tl.int64)
         tgt_offsets = diag - src_offsets
-        mask = (diag >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
+        mask = (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
         # Blank successor: beta[t+1, u] + blank_logprobs[t, u] (valid when t+1 < src_len)
         blank_mask = mask & (src_offsets + 1 < src_len)
@@ -223,7 +221,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
         )
         loss_batch = torch.empty([batch_size], dtype=float_dtype, device=target_logprobs.device)
 
-        BLOCK_SIZE = triton.next_power_of_2(src_max_length + tgt_max_length_plus_1)
+        BLOCK_SIZE = triton.next_power_of_2(src_max_length)
         _rnnt_fwd_kernel[(batch_size,)](
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
