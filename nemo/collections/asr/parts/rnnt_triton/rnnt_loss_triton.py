@@ -108,7 +108,6 @@ def _rnnt_bwd_kernel(
     target_logprobs_ptr,
     blank_logprobs_ptr,
     alpha_ptr,
-    beta_out_ptr,
     src_lengths_ptr,
     tgt_lengths_ptr,
     target_logprobs_grad_out_ptr,
@@ -123,6 +122,9 @@ def _rnnt_bwd_kernel(
     Backward kernel for RNN-T loss.
 
     Calculations are performed in float32 or float64 based on USE_FP64.
+    Beta values are kept in a register tensor (beta_diag) instead of global memory.
+    On each diagonal, one successor is at the same offset (aligned — direct register access)
+    and the other is at offset+1 (shifted — accessed via tl.gather).
     PARALLELIZE_OVER_SRC: if True, offsets enumerate src positions; if False, tgt positions.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
@@ -137,7 +139,6 @@ def _rnnt_bwd_kernel(
     # Initialize beta[src_len-1, tgt_len] = blank_logprobs[src_len-1, tgt_len]
     final_idx = batch_offset + (src_len - 1) * max_tgt_len_plus_1 + tgt_len
     final_blank_lp = tl.load(blank_logprobs_ptr + final_idx).to(compute_dtype)
-    tl.store(beta_out_ptr + final_idx, final_blank_lp)
 
     # log_like = alpha[src_len-1, tgt_len] + blank_logprobs[src_len-1, tgt_len]
     final_alpha = tl.load(alpha_ptr + final_idx).to(compute_dtype)
@@ -148,6 +149,17 @@ def _rnnt_bwd_kernel(
 
     num_diags = src_len + tgt_len
     offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+
+    # Initialize beta_diag for the final diagonal (only one valid position)
+    if PARALLELIZE_OVER_SRC:
+        init_pos = src_len - 1
+    else:
+        init_pos = tgt_len
+    beta_diag = tl.where(offsets == init_pos, final_blank_lp, NEG_INF).to(compute_dtype)
+
+    # Precompute shifted gather index: (offsets+1) % BLOCK_SIZE
+    # Wraparound at BLOCK_SIZE is always masked out by blank_mask/emit_mask
+    shifted_offsets = (offsets + 1) % BLOCK_SIZE
 
     # Reverse diagonal loop: d from (num_diags - 2) down to 0
     for diag_rev_i_i32 in tl.range(0, num_diags - 1):
@@ -160,23 +172,30 @@ def _rnnt_bwd_kernel(
             src_offsets = diag_i - offsets
         mask = (src_offsets >= 0) & (src_offsets < src_len) & (tgt_offsets >= 0) & (tgt_offsets <= tgt_len)
 
-        # Blank successor: beta[t+1, u] + blank_logprobs[t, u] (valid when t+1 < src_len)
+        # Blank successor: beta[t+1, u] (valid when t+1 < src_len)
+        # When PARALLELIZE_OVER_SRC: (t+1,u) is at offset+1 on prev diagonal → shifted (gather)
+        # When not: (t+1,u) is at same offset on prev diagonal → aligned (direct)
         blank_mask = mask & (src_offsets + 1 < src_len)
-        blank_succ_idx = batch_offset + (src_offsets + 1) * max_tgt_len_plus_1 + tgt_offsets
-        blank_beta = tl.load(beta_out_ptr + blank_succ_idx, mask=blank_mask, other=NEG_INF).to(compute_dtype)
+        if PARALLELIZE_OVER_SRC:
+            blank_beta = beta_diag.gather(shifted_offsets, axis=0)
+        else:
+            blank_beta = beta_diag
         cur_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + tgt_offsets
         blank_lp = tl.load(blank_logprobs_ptr + cur_idx, mask=blank_mask, other=0.0).to(compute_dtype)
         blank_score = tl.where(blank_mask, blank_beta + blank_lp, NEG_INF)
 
-        # Emit successor: beta[t, u+1] + target_logprobs[t, u] (valid when u+1 <= tgt_len)
+        # Emit successor: beta[t, u+1] (valid when u+1 <= tgt_len)
+        # When PARALLELIZE_OVER_SRC: (t,u+1) is at same offset on prev diagonal → aligned (direct)
+        # When not: (t,u+1) is at offset+1 on prev diagonal → shifted (gather)
         emit_mask = mask & (tgt_offsets + 1 <= tgt_len)
-        emit_succ_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + (tgt_offsets + 1)
-        emit_beta = tl.load(beta_out_ptr + emit_succ_idx, mask=emit_mask, other=NEG_INF).to(compute_dtype)
+        if PARALLELIZE_OVER_SRC:
+            emit_beta = beta_diag
+        else:
+            emit_beta = beta_diag.gather(shifted_offsets, axis=0)
         emit_lp = tl.load(target_logprobs_ptr + cur_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_beta + emit_lp, NEG_INF)
 
-        beta_diag = _log_add_exp(blank_score, emit_score)
-        tl.store(beta_out_ptr + cur_idx, beta_diag, mask=mask)
+        beta_diag = tl.where(mask, _log_add_exp(blank_score, emit_score), NEG_INF)
 
         # Fused gradient computation
         # blank_grad[t, u] = -exp(alpha[t, u] + beta[t+1, u] + blank_logprobs[t, u] - log_like)
@@ -195,7 +214,7 @@ def _rnnt_bwd_kernel(
             0.0,
         )
         tl.store(target_logprobs_grad_out_ptr + cur_idx, target_grad, mask=mask)
-        # Barrier needed: cross-warp store-load dependency between consecutive diagonals
+        # Barrier needed: cross-warp gather dependency between consecutive diagonals
         tl.debug_barrier()
 
 
@@ -273,12 +292,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
         float_dtype = torch.float64 if use_fp64 else torch.float32
         batch_size, src_max_length, tgt_max_length_plus_1 = target_logprobs.shape
 
-        beta = torch.full(
-            [batch_size, src_max_length, tgt_max_length_plus_1],
-            fill_value=-1e38,
-            dtype=float_dtype,
-            device=target_logprobs.device,
-        )
         target_logprobs_grad = torch.zeros(
             [batch_size, src_max_length, tgt_max_length_plus_1],
             dtype=float_dtype,
@@ -296,7 +309,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
             target_logprobs_ptr=target_logprobs,
             blank_logprobs_ptr=blank_logprobs,
             alpha_ptr=alpha,
-            beta_out_ptr=beta,
             src_lengths_ptr=src_lengths,
             tgt_lengths_ptr=tgt_lengths,
             target_logprobs_grad_out_ptr=target_logprobs_grad,
