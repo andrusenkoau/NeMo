@@ -21,6 +21,12 @@ from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs_triton import rnnt_log
 
 
 @triton.jit
+def _log_add_exp(log_probs_1, log_probs_2):
+    max_score = tl.maximum(log_probs_1, log_probs_2)
+    return max_score + tl.log(tl.exp(log_probs_1 - max_score) + tl.exp(log_probs_2 - max_score))
+
+
+@triton.jit
 def _rnnt_fwd_kernel(
     target_logprobs_ptr,
     blank_logprobs_ptr,
@@ -81,9 +87,7 @@ def _rnnt_fwd_kernel(
         emit_lp = tl.load(target_logprobs_ptr + emit_pred_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_alpha + emit_lp, NEG_INF)
 
-        # logaddexp
-        max_score = tl.maximum(blank_score, emit_score)
-        alpha_val = max_score + tl.log(tl.exp(blank_score - max_score) + tl.exp(emit_score - max_score))
+        alpha_val = _log_add_exp(blank_score, emit_score)
 
         # Store alpha values
         cur_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + tgt_offsets
@@ -171,9 +175,7 @@ def _rnnt_bwd_kernel(
         emit_lp = tl.load(target_logprobs_ptr + cur_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_beta + emit_lp, NEG_INF)
 
-        # Beta: logaddexp
-        max_score = tl.maximum(blank_score, emit_score)
-        beta_val = max_score + tl.log(tl.exp(blank_score - max_score) + tl.exp(emit_score - max_score))
+        beta_val = _log_add_exp(blank_score, emit_score)
         tl.store(beta_out_ptr + cur_idx, beta_val, mask=mask)
 
         # Fused gradient computation
