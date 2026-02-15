@@ -41,7 +41,6 @@ def _rnnt_joint_fwd_kernel(
     vocab_size: int,
     blank_id: int,
     JOINT_DIM_BLOCK: tl.constexpr,
-    VOCAB_BLOCK: tl.constexpr,
     VOCAB_CHUNK_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
@@ -68,9 +67,6 @@ def _rnnt_joint_fwd_kernel(
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
     # Initialize logits accumulator from bias
-    vocab_offsets = tl.arange(0, VOCAB_BLOCK)
-    vocab_mask = vocab_offsets < vocab_size
-    bias = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
     log_sum_exp_score = float("-inf")
     log_sum_exp_score = log_sum_exp_score.to(compute_dtype)
 
@@ -95,10 +91,9 @@ def _rnnt_joint_fwd_kernel(
         v_start = v_start_i32.to(tl.int64)
         v_offsets = v_start + vocab_chunk_offsets
         v_mask = v_offsets < vocab_size
-        v_offsets_safe = v_offsets * v_mask
 
         # Fused add + ReLU
-        bias_chunk = bias.gather(v_offsets_safe, axis=0)  # no need for tl.where here: vocab filtered out later
+        bias_chunk = tl.load(bias_ptr + v_offsets, mask=v_mask, other=0.0).to(compute_dtype)
 
         # Load weight block [VOCAB_CHUNK_BLOCK, JOINT_DIM_BLOCK] and accumulate matmul
         weight_block = tl.load(
@@ -329,7 +324,6 @@ class RnntJointLogProbs(torch.autograd.Function):
         blank_logprobs = torch.zeros_like(target_logprobs)
         log_sum_exp_scores = torch.zeros_like(target_logprobs)
 
-        VOCAB_BLOCK = triton.next_power_of_2(vocab_size)
         VOCAB_CHUNK_BLOCK = 32
 
         _rnnt_joint_fwd_kernel[(batch_size, src_max_length, tgt_max_length_plus_1)](
@@ -349,7 +343,6 @@ class RnntJointLogProbs(torch.autograd.Function):
             vocab_size=vocab_size,
             blank_id=blank_id,
             JOINT_DIM_BLOCK=triton.next_power_of_2(hidden_dim),
-            VOCAB_BLOCK=VOCAB_BLOCK,
             VOCAB_CHUNK_BLOCK=VOCAB_CHUNK_BLOCK,
             USE_FP64=use_fp64,
         )
