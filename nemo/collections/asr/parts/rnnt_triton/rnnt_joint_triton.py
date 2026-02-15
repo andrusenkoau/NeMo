@@ -72,6 +72,7 @@ def _rnnt_joint_fwd_kernel(
         return
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
+    matmul_dtype = tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype
 
     source_offsets = source_i_start + tl.arange(0, ENCODER_CHUNK_BLOCK)
     target_offsets = target_i_start + tl.arange(0, PREDICTOR_CHUNK_BLOCK)
@@ -141,7 +142,7 @@ def _rnnt_joint_fwd_kernel(
                     enc_chunk[:, None, :] + pred_chunk[None, :, :],
                     0.0,
                 )
-                .to(compute_dtype)
+                .to(matmul_dtype)
                 .reshape([NUM_TILE_ELEMENTS, HIDDEN_CHUNK_BLOCK])
             )
 
@@ -150,7 +151,7 @@ def _rnnt_joint_fwd_kernel(
                 weight_ptr + v_offsets[:, None] * joint_dim + d_start + d_offsets[None, :],
                 mask=v_mask[:, None] & d_mask[None, :],
                 other=0.0,
-            ).to(compute_dtype)
+            ).to(matmul_dtype)
 
             # Accumulate matmul: logits_acc += hidden_chunk @ w_chunk^T
             if USE_FP64:
@@ -158,7 +159,7 @@ def _rnnt_joint_fwd_kernel(
             elif USE_HIGH_PRECISION:
                 logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0), input_precision="ieee")
             else:
-                logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0))
+                logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0)).to(compute_dtype)
 
         # Add bias and mask invalid vocab positions
         block_logits = logits_acc + bias_chunk[None, :]  # [TILE, V_CHUNK]
