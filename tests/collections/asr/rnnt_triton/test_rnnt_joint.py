@@ -19,9 +19,8 @@ if TRITON_AVAILABLE:
     from nemo.collections.asr.parts.rnnt_triton.rnnt_joint_triton import rnnt_joint_logprobs_triton
 
 
-# tests: instantiate joint (currently without dropout - use .eval()), and only "relu" activation, generate encoder_output and predictor_output
-# calculate encoder_output_projected, encoder_output_projected
+# tests: instantiate joint (currently without dropout - use .eval()), and only "relu" activation, generate encoder_output_projected and predictor_output_projected
 # compare:
 # (1) get logprobs for RNN-T loss (current pipeline): get logits from joint, get rnnt logprobs using nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs.rnnt_logprobs
 # (2) get efficient logprobs: use rnnt_joint_logprobs_triton
-# compare logprobs and gradients
+# compare logprobs and gradients (using sum with random weights), no need to use RNN-T loss here

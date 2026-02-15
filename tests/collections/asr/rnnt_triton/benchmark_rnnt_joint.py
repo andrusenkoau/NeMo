@@ -46,18 +46,15 @@ def logic_explanation():
     loss = RNNTLoss(num_classes=vocab_size, loss_name="rnnt_triton", reduction=None)  # rnnt_triton or warprnnt_numba
 
     batch_size, src_max_length, tgt_max_length = 64, 150, 37
-    encoder_output = torch.rand([batch_size, src_max_length, 512], device=device, dtype=float_dtype)
-    predictor_output = torch.rand([batch_size, tgt_max_length + 1, 640], device=device, dtype=float_dtype)
+    encoder_output_projected = torch.rand([batch_size, src_max_length, 640], device=device, dtype=float_dtype)
+    predictor_output_projected = torch.rand([batch_size, tgt_max_length + 1, 640], device=device, dtype=float_dtype)
     targets = torch.randint(0, vocab_size - 1, [batch_size, tgt_max_length], dtype=torch.long, device=device)
     tgt_lengths = torch.full([batch_size], fill_value=tgt_max_length, dtype=torch.long, device=device)
     src_lengths = torch.full([batch_size], fill_value=src_max_length, dtype=torch.long, device=device)
 
-    encoder_output = joint.project_encoder(encoder_output)
-    predictor_output = joint.project_prednet(predictor_output)
-
     # we want to optimize the following
     # regular joint: get logits, calculate loss
-    logits = joint.joint_after_projection(f=encoder_output, g=predictor_output)
+    logits = joint.joint_after_projection(f=encoder_output_projected, g=predictor_output_projected)
     loss = loss(
         log_probs=logits,
         targets=targets,
@@ -68,8 +65,8 @@ def logic_explanation():
 
     # new pipeline: get (efficiently logprobs), calculate loss
     target_logprobs, blank_logprobs = rnnt_joint_logprobs_triton(
-        encoder_output_projected=encoder_output,
-        predictor_output_projected=predictor_output,
+        encoder_output_projected=encoder_output_projected,
+        predictor_output_projected=predictor_output_projected,
         targets=targets,
         tgt_lengths=tgt_lengths,
         src_lengths=src_lengths,
