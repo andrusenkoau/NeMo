@@ -80,14 +80,15 @@ def _rnnt_joint_fwd_kernel(
     target_label_mask = target_offsets < target_len  # target labels exist at u < target_len
     NUM_TILE_ELEMENTS: tl.constexpr = ENCODER_CHUNK_BLOCK * PREDICTOR_CHUNK_BLOCK
 
-    # Initialize log-sum-exp accumulator
-    log_sum_exp_score = tl.full([NUM_TILE_ELEMENTS], value=float("-inf"), dtype=compute_dtype)
-
     # Batch base pointers (source_offsets/target_offsets are absolute indices)
     enc_batch_base = batch_i * max_src_len * joint_dim
     pred_batch_base = batch_i * max_tgt_len_plus_1 * joint_dim
 
     vocab_chunk_offsets = tl.arange(0, VOCAB_CHUNK_BLOCK)
+    d_offsets = tl.arange(0, HIDDEN_CHUNK_BLOCK)
+
+    # Initialize log-sum-exp accumulator, blank and target logits
+    log_sum_exp_score = tl.full([NUM_TILE_ELEMENTS], value=float("-inf"), dtype=compute_dtype)
     blank_logits = tl.zeros([NUM_TILE_ELEMENTS], dtype=compute_dtype)
     target_logits = tl.zeros([NUM_TILE_ELEMENTS], dtype=compute_dtype)
 
@@ -112,7 +113,6 @@ def _rnnt_joint_fwd_kernel(
         # Inner loop over hidden dimension chunks
         for d_start_i32 in tl.range(0, joint_dim, HIDDEN_CHUNK_BLOCK):
             d_start = d_start_i32.to(tl.int64)
-            d_offsets = tl.arange(0, HIDDEN_CHUNK_BLOCK)
             d_mask = (d_start + d_offsets) < joint_dim
 
             # Load enc/pred for this hidden chunk
@@ -161,7 +161,7 @@ def _rnnt_joint_fwd_kernel(
                 logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0))
 
         # Add bias and mask invalid vocab positions
-        block_logits = logits_acc + bias_chunk[None, :]
+        block_logits = logits_acc + bias_chunk[None, :]  # [TILE, V_CHUNK]
         block_logits = tl.where(v_mask[None, :], block_logits, -float("inf"))
 
         # Online log-sum-exp
@@ -176,17 +176,17 @@ def _rnnt_joint_fwd_kernel(
         target_logits += tl.sum(tl.where(v_offsets[None, :] == targets_expanded[:, None], block_logits, 0.0), axis=-1)
 
     # Output index in [B, T, U+1] grid
-    flat_index_grid = (batch_i * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
+    indices_grid = (batch_i * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
     tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
 
     # Store log_sum_exp and blank logprobs (valid for all u in [0, target_len])
     tl.store(
-        log_sum_exp_scores_out_ptr + flat_index_grid,
+        log_sum_exp_scores_out_ptr + indices_grid,
         log_sum_exp_score.reshape([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]),
         mask=tile_valid_mask,
     )
     tl.store(
-        blank_logprobs_out_ptr + flat_index_grid,
+        blank_logprobs_out_ptr + indices_grid,
         (blank_logits - log_sum_exp_score).reshape([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]),
         mask=tile_valid_mask,
     )
@@ -194,7 +194,7 @@ def _rnnt_joint_fwd_kernel(
     # Store target logprobs (valid only for u < target_len)
     target_store_mask = source_mask[:, None] & target_label_mask[None, :]
     tl.store(
-        target_logprobs_out_ptr + flat_index_grid,
+        target_logprobs_out_ptr + indices_grid,
         (target_logits - log_sum_exp_score).reshape([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]),
         mask=target_store_mask,
     )
