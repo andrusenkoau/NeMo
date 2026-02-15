@@ -157,7 +157,7 @@ def _rnnt_joint_fwd_kernel(
             if USE_FP64:
                 logits_acc += tl.sum(hidden_chunk[:, None, :] * w_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                logits_acc = tl.dot(hidden_chunk, w_chunk.T, acc=logits_acc, input_precision="ieee")
+                logits_acc = tl.dot(hidden_chunk, w_chunk.T, acc=logits_acc, input_precision="ieee").to(compute_dtype)
             else:
                 logits_acc = tl.dot(hidden_chunk, w_chunk.T, acc=logits_acc).to(compute_dtype)
 
