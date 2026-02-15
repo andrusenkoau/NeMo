@@ -40,97 +40,160 @@ def _rnnt_joint_fwd_kernel(
     joint_dim: int,
     vocab_size: int,
     blank_id: int,
-    JOINT_DIM_BLOCK: tl.constexpr,
+    ENCODER_CHUNK_BLOCK: tl.constexpr,
+    PREDICTOR_CHUNK_BLOCK: tl.constexpr,
+    HIDDEN_CHUNK_BLOCK: tl.constexpr,
     VOCAB_CHUNK_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
     Forward kernel for fused RNN-T Joint + log-softmax.
 
-    For each (b, t, u) position:
-    1. Compute hidden = relu(enc[b,t,:] + pred[b,u,:]) in chunks
-    2. Compute logits = hidden @ W^T + bias
-    3. Compute log-softmax and extract target/blank log-probs
+    Each program handles a tile of [ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK] positions.
+    For each tile:
+    1. Loop over vocab chunks (outer), and hidden chunks (inner) to compute logits
+    2. Online log-softmax across vocab chunks
+    3. Extract target/blank log-probs
 
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
-    source_i = tl.program_id(axis=1).to(tl.int64)
-    target_i = tl.program_id(axis=2).to(tl.int64)
+    source_block_i = tl.program_id(axis=1).to(tl.int64)
+    target_block_i = tl.program_id(axis=2).to(tl.int64)
+    source_i_start = source_block_i * ENCODER_CHUNK_BLOCK
+    target_i_start = target_block_i * PREDICTOR_CHUNK_BLOCK
 
     source_len = tl.load(src_lengths_ptr + batch_i)
     target_len = tl.load(tgt_lengths_ptr + batch_i)
 
-    if source_i >= source_len or target_i > target_len:
+    if source_i_start >= source_len or target_i_start > target_len:
         return
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
-    # Initialize logits accumulator from bias
-    log_sum_exp_score = float("-inf")
-    log_sum_exp_score = log_sum_exp_score.to(compute_dtype)
+    source_offsets = source_i_start + tl.arange(0, ENCODER_CHUNK_BLOCK)
+    target_offsets = target_i_start + tl.arange(0, PREDICTOR_CHUNK_BLOCK)
+    source_mask = source_offsets < source_len
+    target_valid_mask = target_offsets <= target_len  # blank is valid at u == target_len
+    target_label_mask = target_offsets < target_len  # target labels exist at u < target_len
+    NUM_TILE_ELEMENTS: tl.constexpr = ENCODER_CHUNK_BLOCK * PREDICTOR_CHUNK_BLOCK
 
-    # Pointers to enc[b, t, :] and pred[b, u, :]
-    enc_base = batch_i * max_src_len * joint_dim + source_i * joint_dim
-    pred_base = batch_i * max_tgt_len_plus_1 * joint_dim + target_i * joint_dim
-    joint_dim_offsets = tl.arange(0, JOINT_DIM_BLOCK)
-    joint_dim_mask = joint_dim_offsets < joint_dim
-    # sum + relu
-    joint_hidden = tl.maximum(
-        (
-            tl.load(encoder_output_ptr + enc_base + joint_dim_offsets, mask=joint_dim_mask, other=0.0)
-            + tl.load(predictor_output_ptr + pred_base + joint_dim_offsets, mask=joint_dim_mask, other=0.0)
-        ),
-        0.0,
-    ).to(compute_dtype)
+    # Initialize log-sum-exp accumulator
+    log_sum_exp_score = tl.full([NUM_TILE_ELEMENTS], value=float("-inf"), dtype=compute_dtype)
+
+    # Batch base pointers (source_offsets/target_offsets are absolute indices)
+    enc_batch_base = batch_i * max_src_len * joint_dim
+    pred_batch_base = batch_i * max_tgt_len_plus_1 * joint_dim
 
     vocab_chunk_offsets = tl.arange(0, VOCAB_CHUNK_BLOCK)
+    blank_logits = tl.zeros([NUM_TILE_ELEMENTS], dtype=compute_dtype)
+    target_logits = tl.zeros([NUM_TILE_ELEMENTS], dtype=compute_dtype)
 
-    # Loop over vocab dimension
+    # Load target labels with batch offset
+    max_tgt_len = max_tgt_len_plus_1 - 1
+    targets = tl.load(targets_ptr + batch_i * max_tgt_len + target_offsets, mask=target_label_mask, other=0)
+    targets_expanded = (
+        targets[None, :].broadcast_to([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]).reshape([NUM_TILE_ELEMENTS])
+    )
+
+    # Outer loop over vocab chunks
     for v_start_i32 in tl.range(0, vocab_size, VOCAB_CHUNK_BLOCK):
         v_start = v_start_i32.to(tl.int64)
         v_offsets = v_start + vocab_chunk_offsets
         v_mask = v_offsets < vocab_size
 
-        # Fused add + ReLU
         bias_chunk = tl.load(bias_ptr + v_offsets, mask=v_mask, other=0.0).to(compute_dtype)
 
-        # Load weight block [VOCAB_CHUNK_BLOCK, JOINT_DIM_BLOCK] and accumulate matmul
-        weight_block = tl.load(
-            weight_ptr + v_start * joint_dim + (v_offsets[:, None] * joint_dim + joint_dim_offsets[None, :]),
-            mask=v_mask[:, None] & joint_dim_mask[None, :],
-            other=0.0,
-        ).to(compute_dtype)
+        # Accumulate logits for this vocab chunk across hidden dimension
+        logits_acc = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_CHUNK_BLOCK], dtype=compute_dtype)
 
-        # online softmax
-        block_logits = tl.sum(weight_block * joint_hidden[None, :], axis=1) + bias_chunk
-        block_logits = tl.where(v_mask, block_logits, -float("inf"))
-        block_logits_max = tl.max(block_logits, axis=0)
-        log_sum_exp_block_score = tl.log(tl.sum(tl.exp(block_logits - block_logits_max), axis=0)) + block_logits_max
+        # Inner loop over hidden dimension chunks
+        for d_start_i32 in tl.range(0, joint_dim, HIDDEN_CHUNK_BLOCK):
+            d_start = d_start_i32.to(tl.int64)
+            d_offsets = tl.arange(0, HIDDEN_CHUNK_BLOCK)
+            d_mask = (d_start + d_offsets) < joint_dim
+
+            # Load enc/pred for this hidden chunk
+            enc_chunk = tl.load(
+                encoder_output_ptr
+                + enc_batch_base
+                + source_offsets[:, None] * joint_dim
+                + d_start
+                + d_offsets[None, :],
+                mask=source_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )  # [ENC_CHUNK, D_CHUNK]
+            pred_chunk = tl.load(
+                predictor_output_ptr
+                + pred_batch_base
+                + target_offsets[:, None] * joint_dim
+                + d_start
+                + d_offsets[None, :],
+                mask=target_valid_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )  # [PRED_CHUNK, D_CHUNK]
+
+            # hidden = relu(enc + pred) → [ENC, PRED, D_CHUNK] → [TILE, D_CHUNK]
+            hidden_chunk = (
+                tl.maximum(
+                    enc_chunk[:, None, :] + pred_chunk[None, :, :],
+                    0.0,
+                )
+                .to(compute_dtype)
+                .reshape([NUM_TILE_ELEMENTS, HIDDEN_CHUNK_BLOCK])
+            )
+
+            # Load weight sub-block [V_CHUNK, D_CHUNK]
+            w_chunk = tl.load(
+                weight_ptr + v_offsets[:, None] * joint_dim + d_start + d_offsets[None, :],
+                mask=v_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(compute_dtype)
+
+            # Accumulate matmul: logits_acc += hidden_chunk @ w_chunk^T
+            if USE_FP64:
+                logits_acc += tl.sum(hidden_chunk[:, None, :] * w_chunk[None, :, :], axis=-1)
+            else:
+                logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0), input_precision="ieee")
+
+        # Add bias and mask invalid vocab positions
+        block_logits = logits_acc + bias_chunk[None, :]
+        block_logits = tl.where(v_mask[None, :], block_logits, -float("inf"))
+
+        # Online log-sum-exp
+        block_logits_max = tl.max(block_logits, axis=-1)
+        log_sum_exp_block_score = (
+            tl.log(tl.sum(tl.exp(block_logits - block_logits_max[:, None]), axis=-1)) + block_logits_max
+        )
         log_sum_exp_score = _log_add_exp(log_sum_exp_score, log_sum_exp_block_score)
 
+        # Extract blank and target logits from this chunk
+        blank_logits += tl.sum(tl.where((v_offsets == blank_id)[None, :], block_logits, 0.0), axis=-1)
+        target_logits += tl.sum(tl.where(v_offsets[None, :] == targets_expanded[:, None], block_logits, 0.0), axis=-1)
+
     # Output index in [B, T, U+1] grid
-    flat_index_grid = (batch_i * max_src_len + source_i) * max_tgt_len_plus_1 + target_i
+    flat_index_grid = (batch_i * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
+    tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
 
-    tl.store(log_sum_exp_scores_out_ptr + flat_index_grid, log_sum_exp_score)
-    # Blank logprob
-    blank_weight_row = tl.load(
-        weight_ptr + blank_id * joint_dim + joint_dim_offsets, mask=joint_dim_mask, other=0.0
-    ).to(compute_dtype)
-    blank_bias = tl.load(bias_ptr + blank_id)
-    blank_logit = tl.sum(blank_weight_row * joint_hidden, axis=0) + blank_bias
-    tl.store(blank_logprobs_out_ptr + flat_index_grid, blank_logit - log_sum_exp_score)
+    # Store log_sum_exp and blank logprobs (valid for all u in [0, target_len])
+    tl.store(
+        log_sum_exp_scores_out_ptr + flat_index_grid,
+        log_sum_exp_score.reshape([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]),
+        mask=tile_valid_mask,
+    )
+    tl.store(
+        blank_logprobs_out_ptr + flat_index_grid,
+        (blank_logits - log_sum_exp_score).reshape([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]),
+        mask=tile_valid_mask,
+    )
 
-    # Target logprob (only if target_i < target_len)
-    if target_i < target_len:
-        max_tgt_len = max_tgt_len_plus_1 - 1
-        target_id = tl.load(targets_ptr + batch_i * max_tgt_len + target_i)
-        target_weight_row = tl.load(
-            weight_ptr + target_id * joint_dim + joint_dim_offsets, mask=joint_dim_mask, other=0.0
-        ).to(compute_dtype)
-        target_bias = tl.load(bias_ptr + target_id)
-        target_logit = tl.sum(target_weight_row * joint_hidden, axis=0) + target_bias
-        tl.store(target_logprobs_out_ptr + flat_index_grid, target_logit - log_sum_exp_score)
+    # Store target logprobs (valid only for u < target_len)
+    target_store_mask = source_mask[:, None] & target_label_mask[None, :]
+    tl.store(
+        target_logprobs_out_ptr + flat_index_grid,
+        (target_logits - log_sum_exp_score).reshape([ENCODER_CHUNK_BLOCK, PREDICTOR_CHUNK_BLOCK]),
+        mask=target_store_mask,
+    )
 
 
 @triton.jit
@@ -325,8 +388,13 @@ class RnntJointLogProbs(torch.autograd.Function):
         log_sum_exp_scores = torch.zeros_like(target_logprobs)
 
         VOCAB_CHUNK_BLOCK = 32
+        HIDDEN_CHUNK_BLOCK = 32
+        ENCODER_CHUNK_BLOCK = 16
+        PREDICTOR_CHUNK_BLOCK = 16
+        num_encoder_blocks = (src_max_length + ENCODER_CHUNK_BLOCK - 1) // ENCODER_CHUNK_BLOCK
+        num_predictor_blocks = (tgt_max_length_plus_1 + PREDICTOR_CHUNK_BLOCK - 1) // PREDICTOR_CHUNK_BLOCK
 
-        _rnnt_joint_fwd_kernel[(batch_size, src_max_length, tgt_max_length_plus_1)](
+        _rnnt_joint_fwd_kernel[(batch_size, num_encoder_blocks, num_predictor_blocks)](
             encoder_output_ptr=encoder_output_projected,
             predictor_output_ptr=predictor_output_projected,
             targets_ptr=targets,
@@ -342,7 +410,9 @@ class RnntJointLogProbs(torch.autograd.Function):
             joint_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            JOINT_DIM_BLOCK=triton.next_power_of_2(hidden_dim),
+            ENCODER_CHUNK_BLOCK=ENCODER_CHUNK_BLOCK,
+            PREDICTOR_CHUNK_BLOCK=PREDICTOR_CHUNK_BLOCK,
+            HIDDEN_CHUNK_BLOCK=HIDDEN_CHUNK_BLOCK,
             VOCAB_CHUNK_BLOCK=VOCAB_CHUNK_BLOCK,
             USE_FP64=use_fp64,
         )
