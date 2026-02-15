@@ -397,7 +397,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         blank_logprobs = torch.zeros_like(target_logprobs)
         log_sum_exp_scores = torch.zeros_like(target_logprobs)
 
-        VOCAB_CHUNK_BLOCK = 32
+        VOCAB_CHUNK_BLOCK = 64
         HIDDEN_CHUNK_BLOCK = 32
         ENCODER_CHUNK_BLOCK = 16
         PREDICTOR_CHUNK_BLOCK = 16
