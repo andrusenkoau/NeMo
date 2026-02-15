@@ -157,9 +157,9 @@ def _rnnt_joint_fwd_kernel(
             if USE_FP64:
                 logits_acc += tl.sum(hidden_chunk[:, None, :] * w_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0), input_precision="ieee")
+                logits_acc = tl.dot(hidden_chunk, w_chunk.T, acc=logits_acc, input_precision="ieee")
             else:
-                logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0)).to(compute_dtype)
+                logits_acc = tl.dot(hidden_chunk, w_chunk.T, acc=logits_acc).to(compute_dtype)
 
         # Add bias and mask invalid vocab positions
         block_logits = logits_acc + bias_chunk[None, :]  # [TILE, V_CHUNK]
