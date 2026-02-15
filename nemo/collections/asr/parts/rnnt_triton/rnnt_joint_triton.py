@@ -166,7 +166,7 @@ def _rnnt_joint_fwd_kernel(
         block_logits = tl.where(v_mask[None, :], block_logits, -float("inf"))
 
         # Online log-sum-exp
-        block_logits_max = tl.max(block_logits, axis=-1)
+        block_logits_max = tl.max(block_logits, axis=-1)  # [TILE]
         log_sum_exp_block_score = (
             tl.log(tl.sum(tl.exp(block_logits - block_logits_max[:, None]), axis=-1)) + block_logits_max
         )
