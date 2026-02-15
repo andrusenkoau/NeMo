@@ -45,6 +45,7 @@ def _rnnt_joint_fwd_kernel(
     HIDDEN_CHUNK_BLOCK: tl.constexpr,
     VOCAB_CHUNK_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
+    USE_HIGH_PRECISION: tl.constexpr,
 ):
     """
     Forward kernel for fused RNN-T Joint + log-softmax.
@@ -56,6 +57,7 @@ def _rnnt_joint_fwd_kernel(
     3. Extract target/blank log-probs
 
     Calculations are performed in float32 or float64 based on USE_FP64.
+    When USE_HIGH_PRECISION is False, tl.dot uses TF32 (faster but ~10-bit mantissa).
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
     source_block_i = tl.program_id(axis=1).to(tl.int64)
@@ -153,8 +155,10 @@ def _rnnt_joint_fwd_kernel(
             # Accumulate matmul: logits_acc += hidden_chunk @ w_chunk^T
             if USE_FP64:
                 logits_acc += tl.sum(hidden_chunk[:, None, :] * w_chunk[None, :, :], axis=-1)
-            else:
+            elif USE_HIGH_PRECISION:
                 logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0), input_precision="ieee")
+            else:
+                logits_acc += tl.dot(hidden_chunk, w_chunk.trans(1, 0))
 
         # Add bias and mask invalid vocab positions
         block_logits = logits_acc + bias_chunk[None, :]
@@ -205,7 +209,6 @@ def _rnnt_joint_bwd_kernel(
     tgt_lengths_ptr,
     weight_ptr,
     bias_ptr,
-    log_sum_exp_scores_ptr,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
     grad_encoder_out_ptr,
@@ -275,9 +278,15 @@ def _rnnt_joint_bwd_kernel(
 
         logits_acc += tl.sum(weight_block * hidden_chunk[None, :], axis=1)
 
+    # TODO: currently recomputes log_sum_exp instead of using saved log_sum_exp_scores from forward,
+    #  because forward may use TF32 (via tl.dot) while backward recomputes in fp32.
+    #  Need to fix precision properly (e.g., use the same precision in both, or pass log_sum_exp_scores here).
+    logits_acc = tl.where(vocab_mask, logits_acc, -float("inf"))
+    max_logit = tl.max(logits_acc)
+    log_sum_exp = tl.log(tl.sum(tl.exp(logits_acc - max_logit))) + max_logit
+
     # --- Compute grad_logits from log-softmax backward ---
     flat_index_grid = (batch_i * max_src_len + source_i) * max_tgt_len_plus_1 + target_i
-    log_sum_exp = tl.load(log_sum_exp_scores_ptr + flat_index_grid).to(compute_dtype)
 
     softmax = tl.exp(logits_acc - log_sum_exp)
 
@@ -360,6 +369,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         blank_id: int,
         activation: str = "relu",
         dropout_p: float = 0.0,
+        use_high_precision: bool = False,
     ):
         if activation != "relu":
             raise NotImplementedError("Only relu activation is supported")
@@ -415,6 +425,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             HIDDEN_CHUNK_BLOCK=HIDDEN_CHUNK_BLOCK,
             VOCAB_CHUNK_BLOCK=VOCAB_CHUNK_BLOCK,
             USE_FP64=use_fp64,
+            USE_HIGH_PRECISION=use_high_precision,
         )
 
         ctx.save_for_backward(
@@ -441,7 +452,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             targets,
             src_lengths,
             tgt_lengths,
-            log_sum_exp_scores,
+            log_sum_exp_scores,  # noqa: F841
         ) = ctx.saved_tensors
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
@@ -467,7 +478,6 @@ class RnntJointLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             weight_ptr=weight,
             bias_ptr=bias,
-            log_sum_exp_scores_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             grad_encoder_out_ptr=grad_encoder,
@@ -484,7 +494,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             USE_FP64=use_fp64,
         )
 
-        return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None
+        return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None, None
 
 
 def rnnt_joint_logprobs_triton(
@@ -498,6 +508,7 @@ def rnnt_joint_logprobs_triton(
     blank_id: int,
     activation: str = "relu",
     dropout_p: float = 0.0,
+    use_high_precision: bool = False,
 ):
     target_logprobs, blank_logprobs = RnntJointLogProbs.apply(
         encoder_output_projected,
@@ -510,5 +521,6 @@ def rnnt_joint_logprobs_triton(
         blank_id,
         activation,
         dropout_p,
+        use_high_precision,
     )
     return target_logprobs, blank_logprobs

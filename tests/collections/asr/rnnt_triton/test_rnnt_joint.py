@@ -110,8 +110,9 @@ class TestRnntJointTriton:
         )
 
         # Forward comparison
-        # bf16 tolerance is higher because reference computes matmul in bf16 while triton computes in float32
-        fwd_atol = 1e-2 if float_dtype == torch.bfloat16 else 1e-5
+        # fp32: TF32 dot product has ~10-bit mantissa, so ~1e-3 error expected
+        # bf16: reference computes matmul in bf16 while triton computes in float32
+        fwd_atol = 1e-2 if float_dtype == torch.bfloat16 else 5e-3
         assert torch.allclose(
             target_tri, target_ref, atol=fwd_atol
         ), f"target_logprobs mismatch: max diff = {(target_tri - target_ref).abs().max().item()}"
@@ -130,8 +131,9 @@ class TestRnntJointTriton:
         loss_ref.backward()
         loss_tri.backward()
 
-        # bf16 backward tolerance is higher because reference computes in bf16 while triton accumulates in float32
-        bwd_atol = 5e-2 if float_dtype == torch.bfloat16 else 1e-4
+        # fp32: TF32 forward error propagates to backward via log_sum_exp_scores
+        # bf16: reference computes in bf16 while triton accumulates in float32
+        bwd_atol = 5e-2 if float_dtype == torch.bfloat16 else 5e-3
         bwd_rtol = 5e-2 if float_dtype == torch.bfloat16 else 1e-3
 
         assert torch.allclose(
@@ -191,11 +193,12 @@ class TestRnntJointTriton:
             blank_id=blank_id,
         )
 
+        fwd_atol = 5e-3  # TF32 dot product has ~10-bit mantissa
         assert torch.allclose(
-            target_tri, target_ref, atol=1e-5
+            target_tri, target_ref, atol=fwd_atol
         ), f"target_logprobs mismatch: max diff = {(target_tri - target_ref).abs().max().item()}"
         assert torch.allclose(
-            blank_tri, blank_ref, atol=1e-5
+            blank_tri, blank_ref, atol=fwd_atol
         ), f"blank_logprobs mismatch: max diff = {(blank_tri - blank_ref).abs().max().item()}"
 
         # Backward
@@ -206,8 +209,8 @@ class TestRnntJointTriton:
         loss_ref.backward()
         loss_tri.backward()
 
-        assert torch.allclose(enc_tri.grad, enc_ref.grad, atol=1e-4, rtol=1e-3)
-        assert torch.allclose(pred_tri.grad, pred_ref.grad, atol=1e-4, rtol=1e-3)
+        assert torch.allclose(enc_tri.grad, enc_ref.grad, atol=5e-3, rtol=1e-3)
+        assert torch.allclose(pred_tri.grad, pred_ref.grad, atol=5e-3, rtol=1e-3)
 
     def test_edge_case_single_frame(self):
         """Test T=1, U=1 minimal case."""
@@ -251,8 +254,8 @@ class TestRnntJointTriton:
             blank_id=blank_id,
         )
 
-        assert torch.allclose(target_tri, target_ref, atol=1e-5)
-        assert torch.allclose(blank_tri, blank_ref, atol=1e-5)
+        assert torch.allclose(target_tri, target_ref, atol=5e-3)
+        assert torch.allclose(blank_tri, blank_ref, atol=5e-3)
 
     def test_edge_case_blank_only(self):
         """Test U=0 (tgt_length=0) - only blank is possible."""
@@ -297,8 +300,8 @@ class TestRnntJointTriton:
             blank_id=blank_id,
         )
 
-        assert torch.allclose(target_tri, target_ref, atol=1e-5)
-        assert torch.allclose(blank_tri, blank_ref, atol=1e-5)
+        assert torch.allclose(target_tri, target_ref, atol=5e-3)
+        assert torch.allclose(blank_tri, blank_ref, atol=5e-3)
 
     def test_no_cuda_sync(self):
         """Verify no CPU-GPU sync happens during forward/backward."""
