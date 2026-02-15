@@ -18,6 +18,12 @@ import triton.language as tl
 
 
 @triton.jit
+def _log_add_exp(log_probs_1, log_probs_2):
+    max_score = tl.maximum(log_probs_1, log_probs_2)
+    return max_score + tl.log(tl.exp(log_probs_1 - max_score) + tl.exp(log_probs_2 - max_score))
+
+
+@triton.jit
 def _rnnt_joint_fwd_kernel(
     encoder_output_ptr,
     predictor_output_ptr,
@@ -31,12 +37,12 @@ def _rnnt_joint_fwd_kernel(
     log_sum_exp_scores_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
-    hidden_dim: int,
+    joint_dim: int,
     vocab_size: int,
     blank_id: int,
     JOINT_DIM_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
-    HIDDEN_BLOCK: tl.constexpr,
+    VOCAB_CHUNK_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """
@@ -64,63 +70,72 @@ def _rnnt_joint_fwd_kernel(
     # Initialize logits accumulator from bias
     vocab_offsets = tl.arange(0, VOCAB_BLOCK)
     vocab_mask = vocab_offsets < vocab_size
-    logits_acc = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
+    bias = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
+    log_sum_exp_score = float("-inf")
+    log_sum_exp_score = log_sum_exp_score.to(compute_dtype)
 
     # Pointers to enc[b, t, :] and pred[b, u, :]
-    enc_base = batch_i * max_src_len * hidden_dim + source_i * hidden_dim
-    pred_base = batch_i * max_tgt_len_plus_1 * hidden_dim + target_i * hidden_dim
-    joint_dim_offests = tl.arange(0, JOINT_DIM_BLOCK)
-    joint_dim_mask = joint_dim_offests < hidden_dim
+    enc_base = batch_i * max_src_len * joint_dim + source_i * joint_dim
+    pred_base = batch_i * max_tgt_len_plus_1 * joint_dim + target_i * joint_dim
+    joint_dim_offsets = tl.arange(0, JOINT_DIM_BLOCK)
+    joint_dim_mask = joint_dim_offsets < joint_dim
     # sum + relu
     joint_hidden = tl.maximum(
         (
-            tl.load(encoder_output_ptr + enc_base + joint_dim_offests, mask=joint_dim_mask, other=0.0)
-            + tl.load(predictor_output_ptr + pred_base + joint_dim_offests, mask=joint_dim_mask, other=0.0)
+            tl.load(encoder_output_ptr + enc_base + joint_dim_offsets, mask=joint_dim_mask, other=0.0)
+            + tl.load(predictor_output_ptr + pred_base + joint_dim_offsets, mask=joint_dim_mask, other=0.0)
         ),
-        0.0
+        0.0,
     ).to(compute_dtype)
 
-    # Loop over hidden dimension in chunks of HIDDEN_BLOCK
-    for d_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-        d_start = d_start_i32.to(tl.int64)
-        d_offsets = tl.arange(0, HIDDEN_BLOCK)
-        d_mask = (d_start + d_offsets) < hidden_dim
+    vocab_chunk_offsets = tl.arange(0, VOCAB_CHUNK_BLOCK)
+
+    # Loop over vocab dimension
+    for v_start_i32 in tl.range(0, vocab_size, VOCAB_CHUNK_BLOCK):
+        v_start = v_start_i32.to(tl.int64)
+        v_offsets = v_start + vocab_chunk_offsets
+        v_mask = v_offsets < vocab_size
+        v_offsets_safe = v_offsets * v_mask
 
         # Fused add + ReLU
-        hidden_chunk = joint_hidden.gather((d_start + d_offsets) * d_mask, axis=0)
+        bias_chunk = bias.gather(v_offsets_safe, axis=0)  # no need for tl.where here: vocab filtered out later
 
-        # Load weight block [VOCAB_BLOCK, HIDDEN_BLOCK] and accumulate matmul
-        # weight layout: [vocab_size, hidden_dim], row-major
+        # Load weight block [VOCAB_CHUNK_BLOCK, JOINT_DIM_BLOCK] and accumulate matmul
         weight_block = tl.load(
-            weight_ptr + vocab_offsets[:, None] * hidden_dim + d_start + d_offsets[None, :],
-            mask=vocab_mask[:, None] & d_mask[None, :],
+            weight_ptr + v_start * joint_dim + (v_offsets[:, None] * joint_dim + joint_dim_offsets[None, :]),
+            mask=v_mask[:, None] & joint_dim_mask[None, :],
             other=0.0,
         ).to(compute_dtype)
 
-        logits_acc += tl.sum(weight_block * hidden_chunk[None, :], axis=1)
-
-    # Mask padding positions to -inf before log-softmax
-    logits_acc = tl.where(vocab_mask, logits_acc, -float("inf"))
-
-    # Stable log-softmax
-    logits_max = tl.max(logits_acc, axis=0)
-    logits_shifted = logits_acc - logits_max
-    log_sum_exp = tl.log(tl.sum(tl.exp(logits_shifted), axis=0)) + logits_max
+        # online softmax
+        block_logits = tl.sum(weight_block * joint_hidden[None, :], axis=1) + bias_chunk
+        block_logits = tl.where(v_mask, block_logits, -float("inf"))
+        block_logits_max = tl.max(block_logits, axis=0)
+        log_sum_exp_block_score = tl.log(tl.sum(tl.exp(block_logits - block_logits_max), axis=0)) + block_logits_max
+        log_sum_exp_score = _log_add_exp(log_sum_exp_score, log_sum_exp_block_score)
 
     # Output index in [B, T, U+1] grid
     flat_index_grid = (batch_i * max_src_len + source_i) * max_tgt_len_plus_1 + target_i
 
+    tl.store(log_sum_exp_scores_out_ptr + flat_index_grid, log_sum_exp_score)
     # Blank logprob
-    blank_logit = tl.sum(tl.where(vocab_offsets == blank_id, logits_acc, 0.0))
-    tl.store(blank_logprobs_out_ptr + flat_index_grid, blank_logit - log_sum_exp)
-    tl.store(log_sum_exp_scores_out_ptr + flat_index_grid, log_sum_exp)
+    blank_weight_row = tl.load(
+        weight_ptr + blank_id * joint_dim + joint_dim_offsets, mask=joint_dim_mask, other=0.0
+    ).to(compute_dtype)
+    blank_bias = tl.load(bias_ptr + blank_id)
+    blank_logit = tl.sum(blank_weight_row * joint_hidden, axis=0) + blank_bias
+    tl.store(blank_logprobs_out_ptr + flat_index_grid, blank_logit - log_sum_exp_score)
 
     # Target logprob (only if target_i < target_len)
     if target_i < target_len:
         max_tgt_len = max_tgt_len_plus_1 - 1
         target_id = tl.load(targets_ptr + batch_i * max_tgt_len + target_i)
-        target_logit = tl.sum(tl.where(vocab_offsets == target_id, logits_acc, 0.0))
-        tl.store(target_logprobs_out_ptr + flat_index_grid, target_logit - log_sum_exp)
+        target_weight_row = tl.load(
+            weight_ptr + target_id * joint_dim + joint_dim_offsets, mask=joint_dim_mask, other=0.0
+        ).to(compute_dtype)
+        target_bias = tl.load(bias_ptr + target_id)
+        target_logit = tl.sum(target_weight_row * joint_hidden, axis=0) + target_bias
+        tl.store(target_logprobs_out_ptr + flat_index_grid, target_logit - log_sum_exp_score)
 
 
 @triton.jit
@@ -315,7 +330,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         log_sum_exp_scores = torch.zeros_like(target_logprobs)
 
         VOCAB_BLOCK = triton.next_power_of_2(vocab_size)
-        HIDDEN_BLOCK = 32
+        VOCAB_CHUNK_BLOCK = 32
 
         _rnnt_joint_fwd_kernel[(batch_size, src_max_length, tgt_max_length_plus_1)](
             encoder_output_ptr=encoder_output_projected,
@@ -330,12 +345,12 @@ class RnntJointLogProbs(torch.autograd.Function):
             log_sum_exp_scores_out_ptr=log_sum_exp_scores,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
-            hidden_dim=hidden_dim,
+            joint_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
             JOINT_DIM_BLOCK=triton.next_power_of_2(hidden_dim),
             VOCAB_BLOCK=VOCAB_BLOCK,
-            HIDDEN_BLOCK=HIDDEN_BLOCK,
+            VOCAB_CHUNK_BLOCK=VOCAB_CHUNK_BLOCK,
             USE_FP64=use_fp64,
         )
 
