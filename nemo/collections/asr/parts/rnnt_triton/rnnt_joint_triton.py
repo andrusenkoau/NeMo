@@ -34,7 +34,8 @@ def _rnnt_joint_fwd_kernel(
     hidden_dim: int,
     vocab_size: int,
     blank_id: int,
-    BLOCK_SIZE: tl.constexpr,
+    JOINT_DIM_BLOCK: tl.constexpr,
+    VOCAB_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
@@ -61,13 +62,23 @@ def _rnnt_joint_fwd_kernel(
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
     # Initialize logits accumulator from bias
-    vocab_offsets = tl.arange(0, BLOCK_SIZE)
+    vocab_offsets = tl.arange(0, VOCAB_BLOCK)
     vocab_mask = vocab_offsets < vocab_size
     logits_acc = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
 
     # Pointers to enc[b, t, :] and pred[b, u, :]
     enc_base = batch_i * max_src_len * hidden_dim + source_i * hidden_dim
     pred_base = batch_i * max_tgt_len_plus_1 * hidden_dim + target_i * hidden_dim
+    joint_dim_offests = tl.arange(0, JOINT_DIM_BLOCK)
+    joint_dim_mask = joint_dim_offests < hidden_dim
+    # sum + relu
+    joint_hidden = tl.maximum(
+        (
+            tl.load(encoder_output_ptr + enc_base + joint_dim_offests, mask=joint_dim_mask, other=0.0)
+            + tl.load(predictor_output_ptr + pred_base + joint_dim_offests, mask=joint_dim_mask, other=0.0)
+        ),
+        0.0
+    ).to(compute_dtype)
 
     # Loop over hidden dimension in chunks of HIDDEN_BLOCK
     for d_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
@@ -75,17 +86,10 @@ def _rnnt_joint_fwd_kernel(
         d_offsets = tl.arange(0, HIDDEN_BLOCK)
         d_mask = (d_start + d_offsets) < hidden_dim
 
-        enc_chunk = tl.load(encoder_output_ptr + enc_base + d_start + d_offsets, mask=d_mask, other=0.0).to(
-            compute_dtype
-        )
-        pred_chunk = tl.load(predictor_output_ptr + pred_base + d_start + d_offsets, mask=d_mask, other=0.0).to(
-            compute_dtype
-        )
-
         # Fused add + ReLU
-        hidden_chunk = tl.maximum(enc_chunk + pred_chunk, 0.0)
+        hidden_chunk = joint_hidden.gather((d_start + d_offsets) * d_mask, axis=0)
 
-        # Load weight block [BLOCK_SIZE, HIDDEN_BLOCK] and accumulate matmul
+        # Load weight block [VOCAB_BLOCK, HIDDEN_BLOCK] and accumulate matmul
         # weight layout: [vocab_size, hidden_dim], row-major
         weight_block = tl.load(
             weight_ptr + vocab_offsets[:, None] * hidden_dim + d_start + d_offsets[None, :],
@@ -140,7 +144,7 @@ def _rnnt_joint_bwd_kernel(
     hidden_dim: int,
     vocab_size: int,
     blank_id: int,
-    BLOCK_SIZE: tl.constexpr,
+    VOCAB_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
@@ -168,7 +172,7 @@ def _rnnt_joint_bwd_kernel(
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
-    vocab_offsets = tl.arange(0, BLOCK_SIZE)
+    vocab_offsets = tl.arange(0, VOCAB_BLOCK)
     vocab_mask = vocab_offsets < vocab_size
 
     # --- Recompute forward: logits_acc (including bias) ---
@@ -310,7 +314,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         blank_logprobs = torch.zeros_like(target_logprobs)
         log_sum_exp_scores = torch.zeros_like(target_logprobs)
 
-        BLOCK_SIZE = triton.next_power_of_2(vocab_size)
+        VOCAB_BLOCK = triton.next_power_of_2(vocab_size)
         HIDDEN_BLOCK = 32
 
         _rnnt_joint_fwd_kernel[(batch_size, src_max_length, tgt_max_length_plus_1)](
@@ -329,7 +333,8 @@ class RnntJointLogProbs(torch.autograd.Function):
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            BLOCK_SIZE=BLOCK_SIZE,
+            JOINT_DIM_BLOCK=triton.next_power_of_2(hidden_dim),
+            VOCAB_BLOCK=VOCAB_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             USE_FP64=use_fp64,
         )
@@ -373,7 +378,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         grad_weight = torch.zeros_like(weight, dtype=torch.float32)
         grad_bias = torch.zeros_like(bias, dtype=torch.float32)
 
-        BLOCK_SIZE = triton.next_power_of_2(vocab_size)
+        VOCAB_BLOCK = triton.next_power_of_2(vocab_size)
         HIDDEN_BLOCK = 32
 
         _rnnt_joint_bwd_kernel[(batch_size, src_max_length, tgt_max_length_plus_1)](
@@ -396,7 +401,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            BLOCK_SIZE=BLOCK_SIZE,
+            VOCAB_BLOCK=VOCAB_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             USE_FP64=use_fp64,
         )
