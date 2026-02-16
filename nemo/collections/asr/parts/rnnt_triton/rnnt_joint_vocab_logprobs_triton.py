@@ -640,15 +640,8 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         weight: torch.Tensor,
         bias: torch.Tensor,
         blank_id: int,
-        activation: str = "relu",
-        dropout_p: float = 0.0,
         use_high_precision: bool = False,
     ):
-        if activation != "relu":
-            raise NotImplementedError("Only relu activation is supported")
-        if dropout_p != 0.0:
-            raise NotImplementedError("Dropout is not supported yet")
-
         use_fp64 = joint_hidden.dtype == torch.float64
         float_dtype = torch.float64 if use_fp64 else torch.float32
 
@@ -817,7 +810,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         grad_weight = grad_weight_partial.sum(dim=0)
         grad_bias = grad_bias_partial.sum(dim=0)
 
-        return grad_joint_hidden, None, None, None, grad_weight, grad_bias, None, None, None, None
+        return grad_joint_hidden, None, None, None, grad_weight, grad_bias, None, None
 
 
 def rnnt_joint_vocab_logprobs_triton(
@@ -828,8 +821,6 @@ def rnnt_joint_vocab_logprobs_triton(
     weight: torch.Tensor,
     bias: torch.Tensor,
     blank_id: int,
-    activation: str = "relu",
-    dropout_p: float = 0.0,
     use_high_precision: bool = False,
 ):
     target_logprobs, blank_logprobs = RnntJointVocabLogProbs.apply(
@@ -840,8 +831,6 @@ def rnnt_joint_vocab_logprobs_triton(
         weight,
         bias,
         blank_id,
-        activation,
-        dropout_p,
         use_high_precision,
     )
     return target_logprobs, blank_logprobs
