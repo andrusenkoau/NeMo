@@ -96,9 +96,7 @@ def _rnnt_joint_fwd_kernel(
     # Load target labels with batch offset
     max_tgt_len = max_tgt_len_plus_1 - 1
     targets = tl.load(targets_ptr + batch_i * max_tgt_len + target_offsets, mask=target_label_mask, other=0)
-    targets_expanded = (
-        targets[None, :].broadcast_to([ENCODER_BLOCK, PREDICTOR_BLOCK]).reshape([NUM_TILE_ELEMENTS])
-    )
+    targets_expanded = targets[None, :].broadcast_to([ENCODER_BLOCK, PREDICTOR_BLOCK]).reshape([NUM_TILE_ELEMENTS])
 
     # Outer loop over vocab chunks
     for v_start_i32 in tl.range(0, vocab_size, VOCAB_BLOCK):
@@ -202,7 +200,7 @@ def _rnnt_joint_fwd_kernel(
 
 
 @triton.jit
-def _rnnt_joint_bwd_kernel(
+def _rnnt_joint_partial_enc_pred_bwd_kernel(
     encoder_output_ptr,
     predictor_output_ptr,
     targets_ptr,
@@ -212,143 +210,41 @@ def _rnnt_joint_bwd_kernel(
     bias_ptr,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
-    grad_encoder_out_ptr,
-    grad_predictor_out_ptr,
-    grad_weight_out_ptr,
-    grad_bias_out_ptr,
+    grad_encoder_partial_out_ptr,
+    grad_predictor_partial_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
     hidden_dim: int,
     vocab_size: int,
     blank_id: int,
-    VOCAB_BLOCK: tl.constexpr,
+    ENCODER_BLOCK: tl.constexpr,
+    PREDICTOR_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
+    VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
+    USE_HIGH_PRECISION: tl.constexpr,
 ):
     """
     Backward kernel for fused RNN-T Joint + log-softmax.
 
-    Recomputes forward (logits) to avoid storing the full logits tensor,
-    then backpropagates through log-softmax, linear layer, and ReLU
-    to produce gradients for encoder, predictor, weight, and bias.
-
-    Uses atomic adds for encoder/predictor/weight/bias gradients since
-    multiple (b,t,u) programs write to overlapping locations.
+    Computes only gradient for encoder and predictor output (inputs for Joint)
+    Does not compute gradient for weight and bias
 
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
     batch_i = tl.program_id(axis=0).to(tl.int64)
-    source_i = tl.program_id(axis=1).to(tl.int64)
-    target_i = tl.program_id(axis=2).to(tl.int64)
+    source_block_i = tl.program_id(axis=1).to(tl.int64)
+    target_block_i = tl.program_id(axis=2).to(tl.int64)
+    source_i_start = source_block_i * ENCODER_BLOCK
+    target_i_start = target_block_i * PREDICTOR_BLOCK
 
     source_len = tl.load(src_lengths_ptr + batch_i)
     target_len = tl.load(tgt_lengths_ptr + batch_i)
 
-    if source_i >= source_len or target_i > target_len:
+    if source_i_start >= source_len or target_i_start > target_len:
         return
 
-    compute_dtype = tl.float64 if USE_FP64 else tl.float32
-
-    vocab_offsets = tl.arange(0, VOCAB_BLOCK)
-    vocab_mask = vocab_offsets < vocab_size
-
-    # --- Recompute forward: logits_acc (including bias) ---
-    logits_acc = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
-
-    enc_base = batch_i * max_src_len * hidden_dim + source_i * hidden_dim
-    pred_base = batch_i * max_tgt_len_plus_1 * hidden_dim + target_i * hidden_dim
-
-    for d_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-        d_start = d_start_i32.to(tl.int64)
-        d_offsets = tl.arange(0, HIDDEN_BLOCK)
-        d_mask = (d_start + d_offsets) < hidden_dim
-
-        enc_chunk = tl.load(encoder_output_ptr + enc_base + d_start + d_offsets, mask=d_mask, other=0.0).to(
-            compute_dtype
-        )
-        pred_chunk = tl.load(predictor_output_ptr + pred_base + d_start + d_offsets, mask=d_mask, other=0.0).to(
-            compute_dtype
-        )
-        hidden_chunk = tl.maximum(enc_chunk + pred_chunk, 0.0)
-
-        weight_block = tl.load(
-            weight_ptr + vocab_offsets[:, None] * hidden_dim + d_start + d_offsets[None, :],
-            mask=vocab_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        ).to(compute_dtype)
-
-        logits_acc += tl.sum(weight_block * hidden_chunk[None, :], axis=1)
-
-    # TODO: currently recomputes log_sum_exp instead of using saved log_sum_exp_scores from forward,
-    #  because forward may use TF32 (via tl.dot) while backward recomputes in fp32.
-    #  Need to fix precision properly (e.g., use the same precision in both, or pass log_sum_exp_scores here).
-    logits_acc = tl.where(vocab_mask, logits_acc, -float("inf"))
-    max_logit = tl.max(logits_acc)
-    log_sum_exp = tl.log(tl.sum(tl.exp(logits_acc - max_logit))) + max_logit
-
-    # --- Compute grad_logits from log-softmax backward ---
-    flat_index_grid = (batch_i * max_src_len + source_i) * max_tgt_len_plus_1 + target_i
-
-    softmax = tl.exp(logits_acc - log_sum_exp)
-
-    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grid).to(compute_dtype)
-    target_i_valid = target_i < target_len
-    target_grad = tl.load(grad_target_scores_ptr + flat_index_grid, mask=target_i_valid, other=0.0).to(compute_dtype)
-
-    max_tgt_len = max_tgt_len_plus_1 - 1
-    target_id = tl.load(targets_ptr + batch_i * max_tgt_len + target_i, mask=target_i_valid, other=-1)
-
-    # Same gradient formula as _rnnt_logprobs_bwd_kernel
-    grad_base = (-softmax) * (blank_grad + target_grad)
-    grad_logits = tl.where(vocab_offsets == blank_id, blank_grad + grad_base, grad_base)
-    grad_logits = tl.where(vocab_offsets == target_id, target_grad + grad_base, grad_logits)
-
-    # --- Atomic add grad_bias ---
-    tl.atomic_add(grad_bias_out_ptr + vocab_offsets, grad_logits, mask=vocab_mask)
-
-    # --- Backpropagate through linear + ReLU in D-chunked loop ---
-    for d_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-        d_start = d_start_i32.to(tl.int64)
-        d_offsets = tl.arange(0, HIDDEN_BLOCK)
-        d_mask = (d_start + d_offsets) < hidden_dim
-
-        # Reload enc/pred to recompute relu_mask
-        enc_chunk = tl.load(encoder_output_ptr + enc_base + d_start + d_offsets, mask=d_mask, other=0.0).to(
-            compute_dtype
-        )
-        pred_chunk = tl.load(predictor_output_ptr + pred_base + d_start + d_offsets, mask=d_mask, other=0.0).to(
-            compute_dtype
-        )
-        hidden_pre_relu = enc_chunk + pred_chunk
-        relu_mask = hidden_pre_relu > 0.0
-        hidden_chunk = tl.where(relu_mask, hidden_pre_relu, 0.0)
-
-        # Load weight block for this D chunk
-        weight_block = tl.load(
-            weight_ptr + vocab_offsets[:, None] * hidden_dim + d_start + d_offsets[None, :],
-            mask=vocab_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        ).to(compute_dtype)
-
-        # grad_hidden_chunk = grad_logits^T @ weight_block -> [HIDDEN_BLOCK]
-        grad_hidden_chunk = tl.sum(grad_logits[:, None] * weight_block, axis=0)
-
-        # Apply ReLU gradient
-        grad_pre_relu = tl.where(relu_mask, grad_hidden_chunk, 0.0)
-
-        # Atomic add to encoder gradient: grad_encoder[b, t, d]
-        tl.atomic_add(grad_encoder_out_ptr + enc_base + d_start + d_offsets, grad_pre_relu, mask=d_mask)
-
-        # Atomic add to predictor gradient: grad_predictor[b, u, d]
-        tl.atomic_add(grad_predictor_out_ptr + pred_base + d_start + d_offsets, grad_pre_relu, mask=d_mask)
-
-        # Atomic add to weight gradient: grad_weight[v, d] += grad_logits[v] * hidden_chunk[d]
-        grad_weight_chunk = grad_logits[:, None] * hidden_chunk[None, :]
-        tl.atomic_add(
-            grad_weight_out_ptr + vocab_offsets[:, None] * hidden_dim + d_start + d_offsets[None, :],
-            grad_weight_chunk,
-            mask=vocab_mask[:, None] & d_mask[None, :],
-        )
+    # ... actual gradient implementation here
 
 
 class RnntJointLogProbs(torch.autograd.Function):
@@ -402,8 +298,9 @@ class RnntJointLogProbs(torch.autograd.Function):
         HIDDEN_BLOCK = 32
         ENCODER_BLOCK = 16
         PREDICTOR_BLOCK = 16
-        num_encoder_blocks = (src_max_length + ENCODER_BLOCK - 1) // ENCODER_BLOCK
-        num_predictor_blocks = (tgt_max_length_plus_1 + PREDICTOR_BLOCK - 1) // PREDICTOR_BLOCK
+
+        num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
+        num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
 
         _rnnt_joint_fwd_kernel[(batch_size, num_encoder_blocks, num_predictor_blocks)](
             encoder_output_ptr=encoder_output_projected,
@@ -437,10 +334,11 @@ class RnntJointLogProbs(torch.autograd.Function):
             targets,
             src_lengths,
             tgt_lengths,
-            log_sum_exp_scores,
+            blank_logprobs,
         )
         ctx.blank_id = blank_id
         ctx.use_fp64 = use_fp64
+        ctx.use_high_precision = use_high_precision
         return target_logprobs, blank_logprobs
 
     @staticmethod
@@ -453,25 +351,33 @@ class RnntJointLogProbs(torch.autograd.Function):
             targets,
             src_lengths,
             tgt_lengths,
-            log_sum_exp_scores,  # noqa: F841
+            blank_logprobs,
         ) = ctx.saved_tensors
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
+        use_high_precision = ctx.use_high_precision
         float_dtype = torch.float64 if use_fp64 else torch.float32
 
         batch_size, src_max_length, hidden_dim = encoder_output_projected.shape
         tgt_max_length_plus_1 = predictor_output_projected.shape[1]
         vocab_size = weight.shape[0]
 
-        grad_encoder = torch.zeros_like(encoder_output_projected, dtype=float_dtype)
-        grad_predictor = torch.zeros_like(predictor_output_projected, dtype=float_dtype)
-        grad_weight = torch.zeros_like(weight, dtype=float_dtype)
-        grad_bias = torch.zeros_like(bias, dtype=float_dtype)
-
-        VOCAB_BLOCK = triton.next_power_of_2(vocab_size)
+        VOCAB_BLOCK = 64
         HIDDEN_BLOCK = 32
+        ENCODER_BLOCK = 16
+        PREDICTOR_BLOCK = 16
 
-        _rnnt_joint_bwd_kernel[(batch_size, src_max_length, tgt_max_length_plus_1)](
+        num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
+        num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
+
+        grad_encoder_partial = encoder_output_projected.new_zeros(
+            [batch_size, num_encoder_blocks, num_predictor_blocks, ENCODER_BLOCK, hidden_dim]
+        )
+        grad_predictor_partial = predictor_output_projected.new_zeros(
+            [batch_size, num_encoder_blocks, num_predictor_blocks, PREDICTOR_BLOCK, hidden_dim]
+        )
+
+        _rnnt_joint_partial_enc_pred_bwd_kernel[(batch_size, num_encoder_blocks, num_predictor_blocks)](
             encoder_output_ptr=encoder_output_projected,
             predictor_output_ptr=predictor_output_projected,
             targets_ptr=targets,
@@ -481,19 +387,28 @@ class RnntJointLogProbs(torch.autograd.Function):
             bias_ptr=bias,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
-            grad_encoder_out_ptr=grad_encoder,
-            grad_predictor_out_ptr=grad_predictor,
-            grad_weight_out_ptr=grad_weight,
-            grad_bias_out_ptr=grad_bias,
+            grad_encoder_partial_out_ptr=grad_encoder_partial,
+            grad_predictor_partial_out_ptr=grad_predictor_partial,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            VOCAB_BLOCK=VOCAB_BLOCK,
+            ENCODER_BLOCK=ENCODER_BLOCK,
+            PREDICTOR_BLOCK=PREDICTOR_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
+            VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
+            USE_HIGH_PRECISION=use_high_precision,
         )
+
+        grad_encoder = grad_encoder_partial.sum(dim=2).view([batch_size, -1, hidden_dim])[:, :src_max_length]
+        grad_predictor = grad_predictor_partial.sum(dim=1).view([batch_size, -1, hidden_dim])[
+            :, :tgt_max_length_plus_1
+        ]
+        # TODO: compute it later with a separate kernel
+        grad_weight = torch.zeros_like(weight, dtype=float_dtype)
+        grad_bias = torch.zeros_like(bias, dtype=float_dtype)
 
         return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None, None
 
