@@ -611,9 +611,9 @@ class RnntJointLogProbs(torch.autograd.Function):
         vocab_size = weight.shape[0]
 
         VOCAB_BLOCK = 64
-        HIDDEN_BLOCK = 32
-        ENCODER_BLOCK = 16
-        PREDICTOR_BLOCK = 16
+        HIDDEN_BLOCK = 128
+        ENCODER_BLOCK = 8
+        PREDICTOR_BLOCK = 8
 
         num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
         num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
