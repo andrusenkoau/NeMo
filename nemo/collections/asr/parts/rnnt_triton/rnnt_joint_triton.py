@@ -482,33 +482,38 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     HIDDEN_BLOCK: tl.constexpr,
     D_BLOCKS_PER_PROGRAM: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
+    V_BLOCKS_PER_PROGRAM: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
     """
     Backward kernel for weight and bias gradients using split-K parallelism.
 
-    Grid: (num_d_programs, num_v_blocks, num_splits)
-    Each program computes partial grad_weight[d_slice, v_block] and grad_bias[v_block]
-    over a subset of (batch, enc_tile, pred_tile) lattice positions.
+    Grid: (num_d_programs, num_v_programs, num_splits), where each v-program handles
+    V_BLOCKS_PER_PROGRAM contiguous vocab blocks.
     """
     d_prog_i = tl.program_id(axis=0).to(tl.int64)
-    v_block_i = tl.program_id(axis=1).to(tl.int64)
+    v_prog_i = tl.program_id(axis=1).to(tl.int64)
     split_id = tl.program_id(axis=2).to(tl.int64)
     num_splits = tl.num_programs(axis=2).to(tl.int64)
 
     D_BLOCK: tl.constexpr = HIDDEN_BLOCK * D_BLOCKS_PER_PROGRAM
     d_start = d_prog_i * D_BLOCK
-    d_offsets = tl.arange(0, D_BLOCK)
-    d_abs_offsets = d_start + d_offsets
+    d_abs_offsets = d_start + tl.arange(0, D_BLOCK)
     d_mask = d_abs_offsets < hidden_dim
 
-    v_start = v_block_i * VOCAB_BLOCK
     v_chunk_offsets = tl.arange(0, VOCAB_BLOCK)
-    v_offsets = v_start + v_chunk_offsets
-    v_mask = v_offsets < vocab_size
+    v_block_i0 = v_prog_i * V_BLOCKS_PER_PROGRAM
+    v_start0 = v_block_i0 * VOCAB_BLOCK
+    v_offsets0 = v_start0 + v_chunk_offsets
+    v_mask0 = v_offsets0 < vocab_size
 
-    if d_start >= hidden_dim or v_start >= vocab_size:
+    if V_BLOCKS_PER_PROGRAM > 1:
+        v_block_i1 = v_block_i0 + 1
+        v_offsets1 = v_block_i1 * VOCAB_BLOCK + v_chunk_offsets
+        v_mask1 = v_offsets1 < vocab_size
+
+    if d_start >= hidden_dim or v_start0 >= vocab_size:
         return
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
@@ -516,8 +521,11 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     NUM_TILE_ELEMENTS: tl.constexpr = ENCODER_BLOCK * PREDICTOR_BLOCK
 
     # Accumulators
-    grad_weight_acc = tl.zeros([D_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
-    grad_bias_acc = tl.zeros([VOCAB_BLOCK], dtype=compute_dtype)
+    grad_weight_acc0 = tl.zeros([D_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
+    grad_bias_acc0 = tl.zeros([VOCAB_BLOCK], dtype=compute_dtype)
+    if V_BLOCKS_PER_PROGRAM > 1:
+        grad_weight_acc1 = tl.zeros([D_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
+        grad_bias_acc1 = tl.zeros([VOCAB_BLOCK], dtype=compute_dtype)
 
     # Bias gradient doesn't depend on d — only first d-program computes it
     is_first_d_program = d_prog_i == 0
@@ -527,7 +535,9 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     tile_start = split_id * tiles_per_split
 
     # Preload constants
-    bias_chunk = tl.load(bias_ptr + v_offsets, mask=v_mask, other=0.0).to(compute_dtype)
+    bias_chunk0 = tl.load(bias_ptr + v_offsets0, mask=v_mask0, other=0.0).to(compute_dtype)
+    if V_BLOCKS_PER_PROGRAM > 1:
+        bias_chunk1 = tl.load(bias_ptr + v_offsets1, mask=v_mask1, other=0.0).to(compute_dtype)
     d_loop_offsets = tl.arange(0, HIDDEN_BLOCK)
 
     for tile_offset_i32 in tl.range(0, tiles_per_split):
@@ -570,9 +580,12 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                 ]
                 tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
                 target_store_mask = source_mask[:, None] & target_label_mask[None, :]
+                tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
 
-                # ---- Compute logits for v_block ----
-                logits_acc = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
+                # ---- Compute logits for grouped vocab blocks ----
+                logits_acc0 = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
+                if V_BLOCKS_PER_PROGRAM > 1:
+                    logits_acc1 = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
 
                 for d_in_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
                     d_in_start = d_in_start_i32.to(tl.int64)
@@ -602,21 +615,37 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                         .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
                     )
 
-                    # Logits accumulation for v_block (matmul)
-                    w_v = tl.load(
-                        weight_ptr + v_offsets[:, None] * hidden_dim + d_in_start + d_loop_offsets[None, :],
-                        mask=v_mask[:, None] & d_in_mask[None, :],
+                    # Logits accumulation for v_block0 (matmul)
+                    w_v0 = tl.load(
+                        weight_ptr + v_offsets0[:, None] * hidden_dim + d_in_start + d_loop_offsets[None, :],
+                        mask=v_mask0[:, None] & d_in_mask[None, :],
                         other=0.0,
                     ).to(matmul_dtype)
 
                     if USE_FP64:
-                        logits_acc += tl.sum(hidden_in[:, None, :] * w_v[None, :, :], axis=-1)
+                        logits_acc0 += tl.sum(hidden_in[:, None, :] * w_v0[None, :, :], axis=-1)
                     elif USE_HIGH_PRECISION:
-                        logits_acc = tl.dot(hidden_in, w_v.T, acc=logits_acc, input_precision="ieee").to(
+                        logits_acc0 = tl.dot(hidden_in, w_v0.T, acc=logits_acc0, input_precision="ieee").to(
                             compute_dtype
                         )
                     else:
-                        logits_acc = tl.dot(hidden_in, w_v.T, acc=logits_acc).to(compute_dtype)
+                        logits_acc0 = tl.dot(hidden_in, w_v0.T, acc=logits_acc0).to(compute_dtype)
+
+                    if V_BLOCKS_PER_PROGRAM > 1:
+                        w_v1 = tl.load(
+                            weight_ptr + v_offsets1[:, None] * hidden_dim + d_in_start + d_loop_offsets[None, :],
+                            mask=v_mask1[:, None] & d_in_mask[None, :],
+                            other=0.0,
+                        ).to(matmul_dtype)
+
+                        if USE_FP64:
+                            logits_acc1 += tl.sum(hidden_in[:, None, :] * w_v1[None, :, :], axis=-1)
+                        elif USE_HIGH_PRECISION:
+                            logits_acc1 = tl.dot(hidden_in, w_v1.T, acc=logits_acc1, input_precision="ieee").to(
+                                compute_dtype
+                            )
+                        else:
+                            logits_acc1 = tl.dot(hidden_in, w_v1.T, acc=logits_acc1).to(compute_dtype)
 
                 lse = tl.load(lse_ptr + indices_grid, mask=tile_valid_mask, other=0.0).reshape(
                     [NUM_TILE_ELEMENTS]
@@ -635,29 +664,46 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                 )
                 sum_grad = grad_target + grad_blank
 
-                # ---- Compute grad_logits for v_block ----
-                block_logits = logits_acc + bias_chunk[None, :]
-                block_logits = tl.where(v_mask[None, :], block_logits, -float("inf"))
+                # ---- Compute grad_logits for v_block0 ----
+                block_logits0 = logits_acc0 + bias_chunk0[None, :]
+                block_logits0 = tl.where(v_mask0[None, :], block_logits0, -float("inf"))
+                # numerical guard: lse is theoretically >= logits, clamp to avoid exp overflow from rounding
+                logits_minus_lse0 = tl.minimum(block_logits0 - lse[:, None], 0.0)
+                softmax0 = tl.exp(logits_minus_lse0)
+                grad_logits0 = -softmax0 * sum_grad[:, None]
 
-                softmax = tl.exp(block_logits - lse[:, None])
-                grad_logits = -softmax * sum_grad[:, None]
-
-                grad_logits += tl.where(
-                    v_offsets[None, :] == targets_expanded[:, None],
+                grad_logits0 += tl.where(
+                    v_offsets0[None, :] == targets_expanded[:, None],
                     grad_target[:, None],
                     0.0,
                 )
-                grad_logits += tl.where(
-                    (v_offsets == blank_id)[None, :],
+                grad_logits0 += tl.where(
+                    (v_offsets0 == blank_id)[None, :],
                     grad_blank[:, None],
                     0.0,
                 )
+                grad_logits0 = tl.where(tile_flat_mask[:, None] & v_mask0[None, :], grad_logits0, 0.0)
 
-                # Mask out invalid tile and vocab positions
-                tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
-                grad_logits = tl.where(tile_flat_mask[:, None] & v_mask[None, :], grad_logits, 0.0)
+                if V_BLOCKS_PER_PROGRAM > 1:
+                    block_logits1 = logits_acc1 + bias_chunk1[None, :]
+                    block_logits1 = tl.where(v_mask1[None, :], block_logits1, -float("inf"))
+                    logits_minus_lse1 = tl.minimum(block_logits1 - lse[:, None], 0.0)
+                    softmax1 = tl.exp(logits_minus_lse1)
+                    grad_logits1 = -softmax1 * sum_grad[:, None]
 
-                # ---- Re-load hidden for d-slice, accumulate grad_weight ----
+                    grad_logits1 += tl.where(
+                        v_offsets1[None, :] == targets_expanded[:, None],
+                        grad_target[:, None],
+                        0.0,
+                    )
+                    grad_logits1 += tl.where(
+                        (v_offsets1 == blank_id)[None, :],
+                        grad_blank[:, None],
+                        0.0,
+                    )
+                    grad_logits1 = tl.where(tile_flat_mask[:, None] & v_mask1[None, :], grad_logits1, 0.0)
+
+                # ---- Hidden for d-slice, accumulate grad_weight ----
                 enc_d = tl.load(
                     encoder_output_ptr
                     + enc_batch_base
@@ -678,40 +724,73 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                     [NUM_TILE_ELEMENTS, D_BLOCK]
                 )
 
-                grad_logits_matmul = grad_logits.to(matmul_dtype)
+                grad_logits0_matmul = grad_logits0.to(matmul_dtype)
                 if USE_FP64:
-                    grad_weight_acc += tl.sum(
-                        hidden_d[:, :, None] * grad_logits_matmul[:, None, :],
+                    grad_weight_acc0 += tl.sum(
+                        hidden_d[:, :, None] * grad_logits0_matmul[:, None, :],
                         axis=0,
                     )
                 elif USE_HIGH_PRECISION:
-                    grad_weight_acc = tl.dot(
-                        hidden_d.T, grad_logits_matmul, acc=grad_weight_acc, input_precision="ieee"
+                    grad_weight_acc0 = tl.dot(
+                        hidden_d.T, grad_logits0_matmul, acc=grad_weight_acc0, input_precision="ieee"
                     ).to(compute_dtype)
                 else:
-                    grad_weight_acc = tl.dot(hidden_d.T, grad_logits_matmul, acc=grad_weight_acc).to(compute_dtype)
+                    grad_weight_acc0 = tl.dot(hidden_d.T, grad_logits0_matmul, acc=grad_weight_acc0).to(compute_dtype)
+
+                if V_BLOCKS_PER_PROGRAM > 1:
+                    grad_logits1_matmul = grad_logits1.to(matmul_dtype)
+                    if USE_FP64:
+                        grad_weight_acc1 += tl.sum(
+                            hidden_d[:, :, None] * grad_logits1_matmul[:, None, :],
+                            axis=0,
+                        )
+                    elif USE_HIGH_PRECISION:
+                        grad_weight_acc1 = tl.dot(
+                            hidden_d.T, grad_logits1_matmul, acc=grad_weight_acc1, input_precision="ieee"
+                        ).to(compute_dtype)
+                    else:
+                        grad_weight_acc1 = tl.dot(hidden_d.T, grad_logits1_matmul, acc=grad_weight_acc1).to(
+                            compute_dtype
+                        )
 
                 # ---- Accumulate grad_bias (only first d-program) ----
                 if is_first_d_program:
-                    grad_bias_acc += tl.sum(grad_logits, axis=0)
+                    grad_bias_acc0 += tl.sum(grad_logits0, axis=0)
+                    if V_BLOCKS_PER_PROGRAM > 1:
+                        grad_bias_acc1 += tl.sum(grad_logits1, axis=0)
 
     # ---- Store partial results ----
     # grad_weight_partial layout: [num_splits, vocab_size, hidden_dim] (matches weight [V, D])
     weight_partial_offset = split_id * vocab_size * hidden_dim
     tl.store(
-        grad_weight_partial_out_ptr + weight_partial_offset + v_offsets[:, None] * hidden_dim + d_abs_offsets[None, :],
-        tl.trans(grad_weight_acc),  # [D, V] -> [V, D]
-        mask=v_mask[:, None] & d_mask[None, :],
+        grad_weight_partial_out_ptr + weight_partial_offset + v_offsets0[:, None] * hidden_dim + d_abs_offsets[None, :],
+        tl.trans(grad_weight_acc0),  # [D, V] -> [V, D]
+        mask=v_mask0[:, None] & d_mask[None, :],
     )
+    if V_BLOCKS_PER_PROGRAM > 1:
+        tl.store(
+            grad_weight_partial_out_ptr
+            + weight_partial_offset
+            + v_offsets1[:, None] * hidden_dim
+            + d_abs_offsets[None, :],
+            tl.trans(grad_weight_acc1),  # [D, V] -> [V, D]
+            mask=v_mask1[:, None] & d_mask[None, :],
+        )
 
     # grad_bias_partial layout: [num_splits, vocab_size]
     if is_first_d_program:
         bias_partial_offset = split_id * vocab_size
         tl.store(
-            grad_bias_partial_out_ptr + bias_partial_offset + v_offsets,
-            grad_bias_acc,
-            mask=v_mask,
+            grad_bias_partial_out_ptr + bias_partial_offset + v_offsets0,
+            grad_bias_acc0,
+            mask=v_mask0,
         )
+        if V_BLOCKS_PER_PROGRAM > 1:
+            tl.store(
+                grad_bias_partial_out_ptr + bias_partial_offset + v_offsets1,
+                grad_bias_acc1,
+                mask=v_mask1,
+            )
 
 
 class RnntJointLogProbs(torch.autograd.Function):
@@ -885,6 +964,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         WB_HIDDEN_BLOCK = 128
         WB_D_BLOCKS_PER_PROGRAM = 2
         WB_VOCAB_BLOCK = 64
+        WB_V_BLOCKS_PER_PROGRAM = 1
 
         wb_num_encoder_blocks = triton.cdiv(src_max_length, WB_ENCODER_BLOCK)
         wb_num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, WB_PREDICTOR_BLOCK)
@@ -892,12 +972,13 @@ class RnntJointLogProbs(torch.autograd.Function):
 
         num_d_programs = triton.cdiv(hidden_dim, WB_HIDDEN_BLOCK * WB_D_BLOCKS_PER_PROGRAM)
         num_v_blocks = triton.cdiv(vocab_size, WB_VOCAB_BLOCK)
+        num_v_programs = triton.cdiv(num_v_blocks, WB_V_BLOCKS_PER_PROGRAM)
         num_splits = min(64, total_tiles)
 
         grad_weight_partial = torch.zeros([num_splits, vocab_size, hidden_dim], dtype=float_dtype, device=device)
         grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
 
-        _rnnt_joint_partial_weight_bias_bwd_kernel[(num_d_programs, num_v_blocks, num_splits)](
+        _rnnt_joint_partial_weight_bias_bwd_kernel[(num_d_programs, num_v_programs, num_splits)](
             encoder_output_ptr=encoder_output_projected,
             predictor_output_ptr=predictor_output_projected,
             targets_ptr=targets,
@@ -923,6 +1004,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             HIDDEN_BLOCK=WB_HIDDEN_BLOCK,
             D_BLOCKS_PER_PROGRAM=WB_D_BLOCKS_PER_PROGRAM,
             VOCAB_BLOCK=WB_VOCAB_BLOCK,
+            V_BLOCKS_PER_PROGRAM=WB_V_BLOCKS_PER_PROGRAM,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=4,
