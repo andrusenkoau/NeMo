@@ -18,6 +18,7 @@ Benchmark script comparing standard joint + loss vs fused Triton joint + loss.
 Usage:
     python benchmark_rnnt_joint.py --joint standard --loss rnnt_triton --dtype float32
     python benchmark_rnnt_joint.py --joint triton --loss rnnt_triton --dtype float32
+    python benchmark_rnnt_joint.py --joint triton_vocab --loss rnnt_triton --dtype bfloat16
     python benchmark_rnnt_joint.py --joint standard --loss warprnnt_numba --dtype bfloat16
     python benchmark_rnnt_joint.py --joint triton --dtype float32 -fo  # forward only
 """
@@ -30,6 +31,7 @@ import torch
 
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.parts.rnnt_triton.rnnt_joint_triton import rnnt_joint_logprobs_triton
+from nemo.collections.asr.parts.rnnt_triton.rnnt_joint_vocab_logprobs_triton import rnnt_joint_vocab_logprobs_triton
 from nemo.collections.asr.parts.rnnt_triton.rnnt_loss_triton import rnnt_loss_from_logprobs_triton
 
 
@@ -49,6 +51,7 @@ class BenchmarkResults:
     forward_time_ms: float
     backward_time_ms: float
     total_time_ms: float
+    save_rate_percent: float | None
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
@@ -202,6 +205,7 @@ def benchmark_standard_joint(
         forward_time_ms=avg_fwd,
         backward_time_ms=avg_bwd,
         total_time_ms=avg_fwd + avg_bwd,
+        save_rate_percent=0.0,
     )
 
 
@@ -352,25 +356,229 @@ def benchmark_triton_joint(
         forward_time_ms=avg_fwd,
         backward_time_ms=avg_bwd,
         total_time_ms=avg_fwd + avg_bwd,
+        save_rate_percent=None,
     )
 
 
+def benchmark_triton_vocab_joint(
+    loss_name: str,
+    dtype: torch.dtype,
+    warmup_iters: int = 10,
+    bench_iters: int = 100,
+    batch_size: int = 64,
+    max_time: int = 150,
+    hidden_dim: int = 640,
+    num_classes: int = 1024,
+    max_targets: int = 36,
+    forward_only: bool = False,
+) -> BenchmarkResults:
+    if loss_name != 'rnnt_triton':
+        raise ValueError("Joint implementation `triton_vocab` supports only `rnnt_triton` loss.")
+
+    device = torch.device('cuda')
+    vocab_size = num_classes + 1
+    blank_id = num_classes
+    max_target_plus_1 = max_targets + 1
+
+    torch.manual_seed(42)
+    enc_proj = torch.randn(batch_size, max_time, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+    pred_proj = torch.randn(batch_size, max_target_plus_1, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+    weight = torch.randn(vocab_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+    bias = torch.randn(vocab_size, device=device, dtype=dtype, requires_grad=True)
+    targets = torch.randint(0, blank_id, (batch_size, max_targets), device=device, dtype=torch.long)
+    src_lengths = torch.full([batch_size], max_time, device=device, dtype=torch.long)
+    tgt_lengths = torch.full([batch_size], max_targets, device=device, dtype=torch.long)
+
+    def run_fwd():
+        joint_hidden = torch.relu(enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1))
+        target_logprobs, blank_logprobs = rnnt_joint_vocab_logprobs_triton(
+            joint_hidden=joint_hidden,
+            targets=targets,
+            tgt_lengths=tgt_lengths,
+            src_lengths=src_lengths,
+            weight=weight,
+            bias=bias,
+            blank_id=blank_id,
+        )
+        loss_batch = rnnt_loss_from_logprobs_triton(
+            target_logprobs=target_logprobs,
+            blank_logprobs=blank_logprobs,
+            src_lengths=src_lengths,
+            tgt_lengths=tgt_lengths,
+        )
+        return loss_batch.sum()
+
+    def clear_grads():
+        if enc_proj.grad is not None:
+            enc_proj.grad = None
+        if pred_proj.grad is not None:
+            pred_proj.grad = None
+        if weight.grad is not None:
+            weight.grad = None
+        if bias.grad is not None:
+            bias.grad = None
+
+    for _ in range(warmup_iters):
+        clear_grads()
+        loss = run_fwd()
+        if not forward_only:
+            loss.backward()
+        del loss
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    torch.cuda.reset_peak_memory_stats()
+    baseline_memory = torch.cuda.memory_allocated()
+    clear_grads()
+    loss = run_fwd()
+    torch.cuda.synchronize()
+    forward_memory = torch.cuda.max_memory_allocated() - baseline_memory
+
+    if forward_only:
+        del loss
+        backward_peak_memory = 0
+        max_peak_memory = forward_memory
+    else:
+        torch.cuda.reset_peak_memory_stats()
+        loss.backward()
+        torch.cuda.synchronize()
+        backward_peak_memory = torch.cuda.max_memory_allocated() - baseline_memory
+        del loss
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        baseline_memory = torch.cuda.memory_allocated()
+        clear_grads()
+        loss = run_fwd()
+        loss.backward()
+        torch.cuda.synchronize()
+        max_peak_memory = torch.cuda.max_memory_allocated() - baseline_memory
+        del loss
+
+    forward_times = []
+    for _ in range(bench_iters):
+        clear_grads()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        loss = run_fwd()
+        end.record()
+        torch.cuda.synchronize()
+        forward_times.append(start.elapsed_time(end))
+        if not forward_only:
+            loss.backward()
+        del loss
+
+    backward_times = []
+    if not forward_only:
+        for _ in range(bench_iters):
+            clear_grads()
+            loss = run_fwd()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            loss.backward()
+            end.record()
+            torch.cuda.synchronize()
+            backward_times.append(start.elapsed_time(end))
+            del loss
+
+    avg_fwd = sum(forward_times) / len(forward_times)
+    avg_bwd = sum(backward_times) / len(backward_times) if backward_times else 0.0
+    dtype_str = 'float32' if dtype == torch.float32 else 'bfloat16'
+    return BenchmarkResults(
+        joint='triton_vocab',
+        loss='rnnt_triton',
+        dtype=dtype_str,
+        batch_size=batch_size,
+        max_time=max_time,
+        max_target_plus_1=max_target_plus_1,
+        hidden_dim=hidden_dim,
+        vocab_size=vocab_size,
+        forward_memory_gb=forward_memory / (1024**3),
+        backward_peak_memory_gb=backward_peak_memory / (1024**3),
+        max_peak_memory_gb=max_peak_memory / (1024**3),
+        forward_time_ms=avg_fwd,
+        backward_time_ms=avg_bwd,
+        total_time_ms=avg_fwd + avg_bwd,
+        save_rate_percent=None,
+    )
+
+
+def _estimate_save_rate(
+    results: BenchmarkResults,
+    loss_name: str,
+    dtype: torch.dtype,
+    batch_size: int,
+    max_time: int,
+    hidden_dim: int,
+    num_classes: int,
+    max_targets: int,
+    forward_only: bool,
+) -> float:
+    reference = benchmark_standard_joint(
+        loss_name=loss_name,
+        dtype=dtype,
+        warmup_iters=1,
+        bench_iters=1,
+        batch_size=batch_size,
+        max_time=max_time,
+        hidden_dim=hidden_dim,
+        num_classes=num_classes,
+        max_targets=max_targets,
+        forward_only=forward_only,
+    )
+    if reference.max_peak_memory_gb <= 0:
+        return 0.0
+    return max(0.0, (reference.max_peak_memory_gb - results.max_peak_memory_gb) / reference.max_peak_memory_gb * 100.0)
+
+
 def print_results(results: BenchmarkResults):
-    print(f"\n{'=' * 60}")
-    print(f"Benchmark: joint={results.joint}, loss={results.loss}, dtype={results.dtype}")
-    print(f"{'=' * 60}")
-    print(f"  Shape: enc=[{results.batch_size}, {results.max_time}, {results.hidden_dim}]")
-    print(f"         pred=[{results.batch_size}, {results.max_target_plus_1}, {results.hidden_dim}]")
-    print(f"         vocab_size={results.vocab_size}")
-    print(f"\n  Memory (above baseline):")
-    print(f"    Forward Peak:  {results.forward_memory_gb:.3f} GB")
-    print(f"    Backward Peak: {results.backward_peak_memory_gb:.3f} GB")
-    print(f"    Max Peak:      {results.max_peak_memory_gb:.3f} GB")
-    print(f"\n  Timing (averaged):")
-    print(f"    Forward:  {results.forward_time_ms:.3f} ms")
-    print(f"    Backward: {results.backward_time_ms:.3f} ms")
-    print(f"    Total:    {results.total_time_ms:.3f} ms")
-    print(f"{'=' * 60}\n")
+    print(
+        f"\nGPU benchmark shape: enc=[{results.batch_size}, {results.max_time}, {results.hidden_dim}], "
+        f"pred=[{results.batch_size}, {results.max_target_plus_1}, {results.hidden_dim}], "
+        f"vocab_size={results.vocab_size}"
+    )
+
+    headers = [
+        "Joint",
+        "Loss",
+        "Precision",
+        "Fwd Memory",
+        "Bwd Memory",
+        "Max Memory",
+        "Save Rate",
+        "Fwd Time",
+        "Bwd Time",
+        "Total Time",
+    ]
+    save_rate_text = "n/a" if results.save_rate_percent is None else f"{results.save_rate_percent:.2f}%"
+    row = [
+        results.joint,
+        results.loss,
+        results.dtype,
+        f"{results.forward_memory_gb:.3f} GB",
+        f"{results.backward_peak_memory_gb:.3f} GB",
+        f"{results.max_peak_memory_gb:.3f} GB",
+        save_rate_text,
+        f"{results.forward_time_ms:.3f} ms",
+        f"{results.backward_time_ms:.3f} ms",
+        f"{results.total_time_ms:.3f} ms",
+    ]
+
+    column_widths = [max(len(header), len(value)) for header, value in zip(headers, row)]
+    separator = "-+-".join("-" * width for width in column_widths)
+    header_line = " | ".join(header.ljust(width) for header, width in zip(headers, column_widths))
+    row_line = " | ".join(value.ljust(width) for value, width in zip(row, column_widths))
+
+    print(separator)
+    print(header_line)
+    print(separator)
+    print(row_line)
+    print(separator)
 
 
 def main():
@@ -379,7 +587,7 @@ def main():
         '--joint',
         type=str,
         required=True,
-        choices=['standard', 'triton'],
+        choices=['standard', 'triton', 'triton_vocab'],
         help='Joint implementation to benchmark',
     )
     parser.add_argument(
@@ -387,7 +595,7 @@ def main():
         type=str,
         default='rnnt_triton',
         choices=['warprnnt_numba', 'rnnt_triton'],
-        help='Loss implementation (only used with standard joint)',
+        help='Loss implementation',
     )
     parser.add_argument(
         '--dtype',
@@ -430,11 +638,39 @@ def main():
             max_targets=args.max_targets,
             forward_only=args.forward_only,
         )
-    else:
+    elif args.joint == 'triton':
+        if args.loss != 'rnnt_triton':
+            raise ValueError("Joint implementation `triton` supports only `rnnt_triton` loss.")
         results = benchmark_triton_joint(
             dtype=dtype,
             warmup_iters=args.warmup_iterations,
             bench_iters=args.benchmark_iterations,
+            batch_size=args.batch_size,
+            max_time=args.max_time,
+            hidden_dim=args.hidden_dim,
+            num_classes=args.num_classes,
+            max_targets=args.max_targets,
+            forward_only=args.forward_only,
+        )
+    else:
+        results = benchmark_triton_vocab_joint(
+            loss_name=args.loss,
+            dtype=dtype,
+            warmup_iters=args.warmup_iterations,
+            bench_iters=args.benchmark_iterations,
+            batch_size=args.batch_size,
+            max_time=args.max_time,
+            hidden_dim=args.hidden_dim,
+            num_classes=args.num_classes,
+            max_targets=args.max_targets,
+            forward_only=args.forward_only,
+        )
+
+    if args.joint != 'standard':
+        results.save_rate_percent = _estimate_save_rate(
+            results=results,
+            loss_name=args.loss,
+            dtype=dtype,
             batch_size=args.batch_size,
             max_time=args.max_time,
             hidden_dim=args.hidden_dim,
