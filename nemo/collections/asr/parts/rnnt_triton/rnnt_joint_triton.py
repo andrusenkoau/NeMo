@@ -457,16 +457,16 @@ class RnntJointLogProbs(torch.autograd.Function):
         ) = ctx.saved_tensors
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
-        # float_dtype = torch.float64 if use_fp64 else torch.float32
+        float_dtype = torch.float64 if use_fp64 else torch.float32
 
         batch_size, src_max_length, hidden_dim = encoder_output_projected.shape
         tgt_max_length_plus_1 = predictor_output_projected.shape[1]
         vocab_size = weight.shape[0]
 
-        grad_encoder = torch.zeros_like(encoder_output_projected, dtype=torch.float32)
-        grad_predictor = torch.zeros_like(predictor_output_projected, dtype=torch.float32)
-        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
-        grad_bias = torch.zeros_like(bias, dtype=torch.float32)
+        grad_encoder = torch.zeros_like(encoder_output_projected, dtype=float_dtype)
+        grad_predictor = torch.zeros_like(predictor_output_projected, dtype=float_dtype)
+        grad_weight = torch.zeros_like(weight, dtype=float_dtype)
+        grad_bias = torch.zeros_like(bias, dtype=float_dtype)
 
         VOCAB_BLOCK = triton.next_power_of_2(vocab_size)
         HIDDEN_BLOCK = 32
