@@ -133,6 +133,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     )
                 self.consistency_loss_weight = weight
                 self.consistency_loss_after_step = consistency_loss_cfg.get("after_step", -1)
+                # Choose who is teacher: "offline" (default) or "streaming"
+                self.who_is_teacher = consistency_loss_cfg.get("who_is_teacher", "offline")
+                if self.who_is_teacher not in ("offline", "streaming"):
+                    raise ValueError(f"who_is_teacher must be 'offline' or 'streaming', got '{self.who_is_teacher}'")
             else:
                 self.consistency_loss = None
                 self.consistency_loss_weight = 0.0
@@ -863,11 +867,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
                 # Consistency loss
                 if self.consistency_loss is not None and self.trainer.global_step > self.consistency_loss_after_step:
+                    if self.who_is_teacher == "offline":
+                        teacher_logits = offline_joint
+                        student_logits = streaming_joint
+                        teacher_src_lengths = offline_len
+                    else:  # streaming
+                        teacher_logits = streaming_joint
+                        student_logits = offline_joint
+                        teacher_src_lengths = streaming_len
+
                     consistency_loss_value = self.consistency_loss(
-                        teacher_logits=offline_joint,
-                        student_logits=streaming_joint,
+                        teacher_logits=teacher_logits,
+                        student_logits=student_logits,
                         targets=transcript,
-                        src_lengths=offline_len,
+                        src_lengths=teacher_src_lengths,
                         tgt_lengths=target_length,
                     )
                     loss_value += self.consistency_loss_weight * consistency_loss_value
@@ -895,42 +908,42 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     _, scores, words = self.wer.compute()
                     self.wer.reset()
                     tensorboard_logs.update({'training_batch_wer': scores.float() / words})
-            else:
-                # Fused mode - similar pattern
-                compute_wer = (sample_id + 1) % log_every_n_steps == 0
+            # else:
+            #     # Fused mode - similar pattern
+            #     compute_wer = (sample_id + 1) % log_every_n_steps == 0
                 
-                offline_loss, wer, _, _ = self.joint(
-                    encoder_outputs=offline_encoded, decoder_outputs=decoder_output,
-                    encoder_lengths=offline_len, transcripts=transcript,
-                    transcript_lengths=transcript_len, compute_wer=compute_wer,
-                )
-                streaming_loss, _, _, _ = self.joint(
-                    encoder_outputs=streaming_encoded, decoder_outputs=decoder_output,
-                    encoder_lengths=streaming_len, transcripts=transcript,
-                    transcript_lengths=transcript_len, compute_wer=False,
-                )
+            #     offline_loss, wer, _, _ = self.joint(
+            #         encoder_outputs=offline_encoded, decoder_outputs=decoder_output,
+            #         encoder_lengths=offline_len, transcripts=transcript,
+            #         transcript_lengths=transcript_len, compute_wer=compute_wer,
+            #     )
+            #     streaming_loss, _, _, _ = self.joint(
+            #         encoder_outputs=streaming_encoded, decoder_outputs=decoder_output,
+            #         encoder_lengths=streaming_len, transcripts=transcript,
+            #         transcript_lengths=transcript_len, compute_wer=False,
+            #     )
                 
-                # logging.warning(f"Offline loss: {offline_loss}, Streaming loss: {streaming_loss}")
-                # logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss}")
+            #     # logging.warning(f"Offline loss: {offline_loss}, Streaming loss: {streaming_loss}")
+            #     # logging.warning(f"Weighted sum: {self.offline_loss_weight * offline_loss + self.streaming_loss_weight * streaming_loss}")
 
-                loss_value = (
-                    self.offline_loss_weight * offline_loss +
-                    self.streaming_loss_weight * streaming_loss
-                )
-                loss_value = self.add_auxiliary_losses(loss_value)
+            #     loss_value = (
+            #         self.offline_loss_weight * offline_loss +
+            #         self.streaming_loss_weight * streaming_loss
+            #     )
+            #     loss_value = self.add_auxiliary_losses(loss_value)
                 
-                if AccessMixin.is_access_enabled(self.model_guid):
-                    AccessMixin.reset_registry(self)
+            #     if AccessMixin.is_access_enabled(self.model_guid):
+            #         AccessMixin.reset_registry(self)
                 
-                tensorboard_logs = {
-                    'train_loss': loss_value,
-                    'train_offline_loss': offline_loss,
-                    'train_streaming_loss': streaming_loss,
-                    'learning_rate': self._optimizer.param_groups[0]['lr'],
-                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-                }
-                if compute_wer:
-                    tensorboard_logs.update({'training_batch_wer': wer})
+            #     tensorboard_logs = {
+            #         'train_loss': loss_value,
+            #         'train_offline_loss': offline_loss,
+            #         'train_streaming_loss': streaming_loss,
+            #         'learning_rate': self._optimizer.param_groups[0]['lr'],
+            #         'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+            #     }
+            #     if compute_wer:
+            #         tensorboard_logs.update({'training_batch_wer': wer})
 
 
         elif self.hybrid_dual_mode:
@@ -1010,11 +1023,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 
                 # Consistency loss
                 if self.consistency_loss is not None and self.trainer.global_step > self.consistency_loss_after_step:
+                    if self.who_is_teacher == "offline":
+                        teacher_logits = offline_joint
+                        student_logits = streaming_joint
+                        teacher_src_lengths = offline_len
+                    else:  # streaming
+                        teacher_logits = streaming_joint
+                        student_logits = offline_joint
+                        teacher_src_lengths = streaming_len
+
                     consistency_loss_value = self.consistency_loss(
-                        teacher_logits=offline_joint,
-                        student_logits=streaming_joint,
+                        teacher_logits=teacher_logits,
+                        student_logits=student_logits,
                         targets=transcript,
-                        src_lengths=offline_len,
+                        src_lengths=teacher_src_lengths,
                         tgt_lengths=target_length,
                     )
                     loss_value += self.consistency_loss_weight * consistency_loss_value
