@@ -142,11 +142,14 @@ class TestRnntJointTriton:
         assert torch.allclose(
             pred_tri.grad, pred_ref.grad, atol=bwd_atol, rtol=bwd_rtol
         ), f"pred grad mismatch: max diff = {(pred_tri.grad - pred_ref.grad).abs().max().item()}"
+        # Weight/bias gradients accumulate over B*T*(U+1) positions → larger TF32 error
+        weight_bwd_atol = 2.0 if float_dtype == torch.bfloat16 else 0.5
+        weight_bwd_rtol = 0.1 if float_dtype == torch.bfloat16 else 0.05
         assert torch.allclose(
-            weight_tri.grad, linear_ref.weight.grad, atol=bwd_atol, rtol=bwd_rtol
+            weight_tri.grad, linear_ref.weight.grad, atol=weight_bwd_atol, rtol=weight_bwd_rtol
         ), f"weight grad mismatch: max diff = {(weight_tri.grad - linear_ref.weight.grad).abs().max().item()}"
         assert torch.allclose(
-            bias_tri.grad, linear_ref.bias.grad, atol=bwd_atol, rtol=bwd_rtol
+            bias_tri.grad, linear_ref.bias.grad, atol=weight_bwd_atol, rtol=weight_bwd_rtol
         ), f"bias grad mismatch: max diff = {(bias_tri.grad - linear_ref.bias.grad).abs().max().item()}"
 
     def test_variable_lengths(self):
@@ -211,6 +214,8 @@ class TestRnntJointTriton:
 
         assert torch.allclose(enc_tri.grad, enc_ref.grad, atol=5e-3, rtol=1e-3)
         assert torch.allclose(pred_tri.grad, pred_ref.grad, atol=5e-3, rtol=1e-3)
+        assert torch.allclose(weight_tri.grad, linear_ref.weight.grad, atol=0.5, rtol=0.05)
+        assert torch.allclose(bias_tri.grad, linear_ref.bias.grad, atol=0.5, rtol=0.05)
 
     def test_edge_case_single_frame(self):
         """Test T=1, U=1 minimal case."""
