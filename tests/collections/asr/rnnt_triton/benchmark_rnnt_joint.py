@@ -101,7 +101,8 @@ def benchmark_standard_joint(
     )
 
     def run_fwd():
-        hidden = torch.relu(enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1))
+        hidden = enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1)
+        hidden.relu_()
         logits = linear(hidden)
         loss = loss_module(log_probs=logits, targets=targets, input_lengths=src_lengths, target_lengths=tgt_lengths)
         return loss
@@ -138,9 +139,10 @@ def benchmark_standard_joint(
     else:
         # Memory: backward (after forward)
         torch.cuda.reset_peak_memory_stats()
+        backward_baseline_memory = torch.cuda.memory_allocated()
         loss.backward()
         torch.cuda.synchronize()
-        backward_peak_memory = torch.cuda.max_memory_allocated() - baseline_memory
+        backward_peak_memory = torch.cuda.max_memory_allocated() - backward_baseline_memory
         del loss
 
         # Max peak memory (combined fwd+bwd)
@@ -289,9 +291,10 @@ def benchmark_triton_joint(
     else:
         # Memory: backward (after forward)
         torch.cuda.reset_peak_memory_stats()
+        backward_baseline_memory = torch.cuda.memory_allocated()
         loss.backward()
         torch.cuda.synchronize()
-        backward_peak_memory = torch.cuda.max_memory_allocated() - baseline_memory
+        backward_peak_memory = torch.cuda.max_memory_allocated() - backward_baseline_memory
         del loss
 
         # Max peak memory (combined fwd+bwd)
@@ -390,7 +393,8 @@ def benchmark_triton_vocab_joint(
     tgt_lengths = torch.full([batch_size], max_targets, device=device, dtype=torch.long)
 
     def run_fwd():
-        joint_hidden = torch.relu(enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1))
+        joint_hidden = enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1)
+        joint_hidden.relu_()
         target_logprobs, blank_logprobs = rnnt_joint_vocab_logprobs_triton(
             joint_hidden=joint_hidden,
             targets=targets,
@@ -440,9 +444,10 @@ def benchmark_triton_vocab_joint(
         max_peak_memory = forward_memory
     else:
         torch.cuda.reset_peak_memory_stats()
+        backward_baseline_memory = torch.cuda.memory_allocated()
         loss.backward()
         torch.cuda.synchronize()
-        backward_peak_memory = torch.cuda.max_memory_allocated() - baseline_memory
+        backward_peak_memory = torch.cuda.max_memory_allocated() - backward_baseline_memory
         del loss
 
         torch.cuda.synchronize()
