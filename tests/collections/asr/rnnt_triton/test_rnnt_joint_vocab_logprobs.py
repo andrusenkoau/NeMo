@@ -122,6 +122,10 @@ class TestRnntJointVocabLogProbsTriton:
         loss_ref.backward()
         loss_tri.backward()
 
+        assert joint_hidden_tri.grad.dtype == float_dtype
+        assert weight_tri.grad.dtype == float_dtype
+        assert bias_tri.grad.dtype == float_dtype
+
         grad_atol = 5e-2 if float_dtype == torch.bfloat16 else 5e-3
         grad_rtol = 5e-2 if float_dtype == torch.bfloat16 else 1e-3
         assert torch.allclose(

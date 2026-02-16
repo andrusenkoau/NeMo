@@ -809,6 +809,9 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
 
         grad_weight = grad_weight_partial.sum(dim=0)
         grad_bias = grad_bias_partial.sum(dim=0)
+        grad_joint_hidden = grad_joint_hidden.to(joint_hidden.dtype)
+        grad_weight = grad_weight.to(weight.dtype)
+        grad_bias = grad_bias.to(bias.dtype)
 
         return grad_joint_hidden, None, None, None, grad_weight, grad_bias, None, None
 
