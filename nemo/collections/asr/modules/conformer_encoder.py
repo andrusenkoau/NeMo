@@ -310,6 +310,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_zero_rc_weight=None,
         skip_att_chunk_rc_prob=0.0,
         dual_mode_training=False,
+        hybrid_dual_mode=False,
+        hybrid_dual_mode_prob=0.15,
         unified_asr_prob=None,
         xscaling=True,
         untie_biases=True,
@@ -341,6 +343,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.att_context_style = att_context_style
         self.skip_att_chunk_rc_prob = skip_att_chunk_rc_prob
         self.dual_mode_training = dual_mode_training
+        self.hybrid_dual_mode = hybrid_dual_mode
+        self.hybrid_dual_mode_prob = hybrid_dual_mode_prob
         self.unified_asr_prob = unified_asr_prob
         self.subsampling_factor = subsampling_factor
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor

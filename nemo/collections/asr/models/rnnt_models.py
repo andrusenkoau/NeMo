@@ -196,6 +196,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.hybrid_dual_mode = self.cfg.encoder.get('hybrid_dual_mode', False)
         self.hybrid_dual_mode_prob = self.cfg.encoder.get('hybrid_dual_mode_prob', 0.15)  # Default 15%
 
+        # check what only one dual mode is active
+        if self.dual_mode_training and self.hybrid_dual_mode:
+            raise ValueError("Only one dual mode can be active at a time: dual_mode_training or hybrid_dual_mode")
+
 
     def setup_optim_normalization(self):
         """
