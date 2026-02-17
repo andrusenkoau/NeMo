@@ -175,9 +175,6 @@ def _rnnt_joint_vocab_fwd_kernel(
 
 @triton.jit
 def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
-    flattened_batch_to_batch_ptr,
-    flattened_batch_to_source_ptr,
-    flattened_batch_to_target_ptr,
     joint_hidden_ptr,
     targets_ptr,
     src_lengths_ptr,
@@ -200,20 +197,16 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
-    flattened_batch_block_index = tl.program_id(axis=0).to(tl.int64)
+    flattened_batch_block_index = tl.program_id(axis=0)
     flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
     flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
     flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
 
-    batch_index = tl.load(
-        flattened_batch_to_batch_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
-    ).to(tl.int64)
-    source_index = tl.load(
-        flattened_batch_to_source_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
-    ).to(tl.int64)
-    target_index = tl.load(
-        flattened_batch_to_target_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
-    ).to(tl.int64)
+    source_target_block_size = max_src_len * max_tgt_len_plus_1
+    batch_index = flattened_batch_offsets // source_target_block_size
+    batch_offsets = flattened_batch_offsets - batch_index * source_target_block_size
+    source_index = batch_offsets // max_tgt_len_plus_1
+    target_index = batch_offsets - source_index * max_tgt_len_plus_1
 
     source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
     target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
@@ -648,10 +641,6 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         forward_num_stages = 1 if use_high_precision else 2
         num_warps = 4
 
-        # device_properties = torch.cuda.get_device_properties(device=device)
-        # flattened_batch_blocks = device_properties.multi_processor_count
-        # FLATTENED_BATCH_BLOCK = triton.next_power_of_2(triton.cdiv(flattened_batch_size, flattened_batch_blocks))
-
         _rnnt_joint_vocab_fwd_kernel[(flattened_batch_blocks,)](
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
@@ -754,9 +743,6 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
 
         _rnnt_joint_vocab_partial_hidden_bwd_kernel[(hidden_bwd_flattened_batch_blocks,)](
-            flattened_batch_to_batch_ptr=flattened_batch_to_batch,
-            flattened_batch_to_source_ptr=flattened_batch_to_source,
-            flattened_batch_to_target_ptr=flattened_batch_to_target,
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
