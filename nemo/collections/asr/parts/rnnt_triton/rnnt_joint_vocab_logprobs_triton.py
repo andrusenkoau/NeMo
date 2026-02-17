@@ -33,7 +33,7 @@ def _rnnt_joint_vocab_fwd_kernel(
     bias_ptr,
     target_logprobs_out_ptr,
     blank_logprobs_out_ptr,
-    lse_out_ptr,
+    log_sum_exp_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
     hidden_dim: tl.constexpr,
@@ -153,7 +153,7 @@ def _rnnt_joint_vocab_fwd_kernel(
         mask=target_store_mask,
     )
     tl.store(
-        lse_out_ptr + indices_grid,
+        log_sum_exp_out_ptr + indices_grid,
         log_sum_exp_score.reshape([SOURCE_BLOCK, TARGET_BLOCK]),
         mask=tile_valid_mask,
     )
@@ -167,7 +167,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     tgt_lengths_ptr,
     weight_ptr,
     bias_ptr,
-    lse_ptr,
+    log_sum_exp_ptr,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
     grad_joint_hidden_out_ptr,
@@ -223,7 +223,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
 
     lse = (
-        tl.load(lse_ptr + indices_grid, mask=tile_valid_mask, other=0.0).reshape([NUM_TILE_ELEMENTS]).to(compute_dtype)
+        tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0).reshape([NUM_TILE_ELEMENTS]).to(compute_dtype)
     )
     grad_target = (
         tl.load(grad_target_scores_ptr + indices_grid, mask=target_store_mask, other=0.0)
@@ -339,7 +339,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     tgt_lengths_ptr,
     weight_ptr,
     bias_ptr,
-    lse_ptr,
+    log_sum_exp_ptr,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
     grad_weight_partial_out_ptr,
@@ -506,7 +506,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
                             logits_acc_1 = tl.dot(hidden_in, weight_vocab_1.T, acc=logits_acc_1).to(compute_dtype)
 
                 lse = (
-                    tl.load(lse_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
+                    tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
                     .reshape([NUM_TILE_ELEMENTS])
                     .to(compute_dtype)
                 )
@@ -645,22 +645,22 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         use_fp64 = joint_hidden.dtype == torch.float64
         float_dtype = torch.float64 if use_fp64 else torch.float32
 
-        joint_hidden = joint_hidden.contiguous()
+        batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim = joint_hidden.shape
+        vocab_size = weight.shape[0]
+        device = joint_hidden.device
+
+        joint_hidden = joint_hidden.contiguous() # .view([-1, hidden_dim])
         targets = targets.contiguous()
         src_lengths = src_lengths.contiguous()
         tgt_lengths = tgt_lengths.contiguous()
         weight = weight.contiguous()
         bias = bias.contiguous()
 
-        batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim = joint_hidden.shape
-        vocab_size = weight.shape[0]
-        device = joint_hidden.device
-
         target_logprobs = torch.zeros(
             [batch_size, src_max_length, tgt_max_length_plus_1], dtype=float_dtype, device=device
         )
         blank_logprobs = torch.zeros_like(target_logprobs)
-        lse = torch.empty_like(target_logprobs)
+        log_sum_exp_scores = torch.empty_like(target_logprobs)
 
         SOURCE_BLOCK = 16
         TARGET_BLOCK = 16
@@ -680,7 +680,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             bias_ptr=bias,
             target_logprobs_out_ptr=target_logprobs,
             blank_logprobs_out_ptr=blank_logprobs,
-            lse_out_ptr=lse,
+            log_sum_exp_out_ptr=log_sum_exp_scores,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             hidden_dim=hidden_dim,
@@ -696,7 +696,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             num_stages=forward_num_stages,
         )
 
-        ctx.save_for_backward(joint_hidden, weight, bias, targets, src_lengths, tgt_lengths, lse)
+        ctx.save_for_backward(joint_hidden, weight, bias, targets, src_lengths, tgt_lengths, log_sum_exp_scores)
         ctx.blank_id = blank_id
         ctx.use_fp64 = use_fp64
         ctx.use_high_precision = use_high_precision
@@ -704,7 +704,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_target_scores, grad_blank_scores):
-        (joint_hidden, weight, bias, targets, src_lengths, tgt_lengths, lse) = ctx.saved_tensors
+        (joint_hidden, weight, bias, targets, src_lengths, tgt_lengths, log_sum_exp_scores) = ctx.saved_tensors
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
         use_high_precision = ctx.use_high_precision
@@ -768,7 +768,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             weight_ptr=weight,
             bias_ptr=bias,
-            lse_ptr=lse,
+            log_sum_exp_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             grad_joint_hidden_out_ptr=grad_joint_hidden,
@@ -802,7 +802,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             weight_ptr=weight,
             bias_ptr=bias,
-            lse_ptr=lse,
+            log_sum_exp_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             grad_weight_partial_out_ptr=grad_weight_partial,
