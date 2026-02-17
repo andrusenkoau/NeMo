@@ -659,12 +659,10 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         log_sum_exp_scores = torch.empty_like(target_logprobs)
 
         FLATTENED_BATCH_BLOCK = 128
-        HIDDEN_BLOCK = 32
+        HIDDEN_BLOCK = 64
         VOCAB_BLOCK = 64
         forward_num_stages = 1 if use_high_precision else 2
 
-        # num_source_blocks = triton.cdiv(src_max_length, SOURCE_BLOCK)
-        # num_target_blocks = triton.cdiv(tgt_max_length_plus_1, TARGET_BLOCK)
         flattened_batch_blocks = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_BLOCK)
         num_warps = 4
 
