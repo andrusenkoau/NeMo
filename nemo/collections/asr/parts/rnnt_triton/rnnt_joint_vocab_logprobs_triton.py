@@ -36,27 +36,29 @@ def _rnnt_joint_vocab_fwd_kernel(
     log_sum_exp_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
+    flattened_batch_size: int,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
-    SOURCE_BLOCK: tl.constexpr,
-    TARGET_BLOCK: tl.constexpr,
+    FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
-    batch_index = tl.program_id(axis=0).to(tl.int64)
-    source_block_index = tl.program_id(axis=1).to(tl.int64)
-    target_block_index = tl.program_id(axis=2).to(tl.int64)
-    source_index_start = source_block_index * SOURCE_BLOCK
-    target_index_start = target_block_index * TARGET_BLOCK
+    flattened_batch_block_index = tl.program_id(axis=0).to(tl.int64)
+    flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
+    flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
+    flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
 
-    source_length = tl.load(src_lengths_ptr + batch_index)
-    target_length = tl.load(tgt_lengths_ptr + batch_index)
+    source_target_block_size = max_src_len * max_tgt_len_plus_1
+    batch_index = flattened_batch_offsets // source_target_block_size
+    batch_offsets = flattened_batch_offsets - batch_index * source_target_block_size
+    source_index = batch_offsets // max_tgt_len_plus_1
+    target_index = batch_offsets - source_index * max_tgt_len_plus_1
 
-    if source_index_start >= source_length or target_index_start > target_length:
-        return
+    source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
+    target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
     matmul_dtype = (
@@ -64,25 +66,25 @@ def _rnnt_joint_vocab_fwd_kernel(
         if USE_HIGH_PRECISION
         else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
     )
-    NUM_TILE_ELEMENTS: tl.constexpr = SOURCE_BLOCK * TARGET_BLOCK
+    source_mask = source_index < source_length
+    target_valid_mask = target_index <= target_length
+    target_label_mask = target_index < target_length
+    output_blank_mask = flattened_batch_valid_mask & source_mask & target_valid_mask
+    output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
 
-    source_offsets = source_index_start + tl.arange(0, SOURCE_BLOCK)
-    target_offsets = target_index_start + tl.arange(0, TARGET_BLOCK)
-    source_mask = source_offsets < source_length
-    target_valid_mask = target_offsets <= target_length
-    target_label_mask = target_offsets < target_length
-
-    batch_hidden_base = batch_index * max_src_len * max_tgt_len_plus_1 * hidden_dim
     vocab_offsets_in_block = tl.arange(0, VOCAB_BLOCK)
     hidden_offsets = tl.arange(0, HIDDEN_BLOCK)
 
-    log_sum_exp_score = tl.full([NUM_TILE_ELEMENTS], value=float("-inf"), dtype=compute_dtype)
-    blank_logits = tl.zeros([NUM_TILE_ELEMENTS], dtype=compute_dtype)
-    target_logits = tl.zeros([NUM_TILE_ELEMENTS], dtype=compute_dtype)
+    log_sum_exp_score = tl.full([FLATTENED_BATCH_BLOCK], value=float("-inf"), dtype=compute_dtype)
+    blank_logits = tl.zeros([FLATTENED_BATCH_BLOCK], dtype=compute_dtype)
+    target_logits = tl.zeros([FLATTENED_BATCH_BLOCK], dtype=compute_dtype)
 
     max_target_len = max_tgt_len_plus_1 - 1
-    targets = tl.load(targets_ptr + batch_index * max_target_len + target_offsets, mask=target_label_mask, other=0)
-    targets_expanded = targets[None, :].broadcast_to([SOURCE_BLOCK, TARGET_BLOCK]).reshape([NUM_TILE_ELEMENTS])
+    targets = tl.load(
+        targets_ptr + batch_index * max_target_len + target_index,
+        mask=flattened_batch_valid_mask & target_label_mask,
+        other=0,
+    )
 
     for vocab_start_i32 in tl.range(0, vocab_size, VOCAB_BLOCK):
         vocab_start = vocab_start_i32.to(tl.int64)
@@ -90,25 +92,22 @@ def _rnnt_joint_vocab_fwd_kernel(
         vocab_mask = vocab_offsets < vocab_size
         bias_chunk = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
 
-        logits_acc = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
+        logits_acc = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
         for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             hidden_start = hidden_start_i32.to(tl.int64)
             hidden_mask = (hidden_start + hidden_offsets) < hidden_dim
 
             hidden_ptrs = (
                 joint_hidden_ptr
-                + batch_hidden_base
-                + source_offsets[:, None, None] * max_tgt_len_plus_1 * hidden_dim
-                + target_offsets[None, :, None] * hidden_dim
+                + flattened_batch_offsets[:, None] * hidden_dim
                 + hidden_start
-                + hidden_offsets[None, None, :]
+                + hidden_offsets[None, :]
             )
             hidden_chunk = tl.load(
                 hidden_ptrs,
-                mask=source_mask[:, None, None] & target_valid_mask[None, :, None] & hidden_mask[None, None, :],
+                mask=output_blank_mask[:, None] & hidden_mask[None, :],
                 other=0.0,
             ).to(matmul_dtype)
-            hidden_chunk = hidden_chunk.reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
 
             weight_chunk = tl.load(
                 weight_ptr + vocab_offsets[:, None] * hidden_dim + hidden_start + hidden_offsets[None, :],
@@ -133,29 +132,23 @@ def _rnnt_joint_vocab_fwd_kernel(
         log_sum_exp_score = _log_add_exp(log_sum_exp_score, block_lse)
 
         blank_logits += tl.sum(tl.where((vocab_offsets == blank_id)[None, :], block_logits, 0.0), axis=-1)
-        target_logits += tl.sum(
-            tl.where(vocab_offsets[None, :] == targets_expanded[:, None], block_logits, 0.0), axis=-1
-        )
-
-    indices_grid = (batch_index * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
-    tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
+        target_logits += tl.sum(tl.where(vocab_offsets[None, :] == targets[:, None], block_logits, 0.0), axis=-1)
 
     tl.store(
-        blank_logprobs_out_ptr + indices_grid,
-        (blank_logits - log_sum_exp_score).reshape([SOURCE_BLOCK, TARGET_BLOCK]),
-        mask=tile_valid_mask,
+        blank_logprobs_out_ptr + flattened_batch_offsets,
+        blank_logits - log_sum_exp_score,
+        mask=output_blank_mask,
     )
 
-    target_store_mask = source_mask[:, None] & target_label_mask[None, :]
     tl.store(
-        target_logprobs_out_ptr + indices_grid,
-        (target_logits - log_sum_exp_score).reshape([SOURCE_BLOCK, TARGET_BLOCK]),
-        mask=target_store_mask,
+        target_logprobs_out_ptr + flattened_batch_offsets,
+        target_logits - log_sum_exp_score,
+        mask=output_target_mask,
     )
     tl.store(
-        log_sum_exp_out_ptr + indices_grid,
-        log_sum_exp_score.reshape([SOURCE_BLOCK, TARGET_BLOCK]),
-        mask=tile_valid_mask,
+        log_sum_exp_out_ptr + flattened_batch_offsets,
+        log_sum_exp_score,
+        mask=output_blank_mask,
     )
 
 
@@ -223,7 +216,9 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
 
     lse = (
-        tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0).reshape([NUM_TILE_ELEMENTS]).to(compute_dtype)
+        tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
+        .reshape([NUM_TILE_ELEMENTS])
+        .to(compute_dtype)
     )
     grad_target = (
         tl.load(grad_target_scores_ptr + indices_grid, mask=target_store_mask, other=0.0)
@@ -646,10 +641,11 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         float_dtype = torch.float64 if use_fp64 else torch.float32
 
         batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim = joint_hidden.shape
+        flattened_batch_size = batch_size * src_max_length * tgt_max_length_plus_1
         vocab_size = weight.shape[0]
         device = joint_hidden.device
 
-        joint_hidden = joint_hidden.contiguous() # .view([-1, hidden_dim])
+        joint_hidden = joint_hidden.contiguous()
         targets = targets.contiguous()
         src_lengths = src_lengths.contiguous()
         tgt_lengths = tgt_lengths.contiguous()
@@ -662,16 +658,17 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         blank_logprobs = torch.zeros_like(target_logprobs)
         log_sum_exp_scores = torch.empty_like(target_logprobs)
 
-        SOURCE_BLOCK = 16
-        TARGET_BLOCK = 16
+        FLATTENED_BATCH_BLOCK = 128
         HIDDEN_BLOCK = 32
         VOCAB_BLOCK = 64
         forward_num_stages = 1 if use_high_precision else 2
 
-        num_source_blocks = triton.cdiv(src_max_length, SOURCE_BLOCK)
-        num_target_blocks = triton.cdiv(tgt_max_length_plus_1, TARGET_BLOCK)
+        # num_source_blocks = triton.cdiv(src_max_length, SOURCE_BLOCK)
+        # num_target_blocks = triton.cdiv(tgt_max_length_plus_1, TARGET_BLOCK)
+        flattened_batch_blocks = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_BLOCK)
+        num_warps = 4
 
-        _rnnt_joint_vocab_fwd_kernel[(batch_size, num_source_blocks, num_target_blocks)](
+        _rnnt_joint_vocab_fwd_kernel[(flattened_batch_blocks,)](
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
@@ -683,16 +680,16 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             log_sum_exp_out_ptr=log_sum_exp_scores,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
+            flattened_batch_size=flattened_batch_size,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            SOURCE_BLOCK=SOURCE_BLOCK,
-            TARGET_BLOCK=TARGET_BLOCK,
+            FLATTENED_BATCH_BLOCK=FLATTENED_BATCH_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
-            num_warps=4,
+            num_warps=num_warps,
             num_stages=forward_num_stages,
         )
 
@@ -719,7 +716,9 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
 
         device_properties = torch.cuda.get_device_properties(device)
         partial_weight_element_size = 8 if float_dtype == torch.float64 else 4
-        bytes_per_split = vocab_size * hidden_dim * partial_weight_element_size + vocab_size * partial_weight_element_size
+        bytes_per_split = (
+            vocab_size * hidden_dim * partial_weight_element_size + vocab_size * partial_weight_element_size
+        )
         max_splits_by_memory = max(1, int((device_properties.total_memory // 8) // bytes_per_split))
 
         source_block_size = 8
