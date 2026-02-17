@@ -288,14 +288,14 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         grad_logits = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits, 0.0)
 
         grad_logits_matmul = grad_logits.to(matmul_dtype)
-        for hidden_out_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            hidden_out_start = hidden_out_start_i32.to(tl.int64)
-            hidden_out_offsets = hidden_out_start + hidden_offsets
-            hidden_out_mask = hidden_out_offsets < hidden_dim
+        for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            hidden_start = hidden_start_i32.to(tl.int64)
+            hidden_out_offsets = hidden_start + hidden_offsets
+            hidden_mask = hidden_out_offsets < hidden_dim
 
             weight_hidden_out = tl.load(
                 weight_ptr + vocab_offsets[:, None] * hidden_dim + hidden_out_offsets[None, :],
-                mask=vocab_mask[:, None] & hidden_out_mask[None, :],
+                mask=vocab_mask[:, None] & hidden_mask[None, :],
                 other=0.0,
             ).to(matmul_dtype)
 
@@ -313,7 +313,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             grad_hidden_ptrs = (
                 grad_joint_hidden_out_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_out_offsets[None, :]
             )
-            grad_hidden_mask = output_blank_mask[:, None] & hidden_out_mask[None, :]
+            grad_hidden_mask = output_blank_mask[:, None] & hidden_mask[None, :]
 
             old_grad_hidden = tl.load(grad_hidden_ptrs, mask=grad_hidden_mask, other=0.0).to(compute_dtype)
             tl.store(
