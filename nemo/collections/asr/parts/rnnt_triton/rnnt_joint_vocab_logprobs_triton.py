@@ -248,7 +248,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         vocab_mask = vocab_offsets < vocab_size
 
         bias_chunk = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
-        logits_acc = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
+        block_logits = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
 
         for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             hidden_start = hidden_start_i32.to(tl.int64)
@@ -273,20 +273,16 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             ).to(matmul_dtype)
 
             if USE_FP64:
-                logits_acc += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
+                block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                logits_acc = tl.dot(hidden_chunk, weight_chunk.T, acc=logits_acc, input_precision="ieee").to(
+                block_logits = tl.dot(hidden_chunk, weight_chunk.T, acc=block_logits, input_precision="ieee").to(
                     compute_dtype
                 )
             else:
-                logits_acc = tl.dot(hidden_chunk, weight_chunk.T, acc=logits_acc).to(compute_dtype)
+                block_logits = tl.dot(hidden_chunk, weight_chunk.T, acc=block_logits).to(compute_dtype)
 
-        block_logits = logits_acc + bias_chunk[None, :]
-        block_logits = tl.where(vocab_mask[None, :], block_logits, -float("inf"))
-        logits_minus_lse = tl.minimum(block_logits - lse[:, None], 0.0)
-        softmax = tl.exp(logits_minus_lse)
+        softmax = tl.exp(tl.where(vocab_mask[None, :], block_logits - lse[:, None], 0.0))
         grad_logits = -softmax * sum_grad[:, None]
-
         grad_logits += tl.where(vocab_offsets[None, :] == targets[:, None], grad_target[:, None], 0.0)
         grad_logits += tl.where((vocab_offsets == blank_id)[None, :], grad_blank[:, None], 0.0)
         grad_logits = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits, 0.0)
