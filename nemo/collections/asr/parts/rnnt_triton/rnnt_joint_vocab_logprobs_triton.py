@@ -17,6 +17,27 @@ import triton
 import triton.language as tl
 
 
+def _build_flattened_batch_indices(
+    device: torch.device,
+    batch_size: int,
+    src_max_length: int,
+    tgt_max_length_plus_1: int,
+):
+    flattened_batch_size = batch_size * src_max_length * tgt_max_length_plus_1
+    flattened_batch_offsets = torch.arange(flattened_batch_size, device=device, dtype=torch.int64)
+    source_target_block_size = src_max_length * tgt_max_length_plus_1
+    batch_indices = torch.div(flattened_batch_offsets, source_target_block_size, rounding_mode="floor")
+    batch_offsets = flattened_batch_offsets - batch_indices * source_target_block_size
+    source_indices = torch.div(batch_offsets, tgt_max_length_plus_1, rounding_mode="floor")
+    target_indices = batch_offsets - source_indices * tgt_max_length_plus_1
+
+    return (
+        batch_indices.to(torch.int32),
+        source_indices.to(torch.int32),
+        target_indices.to(torch.int32),
+    )
+
+
 @triton.jit
 def _log_add_exp(log_probs_1, log_probs_2):
     max_score = tl.maximum(log_probs_1, log_probs_2)
@@ -154,6 +175,9 @@ def _rnnt_joint_vocab_fwd_kernel(
 
 @triton.jit
 def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
+    flattened_batch_to_batch_ptr,
+    flattened_batch_to_source_ptr,
+    flattened_batch_to_target_ptr,
     joint_hidden_ptr,
     targets_ptr,
     src_lengths_ptr,
@@ -166,27 +190,33 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     grad_joint_hidden_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
+    flattened_batch_size: int,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
-    SOURCE_BLOCK: tl.constexpr,
-    TARGET_BLOCK: tl.constexpr,
+    FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
-    batch_index = tl.program_id(axis=0).to(tl.int64)
-    source_block_index = tl.program_id(axis=1).to(tl.int64)
-    target_block_index = tl.program_id(axis=2).to(tl.int64)
-    source_index_start = source_block_index * SOURCE_BLOCK
-    target_index_start = target_block_index * TARGET_BLOCK
+    flattened_batch_block_index = tl.program_id(axis=0).to(tl.int64)
+    flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
+    flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
+    flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
 
-    source_length = tl.load(src_lengths_ptr + batch_index)
-    target_length = tl.load(tgt_lengths_ptr + batch_index)
+    batch_index = tl.load(
+        flattened_batch_to_batch_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
+    ).to(tl.int64)
+    source_index = tl.load(
+        flattened_batch_to_source_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
+    ).to(tl.int64)
+    target_index = tl.load(
+        flattened_batch_to_target_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
+    ).to(tl.int64)
 
-    if source_index_start >= source_length or target_index_start > target_length:
-        return
+    source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
+    target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
     matmul_dtype = (
@@ -194,41 +224,28 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         if USE_HIGH_PRECISION
         else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
     )
-    NUM_TILE_ELEMENTS: tl.constexpr = SOURCE_BLOCK * TARGET_BLOCK
-
-    source_offsets = source_index_start + tl.arange(0, SOURCE_BLOCK)
-    target_offsets = target_index_start + tl.arange(0, TARGET_BLOCK)
-    source_mask = source_offsets < source_length
-    target_valid_mask = target_offsets <= target_length
-    target_label_mask = target_offsets < target_length
+    source_mask = source_index < source_length
+    target_valid_mask = target_index <= target_length
+    target_label_mask = target_index < target_length
+    output_blank_mask = flattened_batch_valid_mask & source_mask & target_valid_mask
+    output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
 
     vocab_offsets_in_block = tl.arange(0, VOCAB_BLOCK)
     hidden_offsets = tl.arange(0, HIDDEN_BLOCK)
-    batch_hidden_base = batch_index * max_src_len * max_tgt_len_plus_1 * hidden_dim
 
     max_target_len = max_tgt_len_plus_1 - 1
-    targets = tl.load(targets_ptr + batch_index * max_target_len + target_offsets, mask=target_label_mask, other=0)
-    targets_expanded = targets[None, :].broadcast_to([SOURCE_BLOCK, TARGET_BLOCK]).reshape([NUM_TILE_ELEMENTS])
-
-    indices_grid = (batch_index * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
-    tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
-    target_store_mask = source_mask[:, None] & target_label_mask[None, :]
-    tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
-
-    lse = (
-        tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
-        .reshape([NUM_TILE_ELEMENTS])
-        .to(compute_dtype)
+    targets = tl.load(
+        targets_ptr + batch_index * max_target_len + target_index,
+        mask=output_target_mask,
+        other=0,
     )
-    grad_target = (
-        tl.load(grad_target_scores_ptr + indices_grid, mask=target_store_mask, other=0.0)
-        .reshape([NUM_TILE_ELEMENTS])
-        .to(compute_dtype)
+
+    lse = tl.load(log_sum_exp_ptr + flattened_batch_offsets, mask=output_blank_mask, other=0.0).to(compute_dtype)
+    grad_target = tl.load(grad_target_scores_ptr + flattened_batch_offsets, mask=output_target_mask, other=0.0).to(
+        compute_dtype
     )
-    grad_blank = (
-        tl.load(grad_blank_scores_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
-        .reshape([NUM_TILE_ELEMENTS])
-        .to(compute_dtype)
+    grad_blank = tl.load(grad_blank_scores_ptr + flattened_batch_offsets, mask=output_blank_mask, other=0.0).to(
+        compute_dtype
     )
     sum_grad = grad_target + grad_blank
 
@@ -238,7 +255,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         vocab_mask = vocab_offsets < vocab_size
 
         bias_chunk = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
-        logits_acc = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
+        logits_acc = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
 
         for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             hidden_start = hidden_start_i32.to(tl.int64)
@@ -246,18 +263,15 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
 
             hidden_ptrs = (
                 joint_hidden_ptr
-                + batch_hidden_base
-                + source_offsets[:, None, None] * max_tgt_len_plus_1 * hidden_dim
-                + target_offsets[None, :, None] * hidden_dim
+                + flattened_batch_offsets[:, None] * hidden_dim
                 + hidden_start
-                + hidden_offsets[None, None, :]
+                + hidden_offsets[None, :]
             )
             hidden_chunk = tl.load(
                 hidden_ptrs,
-                mask=source_mask[:, None, None] & target_valid_mask[None, :, None] & hidden_mask[None, None, :],
+                mask=output_blank_mask[:, None] & hidden_mask[None, :],
                 other=0.0,
             ).to(matmul_dtype)
-            hidden_chunk = hidden_chunk.reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
 
             weight_chunk = tl.load(
                 weight_ptr + vocab_offsets[:, None] * hidden_dim + hidden_start + hidden_offsets[None, :],
@@ -280,9 +294,9 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         softmax = tl.exp(logits_minus_lse)
         grad_logits = -softmax * sum_grad[:, None]
 
-        grad_logits += tl.where(vocab_offsets[None, :] == targets_expanded[:, None], grad_target[:, None], 0.0)
+        grad_logits += tl.where(vocab_offsets[None, :] == targets[:, None], grad_target[:, None], 0.0)
         grad_logits += tl.where((vocab_offsets == blank_id)[None, :], grad_blank[:, None], 0.0)
-        grad_logits = tl.where(tile_flat_mask[:, None] & vocab_mask[None, :], grad_logits, 0.0)
+        grad_logits = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits, 0.0)
 
         grad_logits_matmul = grad_logits.to(matmul_dtype)
         for hidden_out_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
@@ -308,26 +322,23 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
                 grad_hidden_delta = tl.dot(grad_logits_matmul, weight_hidden_out).to(compute_dtype)
 
             grad_hidden_ptrs = (
-                grad_joint_hidden_out_ptr
-                + batch_hidden_base
-                + source_offsets[:, None, None] * max_tgt_len_plus_1 * hidden_dim
-                + target_offsets[None, :, None] * hidden_dim
-                + hidden_out_offsets[None, None, :]
+                grad_joint_hidden_out_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_out_offsets[None, :]
             )
-            grad_hidden_mask = (
-                source_mask[:, None, None] & target_valid_mask[None, :, None] & hidden_out_mask[None, None, :]
-            )
+            grad_hidden_mask = output_blank_mask[:, None] & hidden_out_mask[None, :]
 
             old_grad_hidden = tl.load(grad_hidden_ptrs, mask=grad_hidden_mask, other=0.0).to(compute_dtype)
             tl.store(
                 grad_hidden_ptrs,
-                old_grad_hidden + grad_hidden_delta.reshape([SOURCE_BLOCK, TARGET_BLOCK, HIDDEN_BLOCK]),
+                old_grad_hidden + grad_hidden_delta,
                 mask=grad_hidden_mask,
             )
 
 
 @triton.jit
 def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
+    flattened_batch_to_batch_ptr,
+    flattened_batch_to_source_ptr,
+    flattened_batch_to_target_ptr,
     joint_hidden_ptr,
     targets_ptr,
     src_lengths_ptr,
@@ -341,14 +352,11 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     grad_bias_partial_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
+    flattened_batch_size: int,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
-    num_source_blocks: int,
-    num_target_blocks: int,
-    total_tiles: int,
-    SOURCE_BLOCK: tl.constexpr,
-    TARGET_BLOCK: tl.constexpr,
+    FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     D_BLOCKS_PER_PROGRAM: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
@@ -386,7 +394,6 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         if USE_HIGH_PRECISION
         else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
     )
-    NUM_TILE_ELEMENTS: tl.constexpr = SOURCE_BLOCK * TARGET_BLOCK
 
     grad_weight_acc_0 = tl.zeros([D_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
     grad_bias_acc_0 = tl.zeros([VOCAB_BLOCK], dtype=compute_dtype)
@@ -396,199 +403,175 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
 
     is_first_d_program = d_program_index == 0
 
-    tiles_per_split = (total_tiles + num_splits - 1) // num_splits
-    tile_start = split_index * tiles_per_split
+    total_flattened_blocks = (flattened_batch_size + FLATTENED_BATCH_BLOCK - 1) // FLATTENED_BATCH_BLOCK
+    blocks_per_split = (total_flattened_blocks + num_splits - 1) // num_splits
+    block_start = split_index * blocks_per_split
 
     bias_chunk_0 = tl.load(bias_ptr + vocab_offsets_0, mask=vocab_mask_0, other=0.0).to(compute_dtype)
     if V_BLOCKS_PER_PROGRAM > 1:
         bias_chunk_1 = tl.load(bias_ptr + vocab_offsets_1, mask=vocab_mask_1, other=0.0).to(compute_dtype)
 
     hidden_offsets = tl.arange(0, HIDDEN_BLOCK)
-    for tile_offset_i32 in tl.range(0, tiles_per_split):
-        tile_index = tile_start + tile_offset_i32.to(tl.int64)
-        if tile_index < total_tiles:
-            target_block_index = tile_index % num_target_blocks
-            source_block_linear = tile_index // num_target_blocks
-            source_block_index = source_block_linear % num_source_blocks
-            batch_index = source_block_linear // num_source_blocks
+    for block_offset_i32 in tl.range(0, blocks_per_split):
+        flattened_batch_block_index = block_start + block_offset_i32.to(tl.int64)
+        if flattened_batch_block_index < total_flattened_blocks:
+            flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
+            flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
+            flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
 
-            source_index_start = source_block_index * SOURCE_BLOCK
-            target_index_start = target_block_index * TARGET_BLOCK
-            source_length = tl.load(src_lengths_ptr + batch_index)
-            target_length = tl.load(tgt_lengths_ptr + batch_index)
+            batch_index = tl.load(
+                flattened_batch_to_batch_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
+            ).to(tl.int64)
+            source_index = tl.load(
+                flattened_batch_to_source_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
+            ).to(tl.int64)
+            target_index = tl.load(
+                flattened_batch_to_target_ptr + flattened_batch_offsets, mask=flattened_batch_valid_mask, other=0
+            ).to(tl.int64)
 
-            if source_index_start < source_length and target_index_start <= target_length:
-                source_offsets = source_index_start + tl.arange(0, SOURCE_BLOCK)
-                target_offsets = target_index_start + tl.arange(0, TARGET_BLOCK)
-                source_mask = source_offsets < source_length
-                target_valid_mask = target_offsets <= target_length
-                target_label_mask = target_offsets < target_length
+            source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
+            target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
 
-                max_target_len = max_tgt_len_plus_1 - 1
-                targets = tl.load(
-                    targets_ptr + batch_index * max_target_len + target_offsets, mask=target_label_mask, other=0
+            source_mask = source_index < source_length
+            target_valid_mask = target_index <= target_length
+            target_label_mask = target_index < target_length
+            output_blank_mask = flattened_batch_valid_mask & source_mask & target_valid_mask
+            output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
+
+            max_target_len = max_tgt_len_plus_1 - 1
+            targets = tl.load(
+                targets_ptr + batch_index * max_target_len + target_index,
+                mask=output_target_mask,
+                other=0,
+            )
+
+            logits_acc_0 = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
+            if V_BLOCKS_PER_PROGRAM > 1:
+                logits_acc_1 = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype)
+
+            for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+                hidden_start = hidden_start_i32.to(tl.int64)
+                hidden_mask = (hidden_start + hidden_offsets) < hidden_dim
+
+                hidden_ptrs = (
+                    joint_hidden_ptr
+                    + flattened_batch_offsets[:, None] * hidden_dim
+                    + hidden_start
+                    + hidden_offsets[None, :]
                 )
-                targets_expanded = (
-                    targets[None, :].broadcast_to([SOURCE_BLOCK, TARGET_BLOCK]).reshape([NUM_TILE_ELEMENTS])
-                )
+                hidden_in = tl.load(
+                    hidden_ptrs,
+                    mask=output_blank_mask[:, None] & hidden_mask[None, :],
+                    other=0.0,
+                ).to(matmul_dtype)
 
-                indices_grid = (
-                    batch_index * max_src_len + source_offsets[:, None]
-                ) * max_tgt_len_plus_1 + target_offsets[None, :]
-                tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
-                target_store_mask = source_mask[:, None] & target_label_mask[None, :]
-                tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
+                weight_vocab_0 = tl.load(
+                    weight_ptr + vocab_offsets_0[:, None] * hidden_dim + hidden_start + hidden_offsets[None, :],
+                    mask=vocab_mask_0[:, None] & hidden_mask[None, :],
+                    other=0.0,
+                ).to(matmul_dtype)
 
-                batch_hidden_base = batch_index * max_src_len * max_tgt_len_plus_1 * hidden_dim
-
-                logits_acc_0 = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
-                if V_BLOCKS_PER_PROGRAM > 1:
-                    logits_acc_1 = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype)
-
-                for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-                    hidden_start = hidden_start_i32.to(tl.int64)
-                    hidden_mask = (hidden_start + hidden_offsets) < hidden_dim
-
-                    hidden_ptrs = (
-                        joint_hidden_ptr
-                        + batch_hidden_base
-                        + source_offsets[:, None, None] * max_tgt_len_plus_1 * hidden_dim
-                        + target_offsets[None, :, None] * hidden_dim
-                        + hidden_start
-                        + hidden_offsets[None, None, :]
+                if USE_FP64:
+                    logits_acc_0 += tl.sum(hidden_in[:, None, :] * weight_vocab_0[None, :, :], axis=-1)
+                elif USE_HIGH_PRECISION:
+                    logits_acc_0 = tl.dot(hidden_in, weight_vocab_0.T, acc=logits_acc_0, input_precision="ieee").to(
+                        compute_dtype
                     )
-                    hidden_in = tl.load(
-                        hidden_ptrs,
-                        mask=source_mask[:, None, None]
-                        & target_valid_mask[None, :, None]
-                        & hidden_mask[None, None, :],
-                        other=0.0,
-                    ).to(matmul_dtype)
-                    hidden_in = hidden_in.reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
+                else:
+                    logits_acc_0 = tl.dot(hidden_in, weight_vocab_0.T, acc=logits_acc_0).to(compute_dtype)
 
-                    weight_vocab_0 = tl.load(
-                        weight_ptr + vocab_offsets_0[:, None] * hidden_dim + hidden_start + hidden_offsets[None, :],
-                        mask=vocab_mask_0[:, None] & hidden_mask[None, :],
+                if V_BLOCKS_PER_PROGRAM > 1:
+                    weight_vocab_1 = tl.load(
+                        weight_ptr + vocab_offsets_1[:, None] * hidden_dim + hidden_start + hidden_offsets[None, :],
+                        mask=vocab_mask_1[:, None] & hidden_mask[None, :],
                         other=0.0,
                     ).to(matmul_dtype)
 
                     if USE_FP64:
-                        logits_acc_0 += tl.sum(hidden_in[:, None, :] * weight_vocab_0[None, :, :], axis=-1)
+                        logits_acc_1 += tl.sum(hidden_in[:, None, :] * weight_vocab_1[None, :, :], axis=-1)
                     elif USE_HIGH_PRECISION:
-                        logits_acc_0 = tl.dot(
-                            hidden_in, weight_vocab_0.T, acc=logits_acc_0, input_precision="ieee"
+                        logits_acc_1 = tl.dot(
+                            hidden_in, weight_vocab_1.T, acc=logits_acc_1, input_precision="ieee"
                         ).to(compute_dtype)
                     else:
-                        logits_acc_0 = tl.dot(hidden_in, weight_vocab_0.T, acc=logits_acc_0).to(compute_dtype)
+                        logits_acc_1 = tl.dot(hidden_in, weight_vocab_1.T, acc=logits_acc_1).to(compute_dtype)
 
-                    if V_BLOCKS_PER_PROGRAM > 1:
-                        weight_vocab_1 = tl.load(
-                            weight_ptr
-                            + vocab_offsets_1[:, None] * hidden_dim
-                            + hidden_start
-                            + hidden_offsets[None, :],
-                            mask=vocab_mask_1[:, None] & hidden_mask[None, :],
-                            other=0.0,
-                        ).to(matmul_dtype)
+            lse = tl.load(log_sum_exp_ptr + flattened_batch_offsets, mask=output_blank_mask, other=0.0).to(
+                compute_dtype
+            )
+            grad_target = tl.load(
+                grad_target_scores_ptr + flattened_batch_offsets,
+                mask=output_target_mask,
+                other=0.0,
+            ).to(compute_dtype)
+            grad_blank = tl.load(
+                grad_blank_scores_ptr + flattened_batch_offsets,
+                mask=output_blank_mask,
+                other=0.0,
+            ).to(compute_dtype)
+            sum_grad = grad_target + grad_blank
 
-                        if USE_FP64:
-                            logits_acc_1 += tl.sum(hidden_in[:, None, :] * weight_vocab_1[None, :, :], axis=-1)
-                        elif USE_HIGH_PRECISION:
-                            logits_acc_1 = tl.dot(
-                                hidden_in, weight_vocab_1.T, acc=logits_acc_1, input_precision="ieee"
-                            ).to(compute_dtype)
-                        else:
-                            logits_acc_1 = tl.dot(hidden_in, weight_vocab_1.T, acc=logits_acc_1).to(compute_dtype)
+            block_logits_0 = logits_acc_0 + bias_chunk_0[None, :]
+            block_logits_0 = tl.where(vocab_mask_0[None, :], block_logits_0, -float("inf"))
+            logits_minus_lse_0 = tl.minimum(block_logits_0 - lse[:, None], 0.0)
+            softmax_0 = tl.exp(logits_minus_lse_0)
+            grad_logits_0 = -softmax_0 * sum_grad[:, None]
+            grad_logits_0 += tl.where(vocab_offsets_0[None, :] == targets[:, None], grad_target[:, None], 0.0)
+            grad_logits_0 += tl.where((vocab_offsets_0 == blank_id)[None, :], grad_blank[:, None], 0.0)
+            grad_logits_0 = tl.where(output_blank_mask[:, None] & vocab_mask_0[None, :], grad_logits_0, 0.0)
 
-                lse = (
-                    tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
-                    .reshape([NUM_TILE_ELEMENTS])
-                    .to(compute_dtype)
+            if V_BLOCKS_PER_PROGRAM > 1:
+                block_logits_1 = logits_acc_1 + bias_chunk_1[None, :]
+                block_logits_1 = tl.where(vocab_mask_1[None, :], block_logits_1, -float("inf"))
+                logits_minus_lse_1 = tl.minimum(block_logits_1 - lse[:, None], 0.0)
+                softmax_1 = tl.exp(logits_minus_lse_1)
+                grad_logits_1 = -softmax_1 * sum_grad[:, None]
+                grad_logits_1 += tl.where(vocab_offsets_1[None, :] == targets[:, None], grad_target[:, None], 0.0)
+                grad_logits_1 += tl.where((vocab_offsets_1 == blank_id)[None, :], grad_blank[:, None], 0.0)
+                grad_logits_1 = tl.where(output_blank_mask[:, None] & vocab_mask_1[None, :], grad_logits_1, 0.0)
+
+            hidden_slice_ptrs = (
+                joint_hidden_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_slice_offsets[None, :]
+            )
+            hidden_slice = tl.load(
+                hidden_slice_ptrs,
+                mask=output_blank_mask[:, None] & hidden_slice_mask[None, :],
+                other=0.0,
+            ).to(matmul_dtype)
+
+            grad_logits_0_matmul = grad_logits_0.to(matmul_dtype)
+            if USE_FP64:
+                grad_weight_acc_0 += tl.sum(hidden_slice[:, :, None] * grad_logits_0_matmul[:, None, :], axis=0).to(
+                    compute_dtype
                 )
-                grad_target = (
-                    tl.load(grad_target_scores_ptr + indices_grid, mask=target_store_mask, other=0.0)
-                    .reshape([NUM_TILE_ELEMENTS])
-                    .to(compute_dtype)
+            elif USE_HIGH_PRECISION:
+                grad_weight_acc_0 = tl.dot(
+                    hidden_slice.T, grad_logits_0_matmul, acc=grad_weight_acc_0, input_precision="ieee"
+                ).to(compute_dtype)
+            else:
+                grad_weight_acc_0 = tl.dot(hidden_slice.T, grad_logits_0_matmul, acc=grad_weight_acc_0).to(
+                    compute_dtype
                 )
-                grad_blank = (
-                    tl.load(grad_blank_scores_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
-                    .reshape([NUM_TILE_ELEMENTS])
-                    .to(compute_dtype)
-                )
-                sum_grad = grad_target + grad_blank
 
-                block_logits_0 = logits_acc_0 + bias_chunk_0[None, :]
-                block_logits_0 = tl.where(vocab_mask_0[None, :], block_logits_0, -float("inf"))
-                logits_minus_lse_0 = tl.minimum(block_logits_0 - lse[:, None], 0.0)
-                softmax_0 = tl.exp(logits_minus_lse_0)
-                grad_logits_0 = -softmax_0 * sum_grad[:, None]
-                grad_logits_0 += tl.where(
-                    vocab_offsets_0[None, :] == targets_expanded[:, None], grad_target[:, None], 0.0
-                )
-                grad_logits_0 += tl.where((vocab_offsets_0 == blank_id)[None, :], grad_blank[:, None], 0.0)
-                grad_logits_0 = tl.where(tile_flat_mask[:, None] & vocab_mask_0[None, :], grad_logits_0, 0.0)
-
-                if V_BLOCKS_PER_PROGRAM > 1:
-                    block_logits_1 = logits_acc_1 + bias_chunk_1[None, :]
-                    block_logits_1 = tl.where(vocab_mask_1[None, :], block_logits_1, -float("inf"))
-                    logits_minus_lse_1 = tl.minimum(block_logits_1 - lse[:, None], 0.0)
-                    softmax_1 = tl.exp(logits_minus_lse_1)
-                    grad_logits_1 = -softmax_1 * sum_grad[:, None]
-                    grad_logits_1 += tl.where(
-                        vocab_offsets_1[None, :] == targets_expanded[:, None], grad_target[:, None], 0.0
-                    )
-                    grad_logits_1 += tl.where((vocab_offsets_1 == blank_id)[None, :], grad_blank[:, None], 0.0)
-                    grad_logits_1 = tl.where(tile_flat_mask[:, None] & vocab_mask_1[None, :], grad_logits_1, 0.0)
-
-                hidden_slice_ptrs = (
-                    joint_hidden_ptr
-                    + batch_hidden_base
-                    + source_offsets[:, None, None] * max_tgt_len_plus_1 * hidden_dim
-                    + target_offsets[None, :, None] * hidden_dim
-                    + hidden_slice_offsets[None, None, :]
-                )
-                hidden_slice = tl.load(
-                    hidden_slice_ptrs,
-                    mask=source_mask[:, None, None]
-                    & target_valid_mask[None, :, None]
-                    & hidden_slice_mask[None, None, :],
-                    other=0.0,
-                ).to(matmul_dtype)
-                hidden_slice = hidden_slice.reshape([NUM_TILE_ELEMENTS, D_BLOCK])
-
-                grad_logits_0_matmul = grad_logits_0.to(matmul_dtype)
+            if V_BLOCKS_PER_PROGRAM > 1:
+                grad_logits_1_matmul = grad_logits_1.to(matmul_dtype)
                 if USE_FP64:
-                    grad_weight_acc_0 += tl.sum(
-                        hidden_slice[:, :, None] * grad_logits_0_matmul[:, None, :], axis=0
+                    grad_weight_acc_1 += tl.sum(
+                        hidden_slice[:, :, None] * grad_logits_1_matmul[:, None, :], axis=0
                     ).to(compute_dtype)
                 elif USE_HIGH_PRECISION:
-                    grad_weight_acc_0 = tl.dot(
-                        hidden_slice.T, grad_logits_0_matmul, acc=grad_weight_acc_0, input_precision="ieee"
+                    grad_weight_acc_1 = tl.dot(
+                        hidden_slice.T, grad_logits_1_matmul, acc=grad_weight_acc_1, input_precision="ieee"
                     ).to(compute_dtype)
                 else:
-                    grad_weight_acc_0 = tl.dot(hidden_slice.T, grad_logits_0_matmul, acc=grad_weight_acc_0).to(
+                    grad_weight_acc_1 = tl.dot(hidden_slice.T, grad_logits_1_matmul, acc=grad_weight_acc_1).to(
                         compute_dtype
                     )
 
+            if is_first_d_program:
+                grad_bias_acc_0 += tl.sum(grad_logits_0, axis=0)
                 if V_BLOCKS_PER_PROGRAM > 1:
-                    grad_logits_1_matmul = grad_logits_1.to(matmul_dtype)
-                    if USE_FP64:
-                        grad_weight_acc_1 += tl.sum(
-                            hidden_slice[:, :, None] * grad_logits_1_matmul[:, None, :], axis=0
-                        ).to(compute_dtype)
-                    elif USE_HIGH_PRECISION:
-                        grad_weight_acc_1 = tl.dot(
-                            hidden_slice.T, grad_logits_1_matmul, acc=grad_weight_acc_1, input_precision="ieee"
-                        ).to(compute_dtype)
-                    else:
-                        grad_weight_acc_1 = tl.dot(hidden_slice.T, grad_logits_1_matmul, acc=grad_weight_acc_1).to(
-                            compute_dtype
-                        )
-
-                if is_first_d_program:
-                    grad_bias_acc_0 += tl.sum(grad_logits_0, axis=0)
-                    if V_BLOCKS_PER_PROGRAM > 1:
-                        grad_bias_acc_1 += tl.sum(grad_logits_1, axis=0)
+                    grad_bias_acc_1 += tl.sum(grad_logits_1, axis=0)
 
     weight_partial_offset = split_index * vocab_size * hidden_dim
     tl.store(
@@ -709,8 +692,17 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         grad_blank_scores = grad_blank_scores.contiguous()
 
         batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim = joint_hidden.shape
+        flattened_batch_size = batch_size * src_max_length * tgt_max_length_plus_1
         vocab_size = weight.shape[0]
         device = joint_hidden.device
+        flattened_batch_to_batch, flattened_batch_to_source, flattened_batch_to_target = (
+            _build_flattened_batch_indices(
+                device=device,
+                batch_size=batch_size,
+                src_max_length=src_max_length,
+                tgt_max_length_plus_1=tgt_max_length_plus_1,
+            )
+        )
 
         device_properties = torch.cuda.get_device_properties(device)
         partial_weight_element_size = 8 if float_dtype == torch.float64 else 4
@@ -719,13 +711,9 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         )
         max_splits_by_memory = max(1, int((device_properties.total_memory // 8) // bytes_per_split))
 
-        source_block_size = 8
-        target_block_size = 8
-        num_source_blocks = triton.cdiv(src_max_length, source_block_size)
-        num_target_blocks = triton.cdiv(tgt_max_length_plus_1, target_block_size)
-        total_tiles = batch_size * num_source_blocks * num_target_blocks
-
         if use_high_precision:
+            hidden_bwd_flattened_batch_block = 64
+            weight_bias_flattened_batch_block = 64
             hidden_bwd_hidden_block = 64
             hidden_bwd_vocab_block = 64
             hidden_bwd_num_warps = 4
@@ -738,19 +726,23 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             weight_bias_num_warps = 4
             weight_bias_num_stages = 2
         else:
+            hidden_bwd_flattened_batch_block = 64
+            weight_bias_flattened_batch_block = 64
             hidden_bwd_hidden_block = 64
-            hidden_bwd_vocab_block = 128
+            hidden_bwd_vocab_block = 128 if joint_hidden.dtype == torch.bfloat16 else 64
             hidden_bwd_num_warps = 4
             hidden_bwd_num_stages = 2
 
-            weight_bias_hidden_block = 128
+            weight_bias_hidden_block = 128 if joint_hidden.dtype == torch.bfloat16 else 64
             weight_bias_d_blocks_per_program = 4
             weight_bias_vocab_block = 64
             weight_bias_v_blocks_per_program = 1
-            weight_bias_num_warps = 8
+            weight_bias_num_warps = 8 if joint_hidden.dtype == torch.bfloat16 else 4
             weight_bias_num_stages = 2
 
-        num_splits = min(64, total_tiles, max_splits_by_memory)
+        hidden_bwd_flattened_batch_blocks = triton.cdiv(flattened_batch_size, hidden_bwd_flattened_batch_block)
+        weight_bias_flattened_batch_blocks = triton.cdiv(flattened_batch_size, weight_bias_flattened_batch_block)
+        num_splits = max(1, min(64, weight_bias_flattened_batch_blocks, max_splits_by_memory))
 
         grad_joint_hidden = torch.zeros(
             [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim], dtype=joint_hidden.dtype, device=device
@@ -758,7 +750,10 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         grad_weight_partial = torch.zeros([num_splits, vocab_size, hidden_dim], dtype=float_dtype, device=device)
         grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
 
-        _rnnt_joint_vocab_partial_hidden_bwd_kernel[(batch_size, num_source_blocks, num_target_blocks)](
+        _rnnt_joint_vocab_partial_hidden_bwd_kernel[(hidden_bwd_flattened_batch_blocks,)](
+            flattened_batch_to_batch_ptr=flattened_batch_to_batch,
+            flattened_batch_to_source_ptr=flattened_batch_to_source,
+            flattened_batch_to_target_ptr=flattened_batch_to_target,
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
@@ -771,11 +766,11 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             grad_joint_hidden_out_ptr=grad_joint_hidden,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
+            flattened_batch_size=flattened_batch_size,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            SOURCE_BLOCK=source_block_size,
-            TARGET_BLOCK=target_block_size,
+            FLATTENED_BATCH_BLOCK=hidden_bwd_flattened_batch_block,
             HIDDEN_BLOCK=hidden_bwd_hidden_block,
             VOCAB_BLOCK=hidden_bwd_vocab_block,
             USE_FP64=use_fp64,
@@ -793,6 +788,9 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[
             (weight_bias_programs_hidden, weight_bias_programs_vocab, num_splits)
         ](
+            flattened_batch_to_batch_ptr=flattened_batch_to_batch,
+            flattened_batch_to_source_ptr=flattened_batch_to_source,
+            flattened_batch_to_target_ptr=flattened_batch_to_target,
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
@@ -806,14 +804,11 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             grad_bias_partial_out_ptr=grad_bias_partial,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
+            flattened_batch_size=flattened_batch_size,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            num_source_blocks=num_source_blocks,
-            num_target_blocks=num_target_blocks,
-            total_tiles=total_tiles,
-            SOURCE_BLOCK=source_block_size,
-            TARGET_BLOCK=target_block_size,
+            FLATTENED_BATCH_BLOCK=weight_bias_flattened_batch_block,
             HIDDEN_BLOCK=weight_bias_hidden_block,
             D_BLOCKS_PER_PROGRAM=weight_bias_d_blocks_per_program,
             VOCAB_BLOCK=weight_bias_vocab_block,
