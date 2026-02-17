@@ -36,9 +36,9 @@ def _rnnt_joint_vocab_fwd_kernel(
     lse_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
-    hidden_dim: int,
-    vocab_size: int,
-    blank_id: int,
+    hidden_dim: tl.constexpr,
+    vocab_size: tl.constexpr,
+    blank_id: tl.constexpr,
     SOURCE_BLOCK: tl.constexpr,
     TARGET_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
@@ -173,9 +173,9 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     grad_joint_hidden_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
-    hidden_dim: int,
-    vocab_size: int,
-    blank_id: int,
+    hidden_dim: tl.constexpr,
+    vocab_size: tl.constexpr,
+    blank_id: tl.constexpr,
     SOURCE_BLOCK: tl.constexpr,
     TARGET_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
@@ -346,9 +346,9 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     grad_bias_partial_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
-    hidden_dim: int,
-    vocab_size: int,
-    blank_id: int,
+    hidden_dim: tl.constexpr,
+    vocab_size: tl.constexpr,
+    blank_id: tl.constexpr,
     num_source_blocks: int,
     num_target_blocks: int,
     total_tiles: int,
@@ -717,17 +717,49 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         vocab_size = weight.shape[0]
         device = joint_hidden.device
 
-        SOURCE_BLOCK = 8
-        TARGET_BLOCK = 8
-        HIDDEN_BLOCK = 64
-        VOCAB_BLOCK = 64
+        device_properties = torch.cuda.get_device_properties(device)
+        partial_weight_element_size = 8 if float_dtype == torch.float64 else 4
+        bytes_per_split = vocab_size * hidden_dim * partial_weight_element_size + vocab_size * partial_weight_element_size
+        max_splits_by_memory = max(1, int((device_properties.total_memory // 8) // bytes_per_split))
 
-        num_source_blocks = triton.cdiv(src_max_length, SOURCE_BLOCK)
-        num_target_blocks = triton.cdiv(tgt_max_length_plus_1, TARGET_BLOCK)
+        source_block_size = 8
+        target_block_size = 8
+        num_source_blocks = triton.cdiv(src_max_length, source_block_size)
+        num_target_blocks = triton.cdiv(tgt_max_length_plus_1, target_block_size)
+        total_tiles = batch_size * num_source_blocks * num_target_blocks
+
+        if use_high_precision:
+            hidden_bwd_hidden_block = 64
+            hidden_bwd_vocab_block = 64
+            hidden_bwd_num_warps = 4
+            hidden_bwd_num_stages = 2
+
+            weight_bias_hidden_block = 64
+            weight_bias_d_blocks_per_program = 4
+            weight_bias_vocab_block = 64
+            weight_bias_v_blocks_per_program = 1
+            weight_bias_num_warps = 4
+            weight_bias_num_stages = 2
+        else:
+            hidden_bwd_hidden_block = 64
+            hidden_bwd_vocab_block = 128
+            hidden_bwd_num_warps = 4
+            hidden_bwd_num_stages = 2
+
+            weight_bias_hidden_block = 128
+            weight_bias_d_blocks_per_program = 4
+            weight_bias_vocab_block = 64
+            weight_bias_v_blocks_per_program = 1
+            weight_bias_num_warps = 8
+            weight_bias_num_stages = 2
+
+        num_splits = min(64, total_tiles, max_splits_by_memory)
 
         grad_joint_hidden = torch.zeros(
-            [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim], dtype=float_dtype, device=device
+            [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim], dtype=joint_hidden.dtype, device=device
         )
+        grad_weight_partial = torch.zeros([num_splits, vocab_size, hidden_dim], dtype=float_dtype, device=device)
+        grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
 
         _rnnt_joint_vocab_partial_hidden_bwd_kernel[(batch_size, num_source_blocks, num_target_blocks)](
             joint_hidden_ptr=joint_hidden,
@@ -745,37 +777,25 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            SOURCE_BLOCK=SOURCE_BLOCK,
-            TARGET_BLOCK=TARGET_BLOCK,
-            HIDDEN_BLOCK=HIDDEN_BLOCK,
-            VOCAB_BLOCK=VOCAB_BLOCK,
+            SOURCE_BLOCK=source_block_size,
+            TARGET_BLOCK=target_block_size,
+            HIDDEN_BLOCK=hidden_bwd_hidden_block,
+            VOCAB_BLOCK=hidden_bwd_vocab_block,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
-            num_warps=4,
-            num_stages=1,
+            num_warps=hidden_bwd_num_warps,
+            num_stages=hidden_bwd_num_stages,
         )
 
-        WB_SOURCE_BLOCK = 8
-        WB_TARGET_BLOCK = 8
-        WB_HIDDEN_BLOCK = 128
-        WB_D_BLOCKS_PER_PROGRAM = 2
-        WB_VOCAB_BLOCK = 64
-        WB_V_BLOCKS_PER_PROGRAM = 1
-        wb_num_stages = 1 if use_high_precision else 2
-
-        wb_num_source_blocks = triton.cdiv(src_max_length, WB_SOURCE_BLOCK)
-        wb_num_target_blocks = triton.cdiv(tgt_max_length_plus_1, WB_TARGET_BLOCK)
-        total_tiles = batch_size * wb_num_source_blocks * wb_num_target_blocks
-
-        num_d_programs = triton.cdiv(hidden_dim, WB_HIDDEN_BLOCK * WB_D_BLOCKS_PER_PROGRAM)
-        num_vocab_blocks = triton.cdiv(vocab_size, WB_VOCAB_BLOCK)
-        num_vocab_programs = triton.cdiv(num_vocab_blocks, WB_V_BLOCKS_PER_PROGRAM)
-        num_splits = min(64, total_tiles)
-
-        grad_weight_partial = torch.zeros([num_splits, vocab_size, hidden_dim], dtype=float_dtype, device=device)
-        grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
-
-        _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[(num_d_programs, num_vocab_programs, num_splits)](
+        weight_bias_programs_hidden = triton.cdiv(
+            hidden_dim, weight_bias_hidden_block * weight_bias_d_blocks_per_program
+        )
+        weight_bias_programs_vocab = triton.cdiv(
+            triton.cdiv(vocab_size, weight_bias_vocab_block), weight_bias_v_blocks_per_program
+        )
+        _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[
+            (weight_bias_programs_hidden, weight_bias_programs_vocab, num_splits)
+        ](
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
@@ -792,24 +812,23 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            num_source_blocks=wb_num_source_blocks,
-            num_target_blocks=wb_num_target_blocks,
+            num_source_blocks=num_source_blocks,
+            num_target_blocks=num_target_blocks,
             total_tiles=total_tiles,
-            SOURCE_BLOCK=WB_SOURCE_BLOCK,
-            TARGET_BLOCK=WB_TARGET_BLOCK,
-            HIDDEN_BLOCK=WB_HIDDEN_BLOCK,
-            D_BLOCKS_PER_PROGRAM=WB_D_BLOCKS_PER_PROGRAM,
-            VOCAB_BLOCK=WB_VOCAB_BLOCK,
-            V_BLOCKS_PER_PROGRAM=WB_V_BLOCKS_PER_PROGRAM,
+            SOURCE_BLOCK=source_block_size,
+            TARGET_BLOCK=target_block_size,
+            HIDDEN_BLOCK=weight_bias_hidden_block,
+            D_BLOCKS_PER_PROGRAM=weight_bias_d_blocks_per_program,
+            VOCAB_BLOCK=weight_bias_vocab_block,
+            V_BLOCKS_PER_PROGRAM=weight_bias_v_blocks_per_program,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
-            num_warps=4,
-            num_stages=wb_num_stages,
+            num_warps=weight_bias_num_warps,
+            num_stages=weight_bias_num_stages,
         )
 
         grad_weight = grad_weight_partial.sum(dim=0)
         grad_bias = grad_bias_partial.sum(dim=0)
-        grad_joint_hidden = grad_joint_hidden.to(joint_hidden.dtype)
         grad_weight = grad_weight.to(weight.dtype)
         grad_bias = grad_bias.to(bias.dtype)
 
