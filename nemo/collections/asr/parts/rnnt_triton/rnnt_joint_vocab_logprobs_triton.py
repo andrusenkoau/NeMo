@@ -683,60 +683,21 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         flattened_batch_size = batch_size * src_max_length * tgt_max_length_plus_1
         vocab_size = weight.shape[0]
         device = joint_hidden.device
-        flattened_batch_to_batch, flattened_batch_to_source, flattened_batch_to_target = (
-            _build_flattened_batch_indices(
-                device=device,
-                batch_size=batch_size,
-                src_max_length=src_max_length,
-                tgt_max_length_plus_1=tgt_max_length_plus_1,
-            )
-        )
-
-        device_properties = torch.cuda.get_device_properties(device)
-        partial_weight_element_size = 8 if float_dtype == torch.float64 else 4
-        bytes_per_split = (
-            vocab_size * hidden_dim * partial_weight_element_size + vocab_size * partial_weight_element_size
-        )
-        max_splits_by_memory = max(1, int((device_properties.total_memory // 8) // bytes_per_split))
-
-        if use_high_precision:
-            hidden_bwd_flattened_batch_block = 64
-            weight_bias_flattened_batch_block = 64
-            hidden_bwd_hidden_block = 64
-            hidden_bwd_vocab_block = 64
-            hidden_bwd_num_warps = 4
-            hidden_bwd_num_stages = 2
-
-            weight_bias_hidden_block = 64
-            weight_bias_d_blocks_per_program = 4
-            weight_bias_vocab_block = 64
-            weight_bias_v_blocks_per_program = 1
-            weight_bias_num_warps = 4
-            weight_bias_num_stages = 2
-        else:
-            hidden_bwd_flattened_batch_block = 64
-            weight_bias_flattened_batch_block = 64
-            hidden_bwd_hidden_block = 64
-            hidden_bwd_vocab_block = 128 if joint_hidden.dtype == torch.bfloat16 else 64
-            hidden_bwd_num_warps = 4
-            hidden_bwd_num_stages = 2
-
-            weight_bias_hidden_block = 128 if joint_hidden.dtype == torch.bfloat16 else 64
-            weight_bias_d_blocks_per_program = 4
-            weight_bias_vocab_block = 64
-            weight_bias_v_blocks_per_program = 1
-            weight_bias_num_warps = 8 if joint_hidden.dtype == torch.bfloat16 else 4
-            weight_bias_num_stages = 2
-
-        hidden_bwd_flattened_batch_blocks = triton.cdiv(flattened_batch_size, hidden_bwd_flattened_batch_block)
-        weight_bias_flattened_batch_blocks = triton.cdiv(flattened_batch_size, weight_bias_flattened_batch_block)
-        num_splits = max(1, min(64, weight_bias_flattened_batch_blocks, max_splits_by_memory))
 
         grad_joint_hidden = torch.zeros(
             [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim], dtype=joint_hidden.dtype, device=device
         )
-        grad_weight_partial = torch.zeros([num_splits, vocab_size, hidden_dim], dtype=float_dtype, device=device)
-        grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
+
+        if use_high_precision or joint_hidden.dtype != torch.bfloat16:
+            hidden_bwd_vocab_block = 64
+        else:
+            hidden_bwd_vocab_block = 128
+        hidden_bwd_flattened_batch_block = 64
+        hidden_bwd_hidden_block = 64
+        hidden_bwd_num_warps = 4
+        hidden_bwd_num_stages = 2
+
+        hidden_bwd_flattened_batch_blocks = triton.cdiv(flattened_batch_size, hidden_bwd_flattened_batch_block)
 
         _rnnt_joint_vocab_partial_hidden_bwd_kernel[(hidden_bwd_flattened_batch_blocks,)](
             joint_hidden_ptr=joint_hidden,
@@ -763,6 +724,45 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             num_warps=hidden_bwd_num_warps,
             num_stages=hidden_bwd_num_stages,
         )
+
+        flattened_batch_to_batch, flattened_batch_to_source, flattened_batch_to_target = (
+            _build_flattened_batch_indices(
+                device=device,
+                batch_size=batch_size,
+                src_max_length=src_max_length,
+                tgt_max_length_plus_1=tgt_max_length_plus_1,
+            )
+        )
+
+        device_properties = torch.cuda.get_device_properties(device)
+        partial_weight_element_size = 8 if float_dtype == torch.float64 else 4
+        bytes_per_split = (
+            vocab_size * hidden_dim * partial_weight_element_size + vocab_size * partial_weight_element_size
+        )
+        max_splits_by_memory = max(1, int((device_properties.total_memory // 8) // bytes_per_split))
+
+        if use_high_precision:
+            weight_bias_flattened_batch_block = 64
+            weight_bias_hidden_block = 64
+            weight_bias_d_blocks_per_program = 4
+            weight_bias_vocab_block = 64
+            weight_bias_v_blocks_per_program = 1
+            weight_bias_num_warps = 4
+            weight_bias_num_stages = 2
+        else:
+            weight_bias_flattened_batch_block = 64
+            weight_bias_hidden_block = 128 if joint_hidden.dtype == torch.bfloat16 else 64
+            weight_bias_d_blocks_per_program = 4
+            weight_bias_vocab_block = 64
+            weight_bias_v_blocks_per_program = 1
+            weight_bias_num_warps = 8 if joint_hidden.dtype == torch.bfloat16 else 4
+            weight_bias_num_stages = 2
+
+        weight_bias_flattened_batch_blocks = triton.cdiv(flattened_batch_size, weight_bias_flattened_batch_block)
+        num_splits = max(1, min(64, weight_bias_flattened_batch_blocks, max_splits_by_memory))
+
+        grad_weight_partial = torch.zeros([num_splits, vocab_size, hidden_dim], dtype=float_dtype, device=device)
+        grad_bias_partial = torch.zeros([num_splits, vocab_size], dtype=float_dtype, device=device)
 
         weight_bias_programs_hidden = triton.cdiv(
             hidden_dim, weight_bias_hidden_block * weight_bias_d_blocks_per_program
