@@ -642,12 +642,15 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         log_sum_exp_scores = torch.empty_like(target_logprobs)
 
         FLATTENED_BATCH_BLOCK = 128
+        flattened_batch_blocks = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_BLOCK)
         HIDDEN_BLOCK = 64
         VOCAB_BLOCK = 64
         forward_num_stages = 1 if use_high_precision else 2
-
-        flattened_batch_blocks = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_BLOCK)
         num_warps = 4
+
+        # device_properties = torch.cuda.get_device_properties(device=device)
+        # flattened_batch_blocks = device_properties.multi_processor_count
+        # FLATTENED_BATCH_BLOCK = triton.next_power_of_2(triton.cdiv(flattened_batch_size, flattened_batch_blocks))
 
         _rnnt_joint_vocab_fwd_kernel[(flattened_batch_blocks,)](
             joint_hidden_ptr=joint_hidden,
