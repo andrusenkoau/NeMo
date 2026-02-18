@@ -65,9 +65,18 @@ def _rnnt_joint_vocab_fwd_kernel(
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
+    USE_INT64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
-    flattened_batch_block_index = tl.program_id(axis=0).to(tl.int64)
+    int_dtype = tl.int64 if USE_INT64 else tl.int32
+    compute_dtype = tl.float64 if USE_FP64 else tl.float32
+    matmul_dtype = (
+        compute_dtype
+        if USE_HIGH_PRECISION
+        else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
+    )
+
+    flattened_batch_block_index = tl.program_id(axis=0).to(int_dtype)
     flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
     flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
     flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
@@ -81,12 +90,6 @@ def _rnnt_joint_vocab_fwd_kernel(
     source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
     target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
 
-    compute_dtype = tl.float64 if USE_FP64 else tl.float32
-    matmul_dtype = (
-        compute_dtype
-        if USE_HIGH_PRECISION
-        else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
-    )
     source_mask = source_index < source_length
     target_valid_mask = target_index <= target_length
     target_label_mask = target_index < target_length
@@ -108,14 +111,14 @@ def _rnnt_joint_vocab_fwd_kernel(
     )
 
     for vocab_start_i32 in tl.range(0, vocab_size, VOCAB_BLOCK):
-        vocab_start = vocab_start_i32.to(tl.int64)
+        vocab_start = vocab_start_i32.to(int_dtype)
         vocab_offsets = vocab_start + vocab_offsets_in_block
         vocab_mask = vocab_offsets < vocab_size
         bias_chunk = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
 
         block_logits = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
         for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            hidden_start = hidden_start_i32.to(tl.int64)
+            hidden_start = hidden_start_i32.to(int_dtype)
             hidden_mask = (hidden_start + hidden_offsets) < hidden_dim
 
             hidden_ptrs = (
@@ -139,9 +142,7 @@ def _rnnt_joint_vocab_fwd_kernel(
             if USE_FP64:
                 block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(
-                    compute_dtype
-                )
+                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(compute_dtype)
             else:
                 block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
 
@@ -193,6 +194,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
+    USE_INT64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
     flattened_batch_block_index = tl.program_id(axis=0)
@@ -209,6 +211,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
     target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
 
+    int_dtype = tl.int64 if USE_INT64 else tl.int32
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
     matmul_dtype = (
         compute_dtype
@@ -241,7 +244,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     sum_grad = grad_target + grad_blank
 
     for vocab_start_i32 in tl.range(0, vocab_size, VOCAB_BLOCK):
-        vocab_start = vocab_start_i32.to(tl.int64)
+        vocab_start = vocab_start_i32.to(int_dtype)
         vocab_offsets = vocab_start + vocab_offsets_in_block
         vocab_mask = vocab_offsets < vocab_size
 
@@ -249,7 +252,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         block_logits = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
 
         for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            hidden_start = hidden_start_i32.to(tl.int64)
+            hidden_start = hidden_start_i32.to(int_dtype)
             hidden_mask = (hidden_start + hidden_offsets) < hidden_dim
 
             hidden_ptrs = (
@@ -273,9 +276,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             if USE_FP64:
                 block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(
-                    compute_dtype
-                )
+                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(compute_dtype)
             else:
                 block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
 
@@ -287,7 +288,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
 
         grad_logits_matmul = grad_logits.to(matmul_dtype)
         for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            hidden_start = hidden_start_i32.to(tl.int64)
+            hidden_start = hidden_start_i32.to(int_dtype)
             hidden_out_offsets = hidden_start + hidden_offsets
             hidden_mask = hidden_out_offsets < hidden_dim
 
@@ -383,9 +384,8 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     # output_blank_mask = flattened_batch_valid_mask & source_mask & target_valid_mask
     # output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
 
-
     grad_bias_acc = tl.zeros((VOCAB_BLOCK,), dtype=compute_dtype)
-    grad_weight_acc = tl.zeros((VOCAB_BLOCK, hidden_dim), dtype=compute_dtype)
+    # grad_weight_acc = tl.zeros((VOCAB_BLOCK, hidden_dim), dtype=compute_dtype)
     is_blank_vocab_col = (vocab_offsets == blank_id) & vocab_mask
 
     # Atomic add into global grads
@@ -464,6 +464,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
+            USE_INT64=True,  # use int64 indexing; currently - always, further - relax condition
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=num_warps,
             num_stages=forward_num_stages,
@@ -542,9 +543,9 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         HIDDEN_BLOCK = 32
         VOCAB_BLOCK = 32
         FLATTENED_BATCH_BLOCK = 32
-        vocab_blocks = tl.cdiv(vocab_size, VOCAB_BLOCK)
+        vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
         FLATTENED_BATCH_SPLITS = 4
-        flattened_batch_split_size = tl.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
+        flattened_batch_split_size = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
         weight_bias_num_stages = 2
@@ -572,6 +573,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
+            USE_INT64=True,  # use int64 indexing; currently - always, further - relax condition
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=weight_bias_num_warps,
             num_stages=weight_bias_num_stages,
