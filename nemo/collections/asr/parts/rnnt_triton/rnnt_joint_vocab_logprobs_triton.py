@@ -376,7 +376,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
     hidden_mask_full = hidden_offsets_full < hidden_dim
 
-    for flattened_batch_start in range(split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK):
+    for flattened_batch_start in tl.range(split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK):
         # iterate over flattened batch
         flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
         flattened_batch_mask = flattened_batch_offsets < split_flattened_batch_end
@@ -412,12 +412,12 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         bias_tile = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=-float("inf")).to(compute_dtype)
         logits_block = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_tile[None, :]
 
-        grad_blank = tl.load(grad_blank_scores_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0).to(
-            tl.float32
+        grad_blank = tl.load(grad_blank_scores_ptr + flattened_batch_offsets, mask=output_blank_mask, other=0.0).to(
+            compute_dtype
         )
         grad_target = tl.load(
-            grad_target_scores_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0
-        ).to(tl.float32)
+            grad_target_scores_ptr + flattened_batch_offsets, mask=output_target_mask, other=0.0
+        ).to(compute_dtype)
         grad_sum = grad_blank + grad_target
 
         log_sum_exp_scores = tl.load(
@@ -440,7 +440,14 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
                 mask=vocab_mask[:, None] & hidden_mask[None, :],
                 other=0.0,
             ).to(matmul_dtype)
-            logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile)).to(compute_dtype)
+            if USE_FP64:
+                logits_block += tl.sum(joint_hidden_tile[:, None, :] * weight_tile[None, :, :], axis=-1)
+            elif USE_HIGH_PRECISION:
+                logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile), input_precision="ieee").to(
+                    compute_dtype
+                )
+            else:
+                logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile)).to(compute_dtype)
 
         probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
         grad_logits_block = -(grad_sum[:, None] * probabilities_block)
@@ -449,9 +456,23 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         grad_logits_block += grad_blank[:, None] * is_blank_vocab_col[None, :].to(compute_dtype)
         grad_logits_block += grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]).to(compute_dtype)
 
-        grad_weight_acc += tl.dot(
-            tl.trans(grad_logits_block.to(matmul_dtype)), joint_hidden_block.to(matmul_dtype)
-        ).to(compute_dtype)
+        grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
+
+        if USE_FP64:
+            grad_weight_acc += tl.sum(
+                grad_logits_block.to(matmul_dtype)[:, :, None] * joint_hidden_block.to(matmul_dtype)[:, None, :],
+                axis=0,
+            ).to(compute_dtype)
+        elif USE_HIGH_PRECISION:
+            grad_weight_acc += tl.dot(
+                tl.trans(grad_logits_block.to(matmul_dtype)),
+                joint_hidden_block.to(matmul_dtype),
+                input_precision="ieee",
+            ).to(compute_dtype)
+        else:
+            grad_weight_acc += tl.dot(
+                tl.trans(grad_logits_block.to(matmul_dtype)), joint_hidden_block.to(matmul_dtype)
+            ).to(compute_dtype)
 
         grad_bias_acc += tl.sum(grad_logits_block, axis=0)
 
