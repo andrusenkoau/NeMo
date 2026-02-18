@@ -51,7 +51,6 @@ class BenchmarkResults:
     forward_time_ms: float
     backward_time_ms: float
     total_time_ms: float
-    save_rate_percent: float | None
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
@@ -207,7 +206,6 @@ def benchmark_standard_joint(
         forward_time_ms=avg_fwd,
         backward_time_ms=avg_bwd,
         total_time_ms=avg_fwd + avg_bwd,
-        save_rate_percent=0.0,
     )
 
 
@@ -359,7 +357,6 @@ def benchmark_triton_joint(
         forward_time_ms=avg_fwd,
         backward_time_ms=avg_bwd,
         total_time_ms=avg_fwd + avg_bwd,
-        save_rate_percent=None,
     )
 
 
@@ -509,36 +506,7 @@ def benchmark_triton_vocab_joint(
         forward_time_ms=avg_fwd,
         backward_time_ms=avg_bwd,
         total_time_ms=avg_fwd + avg_bwd,
-        save_rate_percent=None,
     )
-
-
-def _estimate_save_rate(
-    results: BenchmarkResults,
-    loss_name: str,
-    dtype: torch.dtype,
-    batch_size: int,
-    max_time: int,
-    hidden_dim: int,
-    num_classes: int,
-    max_targets: int,
-    forward_only: bool,
-) -> float:
-    reference = benchmark_standard_joint(
-        loss_name=loss_name,
-        dtype=dtype,
-        warmup_iters=1,
-        bench_iters=1,
-        batch_size=batch_size,
-        max_time=max_time,
-        hidden_dim=hidden_dim,
-        num_classes=num_classes,
-        max_targets=max_targets,
-        forward_only=forward_only,
-    )
-    if reference.max_peak_memory_gb <= 0:
-        return 0.0
-    return max(0.0, (reference.max_peak_memory_gb - results.max_peak_memory_gb) / reference.max_peak_memory_gb * 100.0)
 
 
 def print_results(results: BenchmarkResults):
@@ -555,12 +523,10 @@ def print_results(results: BenchmarkResults):
         "Fwd Memory",
         "Bwd Memory",
         "Max Memory",
-        "Save Rate",
         "Fwd Time",
         "Bwd Time",
         "Total Time",
     ]
-    save_rate_text = "n/a" if results.save_rate_percent is None else f"{results.save_rate_percent:.2f}%"
     row = [
         results.joint,
         results.loss,
@@ -568,7 +534,6 @@ def print_results(results: BenchmarkResults):
         f"{results.forward_memory_gb:.3f} GB",
         f"{results.backward_peak_memory_gb:.3f} GB",
         f"{results.max_peak_memory_gb:.3f} GB",
-        save_rate_text,
         f"{results.forward_time_ms:.3f} ms",
         f"{results.backward_time_ms:.3f} ms",
         f"{results.total_time_ms:.3f} ms",
@@ -663,19 +628,6 @@ def main():
             dtype=dtype,
             warmup_iters=args.warmup_iterations,
             bench_iters=args.benchmark_iterations,
-            batch_size=args.batch_size,
-            max_time=args.max_time,
-            hidden_dim=args.hidden_dim,
-            num_classes=args.num_classes,
-            max_targets=args.max_targets,
-            forward_only=args.forward_only,
-        )
-
-    if args.joint != 'standard':
-        results.save_rate_percent = _estimate_save_rate(
-            results=results,
-            loss_name=args.loss,
-            dtype=dtype,
             batch_size=args.batch_size,
             max_time=args.max_time,
             hidden_dim=args.hidden_dim,
