@@ -634,7 +634,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         flattened_batch_split_size = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
-        weight_bias_num_stages = 1
+        weight_bias_num_stages = 2
 
         _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[(vocab_blocks, FLATTENED_BATCH_SPLITS)](
             joint_hidden_ptr=joint_hidden,
