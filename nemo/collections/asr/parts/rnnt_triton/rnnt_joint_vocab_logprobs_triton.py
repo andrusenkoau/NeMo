@@ -17,27 +17,6 @@ import triton
 import triton.language as tl
 
 
-def _build_flattened_batch_indices(
-    device: torch.device,
-    batch_size: int,
-    src_max_length: int,
-    tgt_max_length_plus_1: int,
-):
-    flattened_batch_size = batch_size * src_max_length * tgt_max_length_plus_1
-    flattened_batch_offsets = torch.arange(flattened_batch_size, device=device, dtype=torch.int64)
-    source_target_block_size = src_max_length * tgt_max_length_plus_1
-    batch_indices = torch.div(flattened_batch_offsets, source_target_block_size, rounding_mode="floor")
-    batch_offsets = flattened_batch_offsets - batch_indices * source_target_block_size
-    source_indices = torch.div(batch_offsets, tgt_max_length_plus_1, rounding_mode="floor")
-    target_indices = batch_offsets - source_indices * tgt_max_length_plus_1
-
-    return (
-        batch_indices.to(torch.int32),
-        source_indices.to(torch.int32),
-        target_indices.to(torch.int32),
-    )
-
-
 @triton.jit
 def _log_add_exp(log_probs_1, log_probs_2):
     max_score = tl.maximum(log_probs_1, log_probs_2)
