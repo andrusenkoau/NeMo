@@ -376,7 +376,9 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
     hidden_mask_full = hidden_offsets_full < hidden_dim
 
-    for flattened_batch_start in tl.range(split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK):
+    for flattened_batch_start in tl.range(
+        split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK
+    ):
         # iterate over flattened batch
         flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
         flattened_batch_mask = flattened_batch_offsets < split_flattened_batch_end
@@ -403,21 +405,15 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             other=0,
         )
 
-        joint_hidden_block = tl.load(
-            joint_hidden_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
-            mask=flattened_batch_mask[:, None] & hidden_mask_full[None, :],
-            other=0.0,
-        ).to(matmul_dtype)
-
         bias_tile = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=-float("inf")).to(compute_dtype)
         logits_block = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_tile[None, :]
 
         grad_blank = tl.load(grad_blank_scores_ptr + flattened_batch_offsets, mask=output_blank_mask, other=0.0).to(
             compute_dtype
         )
-        grad_target = tl.load(
-            grad_target_scores_ptr + flattened_batch_offsets, mask=output_target_mask, other=0.0
-        ).to(compute_dtype)
+        grad_target = tl.load(grad_target_scores_ptr + flattened_batch_offsets, mask=output_target_mask, other=0.0).to(
+            compute_dtype
+        )
         grad_sum = grad_blank + grad_target
 
         log_sum_exp_scores = tl.load(
@@ -458,23 +454,31 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
 
         grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
 
+        # compute grad bias addition
+        grad_bias_acc += tl.sum(grad_logits_block, axis=0)
+
+        # compute grad weight addition
+        joint_hidden_block = tl.load(
+            joint_hidden_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
+            mask=flattened_batch_mask[:, None] & hidden_mask_full[None, :],
+            other=0.0,
+        ).to(matmul_dtype)
+
         if USE_FP64:
             grad_weight_acc += tl.sum(
-                grad_logits_block.to(matmul_dtype)[:, :, None] * joint_hidden_block.to(matmul_dtype)[:, None, :],
+                grad_logits_block.to(matmul_dtype)[:, :, None] * joint_hidden_block[:, None, :],
                 axis=0,
             ).to(compute_dtype)
         elif USE_HIGH_PRECISION:
             grad_weight_acc += tl.dot(
                 tl.trans(grad_logits_block.to(matmul_dtype)),
-                joint_hidden_block.to(matmul_dtype),
+                joint_hidden_block,
                 input_precision="ieee",
             ).to(compute_dtype)
         else:
-            grad_weight_acc += tl.dot(
-                tl.trans(grad_logits_block.to(matmul_dtype)), joint_hidden_block.to(matmul_dtype)
-            ).to(compute_dtype)
-
-        grad_bias_acc += tl.sum(grad_logits_block, axis=0)
+            grad_weight_acc += tl.dot(tl.trans(grad_logits_block.to(matmul_dtype)), joint_hidden_block).to(
+                compute_dtype
+            )
 
     # Atomic add into global grads
     tl.atomic_add(
