@@ -345,6 +345,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
+    HIDDEN_DIM_MAX: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_INT64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
@@ -369,8 +370,11 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     )
 
     grad_bias_acc = tl.zeros((VOCAB_BLOCK,), dtype=compute_dtype)
-    # grad_weight_acc = tl.zeros((VOCAB_BLOCK, hidden_dim), dtype=compute_dtype)
+    grad_weight_acc = tl.zeros((VOCAB_BLOCK, HIDDEN_DIM_MAX), dtype=compute_dtype)
     is_blank_vocab_col = (vocab_offsets == blank_id) & vocab_mask
+
+    hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
+    hidden_mask_full = hidden_offsets_full < hidden_dim
 
     for flattened_batch_start in range(split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK):
         # iterate over flattened batch
@@ -392,13 +396,34 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         output_blank_mask = flattened_batch_mask & source_mask & target_valid_mask
         output_target_mask = flattened_batch_mask & source_mask & target_label_mask
 
+        targets = tl.load(
+            targets_ptr + batch_index * (max_tgt_len_plus_1 - 1) + target_index,
+            mask=output_target_mask,
+            other=0,
+        )
+
+        joint_hidden_block = tl.load(
+            joint_hidden_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
+            mask=flattened_batch_mask[:, None] & hidden_mask_full[None, :],
+            other=0.0,
+        ).to(matmul_dtype)
+
         bias_tile = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=-float("inf")).to(compute_dtype)
-        logits_block = bias_tile[None, :]
+        logits_block = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_tile[None, :]
+
+        grad_blank = tl.load(grad_blank_scores_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0).to(
+            tl.float32
+        )
+        grad_target = tl.load(
+            grad_target_scores_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0
+        ).to(tl.float32)
+        grad_sum = grad_blank + grad_target
+
         log_sum_exp_scores = tl.load(
             log_sum_exp_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0
         ).to(compute_dtype)
 
-        for hidden_start in tl.static_range(0, hidden_dim, HIDDEN_BLOCK):
+        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             # iterate over hidden block
             hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
             hidden_mask = hidden_offsets < hidden_dim
@@ -417,15 +442,24 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile)).to(compute_dtype)
 
         probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
+        grad_logits_block = -(grad_sum[:, None] * probabilities_block)
+
+        # sparse adds (only affect the blank/target columns)
+        grad_logits_block += grad_blank[:, None] * is_blank_vocab_col[None, :].to(compute_dtype)
+        grad_logits_block += grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]).to(compute_dtype)
+
+        grad_weight_acc += tl.dot(
+            tl.trans(grad_logits_block.to(matmul_dtype)), joint_hidden_block.to(matmul_dtype)
+        ).to(compute_dtype)
+
+        grad_bias_acc += tl.sum(grad_logits_block, axis=0)
 
     # Atomic add into global grads
-    # tl.atomic_add(
-    #     grad_weight_out_ptr
-    #     + vocab_offsets[:, None] * hidden_dim
-    #     + hidden_offsets_full[None, :],
-    #     grad_weight_acc,
-    #     mask=vocab_mask[:, None] & hidden_mask_full[None, :],
-    # )
+    tl.atomic_add(
+        grad_weight_out_ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
+        grad_weight_acc,
+        mask=vocab_mask[:, None] & hidden_mask_full[None, :],
+    )
     tl.atomic_add(
         grad_bias_out_ptr + vocab_offsets,
         grad_bias_acc,
@@ -570,15 +604,15 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         grad_bias = torch.zeros([vocab_size], dtype=float_dtype, device=device)
 
         # device_properties = torch.cuda.get_device_properties(device)
-        HIDDEN_BLOCK = 32
-        VOCAB_BLOCK = 32
-        FLATTENED_BATCH_BLOCK = 32
+        HIDDEN_BLOCK = 16
+        VOCAB_BLOCK = 16
+        FLATTENED_BATCH_BLOCK = 16
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
         FLATTENED_BATCH_SPLITS = 4
         flattened_batch_split_size = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
-        weight_bias_num_stages = 2
+        weight_bias_num_stages = 1
 
         _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[(vocab_blocks, FLATTENED_BATCH_SPLITS)](
             joint_hidden_ptr=joint_hidden,
@@ -602,6 +636,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             FLATTENED_BATCH_BLOCK=FLATTENED_BATCH_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
+            HIDDEN_DIM_MAX=triton.next_power_of_2(hidden_dim),
             USE_FP64=use_fp64,
             USE_INT64=True,  # use int64 indexing; currently - always, further - relax condition
             USE_HIGH_PRECISION=use_high_precision,
