@@ -363,30 +363,65 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     vocab_offsets = vocab_block_start + tl.arange(0, VOCAB_BLOCK)
     vocab_mask = vocab_offsets < vocab_size
 
-    # flattened_batch_block_index = tl.program_id(axis=0)
-    # flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
-    # flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
-    # flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
-    #
-    # source_target_block_size = max_src_len * max_tgt_len_plus_1
-    # batch_index = flattened_batch_offsets // source_target_block_size
-    # batch_offsets = flattened_batch_offsets - batch_index * source_target_block_size
-    # source_index = batch_offsets // max_tgt_len_plus_1
-    # target_index = batch_offsets - source_index * max_tgt_len_plus_1
-    #
-    # source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
-    # target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
-    #
-
-    # source_mask = source_index < source_length
-    # target_valid_mask = target_index <= target_length
-    # target_label_mask = target_index < target_length
-    # output_blank_mask = flattened_batch_valid_mask & source_mask & target_valid_mask
-    # output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
+    split_flattened_batch_start = flattened_batch_split_index * flattened_batch_split_size
+    split_flattened_batch_end = tl.minimum(
+        split_flattened_batch_start + flattened_batch_split_size, flattened_batch_size
+    )
 
     grad_bias_acc = tl.zeros((VOCAB_BLOCK,), dtype=compute_dtype)
     # grad_weight_acc = tl.zeros((VOCAB_BLOCK, hidden_dim), dtype=compute_dtype)
     is_blank_vocab_col = (vocab_offsets == blank_id) & vocab_mask
+
+    for flattened_batch_start in range(
+        split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK
+    ):
+        # iterate over flattened batch
+        flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
+        flattened_batch_mask = flattened_batch_offsets < split_flattened_batch_end
+
+        source_target_block_size = max_src_len * max_tgt_len_plus_1
+        batch_index = flattened_batch_offsets // source_target_block_size
+        batch_offsets = flattened_batch_offsets - batch_index * source_target_block_size
+        source_index = batch_offsets // max_tgt_len_plus_1
+        target_index = batch_offsets - source_index * max_tgt_len_plus_1
+
+        source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_mask, other=0)
+        target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_mask, other=0)
+
+        source_mask = source_index < source_length
+        target_valid_mask = target_index <= target_length
+        target_label_mask = target_index < target_length
+        output_blank_mask = flattened_batch_mask & source_mask & target_valid_mask
+        output_target_mask = flattened_batch_mask & source_mask & target_label_mask
+
+        bias_tile = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=-float("inf")).to(compute_dtype)
+        logits_block = bias_tile[None, :]
+        log_sum_exp_scores = tl.load(log_sum_exp_ptr + flattened_batch_offsets, mask=flattened_batch_mask,
+                                   other=0.0).to(tl.float32)
+
+        for hidden_start in tl.static_range(0, hidden_dim, HIDDEN_BLOCK):
+            # iterate over hidden block
+            hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
+            hidden_mask = hidden_offsets < hidden_dim
+            # load hidden tile, weight tile, calculate logits
+            joint_hidden_tile = tl.load(
+                joint_hidden_ptr
+                + flattened_batch_offsets[:, None] * hidden_dim
+                + hidden_offsets[None, :],
+                mask=flattened_batch_mask[:, None] & hidden_mask[None, :],
+                other=0.0,
+            ).to(matmul_dtype)
+
+            weight_tile = tl.load(
+                weight_ptr
+                + vocab_offsets[:, None] * hidden_dim
+                + hidden_offsets[None, :],
+                mask=vocab_mask[:, None] & hidden_mask[None, :],
+                other=0.0,
+            ).to(matmul_dtype)
+            logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile)).to(compute_dtype)
+
+        probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
 
     # Atomic add into global grads
     # tl.atomic_add(
