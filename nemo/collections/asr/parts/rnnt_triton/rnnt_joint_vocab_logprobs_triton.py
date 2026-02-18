@@ -627,10 +627,10 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         grad_bias = torch.zeros([vocab_size], dtype=float_dtype, device=device)
 
         HIDDEN_BLOCK = 64
-        VOCAB_BLOCK = 128
+        VOCAB_BLOCK = 64
         FLATTENED_BATCH_BLOCK = 128
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
-        FLATTENED_BATCH_SPLITS = 32
+        FLATTENED_BATCH_SPLITS = 128
         flattened_batch_split_size = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
