@@ -105,7 +105,7 @@ class TestRnntJointVocabLogProbsTriton:
             use_high_precision=use_high_precision,
         )
 
-        forward_atol = 1e-3
+        forward_atol = 1e-5
         assert torch.allclose(
             target_tri, target_ref, atol=forward_atol
         ), f"target logprobs mismatch: max diff={(target_tri - target_ref).abs().max().item()}"
@@ -126,14 +126,14 @@ class TestRnntJointVocabLogProbsTriton:
         assert weight_tri.grad.dtype == float_dtype
         assert bias_tri.grad.dtype == float_dtype
 
-        grad_atol = 5e-2 if float_dtype == torch.bfloat16 else 5e-3
-        grad_rtol = 5e-2 if float_dtype == torch.bfloat16 else 1e-3
+        grad_atol = 5e-3 if float_dtype == torch.bfloat16 else 1e-4
+        grad_rtol = 5e-3 if float_dtype == torch.bfloat16 else 1e-5
         assert torch.allclose(
             joint_hidden_tri.grad.float(), joint_hidden_ref.grad.float(), atol=grad_atol, rtol=grad_rtol
         ), f"joint_hidden grad mismatch: max diff={(joint_hidden_tri.grad.float() - joint_hidden_ref.grad.float()).abs().max().item()}"
 
-        weight_bias_atol = 2.0 if float_dtype == torch.bfloat16 else 0.5
-        weight_bias_rtol = 0.1 if float_dtype == torch.bfloat16 else 0.05
+        weight_bias_atol = 1e-0 if float_dtype == torch.bfloat16 else 1e-4
+        weight_bias_rtol = 1e-3 if float_dtype == torch.bfloat16 else 1e-5
         assert torch.allclose(
             weight_tri.grad.float(), weight_ref.grad.float(), atol=weight_bias_atol, rtol=weight_bias_rtol
         ), f"weight grad mismatch: max diff={(weight_tri.grad.float() - weight_ref.grad.float()).abs().max().item()}"
@@ -189,7 +189,7 @@ class TestRnntJointVocabLogProbsTriton:
             use_high_precision=use_high_precision,
         )
 
-        forward_atol = 5e-3
+        forward_atol = 1e-5
         assert torch.allclose(target_tri, target_ref, atol=forward_atol)
         assert torch.allclose(blank_tri, blank_ref, atol=forward_atol)
 
@@ -201,8 +201,8 @@ class TestRnntJointVocabLogProbsTriton:
         loss_tri.backward()
 
         assert torch.allclose(joint_hidden_tri.grad.float(), joint_hidden_ref.grad.float(), atol=5e-3, rtol=1e-3)
-        assert torch.allclose(weight_tri.grad.float(), weight_ref.grad.float(), atol=0.5, rtol=0.05)
-        assert torch.allclose(bias_tri.grad.float(), bias_ref.grad.float(), atol=0.5, rtol=0.05)
+        assert torch.allclose(weight_tri.grad.float(), weight_ref.grad.float(), atol=0.5, rtol=1e-3)
+        assert torch.allclose(bias_tri.grad.float(), bias_ref.grad.float(), atol=0.5, rtol=1e-3)
 
     def test_edge_case_single_frame(self):
         device = torch.device("cuda")
