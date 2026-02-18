@@ -420,6 +420,10 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             log_sum_exp_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0
         ).to(compute_dtype)
 
+        # sparse adds (only affect the blank/target columns)
+        grad_logits_block = grad_blank[:, None] * is_blank_vocab_col[None, :].to(compute_dtype)
+        grad_logits_block += grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]).to(compute_dtype)
+
         for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             # iterate over hidden block
             hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
@@ -446,12 +450,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
                 logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile)).to(compute_dtype)
 
         probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
-        grad_logits_block = -(grad_sum[:, None] * probabilities_block)
-
-        # sparse adds (only affect the blank/target columns)
-        grad_logits_block += grad_blank[:, None] * is_blank_vocab_col[None, :].to(compute_dtype)
-        grad_logits_block += grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]).to(compute_dtype)
-
+        grad_logits_block += -(grad_sum[:, None] * probabilities_block)
         grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
 
         # compute grad bias addition
@@ -633,8 +632,10 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         HIDDEN_BLOCK = 128
         VOCAB_BLOCK = 16
         FLATTENED_BATCH_BLOCK = 16
+        # VOCAB_BLOCK = 128
+        # FLATTENED_BATCH_BLOCK = 128
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
-        FLATTENED_BATCH_SPLITS = 4
+        FLATTENED_BATCH_SPLITS = 32
         flattened_batch_split_size = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
