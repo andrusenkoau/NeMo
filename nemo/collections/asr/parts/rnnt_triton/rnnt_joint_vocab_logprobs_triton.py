@@ -372,9 +372,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     # grad_weight_acc = tl.zeros((VOCAB_BLOCK, hidden_dim), dtype=compute_dtype)
     is_blank_vocab_col = (vocab_offsets == blank_id) & vocab_mask
 
-    for flattened_batch_start in range(
-        split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK
-    ):
+    for flattened_batch_start in range(split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK):
         # iterate over flattened batch
         flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
         flattened_batch_mask = flattened_batch_offsets < split_flattened_batch_end
@@ -396,8 +394,9 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
 
         bias_tile = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=-float("inf")).to(compute_dtype)
         logits_block = bias_tile[None, :]
-        log_sum_exp_scores = tl.load(log_sum_exp_ptr + flattened_batch_offsets, mask=flattened_batch_mask,
-                                   other=0.0).to(tl.float32)
+        log_sum_exp_scores = tl.load(
+            log_sum_exp_ptr + flattened_batch_offsets, mask=flattened_batch_mask, other=0.0
+        ).to(compute_dtype)
 
         for hidden_start in tl.static_range(0, hidden_dim, HIDDEN_BLOCK):
             # iterate over hidden block
@@ -405,17 +404,13 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             hidden_mask = hidden_offsets < hidden_dim
             # load hidden tile, weight tile, calculate logits
             joint_hidden_tile = tl.load(
-                joint_hidden_ptr
-                + flattened_batch_offsets[:, None] * hidden_dim
-                + hidden_offsets[None, :],
+                joint_hidden_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
                 mask=flattened_batch_mask[:, None] & hidden_mask[None, :],
                 other=0.0,
             ).to(matmul_dtype)
 
             weight_tile = tl.load(
-                weight_ptr
-                + vocab_offsets[:, None] * hidden_dim
-                + hidden_offsets[None, :],
+                weight_ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
                 mask=vocab_mask[:, None] & hidden_mask[None, :],
                 other=0.0,
             ).to(matmul_dtype)
