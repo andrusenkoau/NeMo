@@ -395,6 +395,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         target_label_mask = target_index < target_length
         output_blank_mask = flattened_batch_mask & source_mask & target_valid_mask
         output_target_mask = flattened_batch_mask & source_mask & target_label_mask
+        # flattened_batch_mask = output_blank_mask
 
         targets = tl.load(
             targets_ptr + batch_index * (max_tgt_len_plus_1 - 1) + target_index,
