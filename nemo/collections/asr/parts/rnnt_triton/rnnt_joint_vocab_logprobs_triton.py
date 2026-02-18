@@ -139,11 +139,11 @@ def _rnnt_joint_vocab_fwd_kernel(
             if USE_FP64:
                 block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                block_logits = tl.dot(hidden_chunk, weight_chunk.T, acc=block_logits, input_precision="ieee").to(
+                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(
                     compute_dtype
                 )
             else:
-                block_logits = tl.dot(hidden_chunk, weight_chunk.T, acc=block_logits).to(compute_dtype)
+                block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
 
         block_logits = tl.where(vocab_mask[None, :], block_logits, -float("inf"))
         block_logits_max = tl.max(block_logits, axis=-1)
@@ -273,11 +273,11 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             if USE_FP64:
                 block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
             elif USE_HIGH_PRECISION:
-                block_logits = tl.dot(hidden_chunk, weight_chunk.T, acc=block_logits, input_precision="ieee").to(
+                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(
                     compute_dtype
                 )
             else:
-                block_logits = tl.dot(hidden_chunk, weight_chunk.T, acc=block_logits).to(compute_dtype)
+                block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
 
         softmax = tl.exp(tl.where(vocab_mask[None, :], block_logits - lse[:, None], 0.0))
         grad_logits = -softmax * sum_grad[:, None]
@@ -332,11 +332,12 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     log_sum_exp_ptr,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
-    grad_weight_partial_out_ptr,
-    grad_bias_partial_out_ptr,
+    grad_weight_out_ptr,
+    grad_bias_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
     flattened_batch_size: int,
+    flattened_batch_split_size: int,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
@@ -344,9 +345,63 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
+    USE_INT64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
-    ...
+    int_dtype = tl.int64 if USE_INT64 else tl.int32
+    compute_dtype = tl.float64 if USE_FP64 else tl.float32
+    matmul_dtype = (
+        compute_dtype
+        if USE_HIGH_PRECISION
+        else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
+    )
+
+    vocab_block_index = tl.program_id(axis=0).to(int_dtype)
+    flattened_batch_split_index = tl.program_id(axis=1).to(int_dtype)
+    vocab_block_start = vocab_block_index * VOCAB_BLOCK
+    vocab_offsets = vocab_block_start + tl.arange(0, VOCAB_BLOCK)
+    vocab_mask = vocab_offsets < vocab_size
+
+    # flattened_batch_block_index = tl.program_id(axis=0)
+    # flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
+    # flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
+    # flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
+    #
+    # source_target_block_size = max_src_len * max_tgt_len_plus_1
+    # batch_index = flattened_batch_offsets // source_target_block_size
+    # batch_offsets = flattened_batch_offsets - batch_index * source_target_block_size
+    # source_index = batch_offsets // max_tgt_len_plus_1
+    # target_index = batch_offsets - source_index * max_tgt_len_plus_1
+    #
+    # source_length = tl.load(src_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
+    # target_length = tl.load(tgt_lengths_ptr + batch_index, mask=flattened_batch_valid_mask, other=0)
+    #
+
+    # source_mask = source_index < source_length
+    # target_valid_mask = target_index <= target_length
+    # target_label_mask = target_index < target_length
+    # output_blank_mask = flattened_batch_valid_mask & source_mask & target_valid_mask
+    # output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
+
+
+    grad_bias_acc = tl.zeros((VOCAB_BLOCK,), dtype=compute_dtype)
+    grad_weight_acc = tl.zeros((VOCAB_BLOCK, hidden_dim), dtype=compute_dtype)
+    is_blank_vocab_col = (vocab_offsets == blank_id) & vocab_mask
+
+    # Atomic add into global grads
+    # tl.atomic_add(
+    #     grad_weight_out_ptr
+    #     + vocab_offsets[:, None] * hidden_dim
+    #     + hidden_offsets_full[None, :],
+    #     grad_weight_acc,
+    #     mask=vocab_mask[:, None] & hidden_mask_full[None, :],
+    # )
+    tl.atomic_add(
+        grad_bias_out_ptr + vocab_offsets,
+        grad_bias_acc,
+        mask=vocab_mask,
+    )
+
 
 class RnntJointVocabLogProbs(torch.autograd.Function):
     @staticmethod
@@ -473,27 +528,28 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             HIDDEN_BLOCK=hidden_bwd_hidden_block,
             VOCAB_BLOCK=hidden_bwd_vocab_block,
             USE_FP64=use_fp64,
+            USE_INT64=True,  # use int64 indexing; currently - always, further - relax condition
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=hidden_bwd_num_warps,
             num_stages=hidden_bwd_num_stages,
         )
 
+        # grad output variables
+        grad_weight = torch.zeros([vocab_size, hidden_dim], dtype=float_dtype, device=device)
+        grad_bias = torch.zeros([vocab_size], dtype=float_dtype, device=device)
+
         # device_properties = torch.cuda.get_device_properties(device)
-        weight_bias_bwd_flattened_batch_block = 64
-        weight_bias_bwd_flattened_batch_blocks = triton.cdiv(flattened_batch_size, weight_bias_bwd_flattened_batch_block)
-        HIDDEN_BLOCK = 64
-        VOCAB_BLOCK = 128
-        NUM_SPLITS = 8
+        HIDDEN_BLOCK = 32
+        VOCAB_BLOCK = 32
+        FLATTENED_BATCH_BLOCK = 32
+        vocab_blocks = tl.cdiv(vocab_size, VOCAB_BLOCK)
+        FLATTENED_BATCH_SPLITS = 4
+        flattened_batch_split_size = tl.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
         weight_bias_num_stages = 2
 
-        grad_weight_partial = torch.zeros([NUM_SPLITS, vocab_size, hidden_dim], dtype=float_dtype, device=device)
-        grad_bias_partial = torch.zeros([NUM_SPLITS, vocab_size], dtype=float_dtype, device=device)
-
-        _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[
-            (weight_bias_bwd_flattened_batch_blocks,)
-        ](
+        _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[(vocab_blocks, FLATTENED_BATCH_SPLITS)](
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
@@ -503,15 +559,16 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             log_sum_exp_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
-            grad_weight_partial_out_ptr=grad_weight_partial,
-            grad_bias_partial_out_ptr=grad_bias_partial,
+            grad_weight_out_ptr=grad_weight,
+            grad_bias_out_ptr=grad_bias,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             flattened_batch_size=flattened_batch_size,
+            flattened_batch_split_size=flattened_batch_split_size,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            FLATTENED_BATCH_BLOCK=weight_bias_bwd_flattened_batch_block,
+            FLATTENED_BATCH_BLOCK=FLATTENED_BATCH_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
@@ -520,9 +577,6 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             num_stages=weight_bias_num_stages,
         )
 
-        grad_weight = grad_weight_partial.sum(dim=0)
-        grad_bias = grad_bias_partial.sum(dim=0)
-        
         # convert grad to desired dtype
         grad_weight = grad_weight.to(weight.dtype)
         grad_bias = grad_bias.to(bias.dtype)
