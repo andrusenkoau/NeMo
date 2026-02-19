@@ -29,11 +29,9 @@ def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
     """
     # TODO: add tests
     # TODO: optimize (?)
-    if axis != 1 or len(x.shape) != 2:
-        # TODO: fix this
-        raise NotImplementedError
     x_offsets = tl.arange(0, x.shape[axis])
     mask = (x_offsets >= start) & (x_offsets < y.shape[axis])
     y_indices_safe_to_x = tl.where(mask, x_offsets - start, 0)
-    y_to_x_expanded = y.gather(y_indices_safe_to_x[None, :].broadcast_to(x.shape), axis=axis)
-    return x + tl.where(mask[None, :], y_to_x_expanded, 0)
+    broadcastable_shape: tl.constexpr = [1] * axis + [x.shape[axis]] + ([1] * (len(x.shape) - axis - 1))
+    y_to_x_expanded = y.gather(y_indices_safe_to_x.reshape(broadcastable_shape).broadcast_to(x.shape), axis=axis)
+    return x + tl.where(mask.reshape(broadcastable_shape), y_to_x_expanded, 0)
