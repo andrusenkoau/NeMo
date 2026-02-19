@@ -17,10 +17,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _log_add_exp(log_probs_1, log_probs_2):
-    max_score = tl.maximum(log_probs_1, log_probs_2)
-    return max_score + tl.log(tl.exp(log_probs_1 - max_score) + tl.exp(log_probs_2 - max_score))
+from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp
 
 
 @triton.jit
@@ -128,7 +125,7 @@ def _rnnt_joint_vocab_fwd_kernel(
         block_logits = tl.where(vocab_mask[None, :], block_logits, -float("inf"))
         block_logits_max = tl.max(block_logits, axis=-1)
         block_lse = tl.log(tl.sum(tl.exp(block_logits - block_logits_max[:, None]), axis=-1)) + block_logits_max
-        log_sum_exp_score = _log_add_exp(log_sum_exp_score, block_lse)
+        log_sum_exp_score = log_add_exp(log_sum_exp_score, block_lse)
 
         blank_logits += tl.sum(tl.where((vocab_offsets == blank_id)[None, :], block_logits, 0.0), axis=-1)
         target_logits += tl.sum(tl.where(vocab_offsets[None, :] == targets[:, None], block_logits, 0.0), axis=-1)

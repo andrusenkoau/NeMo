@@ -18,12 +18,7 @@ import triton
 import triton.language as tl
 
 from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs_triton import rnnt_logprobs_triton
-
-
-@triton.jit
-def _log_add_exp(log_probs_1, log_probs_2):
-    max_score = tl.maximum(log_probs_1, log_probs_2)
-    return max_score + tl.log(tl.exp(log_probs_1 - max_score) + tl.exp(log_probs_2 - max_score))
+from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp
 
 
 @triton.jit
@@ -87,7 +82,7 @@ def _rnnt_fwd_kernel(
         emit_lp = tl.load(target_logprobs_ptr + emit_pred_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_alpha + emit_lp, NEG_INF)
 
-        alpha_diag = _log_add_exp(blank_score, emit_score)
+        alpha_diag = log_add_exp(blank_score, emit_score)
 
         # Store alpha values
         cur_idx = batch_offset + src_offsets * max_tgt_len_plus_1 + tgt_offsets
@@ -195,7 +190,7 @@ def _rnnt_bwd_kernel(
         emit_lp = tl.load(target_logprobs_ptr + cur_idx, mask=emit_mask, other=0.0).to(compute_dtype)
         emit_score = tl.where(emit_mask, emit_beta + emit_lp, NEG_INF)
 
-        beta_diag = tl.where(mask, _log_add_exp(blank_score, emit_score), NEG_INF)
+        beta_diag = tl.where(mask, log_add_exp(blank_score, emit_score), NEG_INF)
 
         # Fused gradient computation
         # blank_grad[t, u] = -exp(alpha[t, u] + beta[t+1, u] + blank_logprobs[t, u] - log_like)
