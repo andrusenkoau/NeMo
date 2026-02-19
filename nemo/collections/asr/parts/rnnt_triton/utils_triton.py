@@ -23,14 +23,17 @@ def log_add_exp(log_probs_1, log_probs_2):
 
 
 @triton.jit
-def add_at_range_(x: tl.tensor, y: tl.tensor, start, axis):
-    # TODO: optimize
+def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
+    """
+    Return x[..., 0:start] + (x[..., start:y.shape[axis]] + y) + x[.., y.shape[axis]:]
+    """
     # TODO: add tests
+    # TODO: optimize (?)
+    if axis != 1 or len(x.shape) != 2:
+        # TODO: fix this
+        raise NotImplementedError
     x_offsets = tl.arange(0, x.shape[axis])
-    y_len = y.shape[axis]
-    num_axes = len(x.shape)
-    mask = (x_offsets >= start) & (x_offsets < y_len)
+    mask = (x_offsets >= start) & (x_offsets < y.shape[axis])
     y_indices_safe_to_x = tl.where(mask, x_offsets - start, 0)
-    broadcastable_shape = [1] * axis + [y_len] + [1] * (num_axes - axis)
-    y_to_x_expanded = y.gather(y_indices_safe_to_x.reshape(broadcastable_shape).broadcast_to(x.shape), axis=axis)
-    x += tl.where(mask.reshape(broadcastable_shape), y_to_x_expanded, 0)
+    y_to_x_expanded = y.gather(y_indices_safe_to_x[None, :].broadcast_to(x.shape), axis=axis)
+    return x + tl.where(mask[None, :], y_to_x_expanded, 0)
