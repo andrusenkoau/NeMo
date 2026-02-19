@@ -34,4 +34,5 @@ def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
     y_indices_safe_to_x = tl.where(mask, x_offsets - start, 0)
     broadcastable_shape: tl.constexpr = [1] * axis + [x.shape[axis]] + ([1] * (len(x.shape) - axis - 1))
     y_to_x_expanded = y.gather(y_indices_safe_to_x.reshape(broadcastable_shape).broadcast_to(x.shape), axis=axis)
-    return x + tl.where(mask.reshape(broadcastable_shape), y_to_x_expanded, 0)
+    y_to_x_expanded = tl.where(mask.reshape(broadcastable_shape), y_to_x_expanded, 0.0)
+    return x + y_to_x_expanded
