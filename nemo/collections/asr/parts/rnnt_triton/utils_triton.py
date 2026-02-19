@@ -25,7 +25,7 @@ def log_add_exp(log_probs_1, log_probs_2):
 @triton.jit
 def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
     """
-    Return x[..., 0:start] + (x[..., start:start+y.shape[axis]] + y) + x[.., start+y.shape[axis]:]
+    Return x[..., 0:start] + (x[..., start:start+y.shape[axis]] + y) + x[..., start+y.shape[axis]:]
     """
     # TODO: add tests
     # TODO: optimize (?)
