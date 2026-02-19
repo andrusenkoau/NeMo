@@ -625,7 +625,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         VOCAB_BLOCK = 16 if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR else 64
         FLATTENED_BATCH_BLOCK = 128
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
-        FLATTENED_BATCH_SPLITS = 128
+        FLATTENED_BATCH_SPLITS = 256
         flattened_batch_split_size = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_SPLITS)
 
         weight_bias_num_warps = 4
