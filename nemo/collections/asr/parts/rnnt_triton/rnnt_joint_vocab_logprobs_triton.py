@@ -21,6 +21,17 @@ from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp
 
 
 @triton.jit
+def _matmul(a, b, USE_FP64: tl.constexpr, USE_HIGH_PRECISION: tl.constexpr):
+    if USE_FP64:
+        result = tl.sum(a.T[:, :, None] * b[:, None, :], axis=0)
+    elif USE_HIGH_PRECISION:
+        result = tl.dot(a, b, input_precision="ieee")
+    else:
+        result = tl.dot(a, b)
+    return result
+
+
+@triton.jit
 def _rnnt_joint_vocab_fwd_kernel(
     joint_hidden_ptr,
     targets_ptr,
@@ -123,12 +134,9 @@ def _rnnt_joint_vocab_fwd_kernel(
             hidden_chunk = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            if USE_FP64:
-                block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
-            elif USE_HIGH_PRECISION:
-                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(compute_dtype)
-            else:
-                block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
+            block_logits += _matmul(
+                hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
 
             joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
@@ -289,12 +297,9 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             hidden_chunk = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            if USE_FP64:
-                block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
-            elif USE_HIGH_PRECISION:
-                block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(compute_dtype)
-            else:
-                block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
+            block_logits += _matmul(
+                hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
 
             joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
@@ -315,14 +320,9 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            if USE_FP64:
-                grad_hidden_delta = tl.sum(grad_logits_matmul[:, :, None] * weight_chunk[None, :, :], axis=1).to(
-                    compute_dtype
-                )
-            elif USE_HIGH_PRECISION:
-                grad_hidden_delta = tl.dot(grad_logits_matmul, weight_chunk, input_precision="ieee").to(compute_dtype)
-            else:
-                grad_hidden_delta = tl.dot(grad_logits_matmul, weight_chunk).to(compute_dtype)
+            grad_hidden_delta = _matmul(
+                grad_logits_matmul, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
 
             if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
                 grad_hidden_mask = hidden_blocks_offsets == (hidden_start // HIDDEN_BLOCK)
@@ -478,14 +478,9 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             joint_hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_tile = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            if USE_FP64:
-                logits_block += tl.sum(joint_hidden_tile[:, None, :] * weight_tile[None, :, :], axis=-1)
-            elif USE_HIGH_PRECISION:
-                logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile), input_precision="ieee").to(
-                    compute_dtype
-                )
-            else:
-                logits_block += tl.dot(joint_hidden_tile, tl.trans(weight_tile)).to(compute_dtype)
+            logits_block += _matmul(
+                joint_hidden_tile, weight_tile.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
 
             joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
@@ -509,19 +504,9 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
 
             hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            if USE_FP64:
-                grad_weight_tile = tl.sum(
-                    grad_logits_matmul[:, :, None] * hidden_tile[:, None, :],
-                    axis=0,
-                ).to(compute_dtype)
-            elif USE_HIGH_PRECISION:
-                grad_weight_tile = tl.dot(
-                    tl.trans(grad_logits_matmul),
-                    hidden_tile,
-                    input_precision="ieee",
-                ).to(compute_dtype)
-            else:
-                grad_weight_tile = tl.dot(tl.trans(grad_logits_matmul), hidden_tile).to(compute_dtype)
+            grad_weight_tile = _matmul(
+                grad_logits_matmul.T, hidden_tile, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
 
             if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
                 grad_weight_mask = hidden_blocks_offsets == (hidden_start // HIDDEN_BLOCK)
