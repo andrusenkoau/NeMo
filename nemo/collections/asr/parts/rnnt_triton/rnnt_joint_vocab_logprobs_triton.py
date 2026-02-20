@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 
-from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp, sum_at_range
+from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp
 
 
 @triton.jit
@@ -318,9 +318,9 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
-    HIDDEN_DIM_MAX: tl.constexpr,
     FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
+    NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_INT64: tl.constexpr,
@@ -350,7 +350,8 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
     is_blank_vocab_col = (vocab_offsets == blank_id) & vocab_mask
 
     if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
-        grad_weight_acc = tl.zeros([VOCAB_BLOCK, HIDDEN_DIM_MAX], dtype=compute_dtype)
+        grad_weight_acc = tl.zeros([VOCAB_BLOCK, NUM_HIDDEN_BLOCKS, HIDDEN_BLOCK], dtype=compute_dtype)
+        hidden_blocks_offsets = tl.arange(0, NUM_HIDDEN_BLOCKS)
 
     for flattened_batch_start in tl.range(
         split_flattened_batch_start, split_flattened_batch_end, FLATTENED_BATCH_BLOCK
@@ -458,7 +459,8 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
                 grad_weight_tile = tl.dot(tl.trans(grad_logits_matmul), hidden_tile).to(compute_dtype)
 
             if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
-                grad_weight_acc = sum_at_range(grad_weight_acc, grad_weight_tile, hidden_start, axis=1)
+                grad_weight_mask = hidden_blocks_offsets == (hidden_start // HIDDEN_BLOCK)
+                grad_weight_acc += grad_weight_tile.expand_dims(1) * grad_weight_mask[None, :, None]
             else:
                 tl.atomic_add(
                     grad_weight_out_ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
@@ -468,11 +470,12 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
 
     if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
         # Atomic add into global grads
+        HIDDEN_DIM_MAX: tl.constexpr = NUM_HIDDEN_BLOCKS * HIDDEN_BLOCK
         hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
         hidden_mask_full = hidden_offsets_full < hidden_dim
         tl.atomic_add(
             grad_weight_out_ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
-            grad_weight_acc,
+            grad_weight_acc.reshape([VOCAB_BLOCK, HIDDEN_DIM_MAX]),
             mask=vocab_mask[:, None] & hidden_mask_full[None, :],
         )
 
@@ -622,6 +625,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
 
         USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR = False  # disable for now
         HIDDEN_BLOCK = 64
+        num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, HIDDEN_BLOCK))
         VOCAB_BLOCK = 16 if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR else 64
         FLATTENED_BATCH_BLOCK = 128
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
@@ -650,9 +654,9 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            HIDDEN_DIM_MAX=triton.next_power_of_2(hidden_dim),
             FLATTENED_BATCH_BLOCK=FLATTENED_BATCH_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
+            NUM_HIDDEN_BLOCKS=num_hidden_blocks,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
             USE_INT64=True,  # use int64 indexing; currently - always, further - relax condition

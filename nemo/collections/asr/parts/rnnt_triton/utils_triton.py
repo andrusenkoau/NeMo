@@ -27,8 +27,6 @@ def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
     """
     Return x[..., 0:start] + (x[..., start:start+y.shape[axis]] + y) + x[..., start+y.shape[axis]:]
     """
-    # TODO: add tests
-    # TODO: optimize (?)
     x_offsets = tl.arange(0, x.shape[axis])
     mask = (x_offsets >= start) & (x_offsets < start + y.shape[axis])
     y_indices_safe_to_x = tl.where(mask, x_offsets - start, 0)
@@ -36,3 +34,18 @@ def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
     y_to_x_expanded = y.gather(y_indices_safe_to_x.reshape(broadcastable_shape).broadcast_to(x.shape), axis=axis)
     y_to_x_expanded = tl.where(mask.reshape(broadcastable_shape), y_to_x_expanded, 0.0)
     return x + y_to_x_expanded
+
+
+@triton.jit
+def sum_at_block(x: tl.tensor, y: tl.tensor, block_id, axis: tl.constexpr):
+    """
+    Return x[..., 0:block_id*y.shape[axis]] + (x[..., block_id*y.shape[axis]:(block_id+1)*y.shape[axis] + y) + x[..., (block_id+1)*y.shape[axis]:]
+    """
+    tl.static_assert(x.shape[axis] % y.shape[axis] == 0)
+    num_blocks: tl.constexpr = x.shape[axis] // y.shape[axis]
+    mask = tl.arange(0, num_blocks) == block_id
+    mask_broadcastable_shape: tl.constexpr = [1] * axis + [num_blocks] + ([1] * (len(x.shape) - axis))
+    x_shape_by_blocks: tl.constexpr = x.shape[:axis] + [num_blocks, y.shape[axis]] + x.shape[axis + 1 :]
+    return (x.reshape(x_shape_by_blocks) + y.expand_dims(axis) * mask.reshape(mask_broadcastable_shape)).reshape(
+        x.shape
+    )
