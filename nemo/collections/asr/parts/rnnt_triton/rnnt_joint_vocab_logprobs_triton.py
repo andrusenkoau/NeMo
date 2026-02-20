@@ -184,8 +184,10 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     blank_id: tl.constexpr,
     FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
+    NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
+    USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
@@ -261,14 +263,19 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         block_shape=(VOCAB_BLOCK,),
         order=(0,),
     )
-    grad_hidden_block_ptr = tl.make_block_ptr(
-        base=grad_joint_hidden_out_ptr,
-        shape=(flattened_batch_size, hidden_dim),
-        strides=(hidden_dim, 1),
-        offsets=(flattened_batch_start, 0),
-        block_shape=(FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK),
-        order=(1, 0),
-    )
+
+    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+        grad_hidden_acc = tl.zeros([FLATTENED_BATCH_BLOCK, NUM_HIDDEN_BLOCKS, HIDDEN_BLOCK], dtype=compute_dtype)
+        hidden_blocks_offsets = tl.arange(0, NUM_HIDDEN_BLOCKS)
+    else:
+        grad_hidden_block_ptr = tl.make_block_ptr(
+            base=grad_joint_hidden_out_ptr,
+            shape=(flattened_batch_size, hidden_dim),
+            strides=(hidden_dim, 1),
+            offsets=(flattened_batch_start, 0),
+            block_shape=(FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK),
+            order=(1, 0),
+        )
 
     for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
         vocab_offsets = vocab_start + vocab_offsets_in_block
@@ -305,7 +312,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
 
         # Inner loop 2: compute grad_hidden
         grad_logits_matmul = grad_logits.to(matmul_dtype)
-        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             if USE_FP64:
@@ -317,16 +324,32 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             else:
                 grad_hidden_delta = tl.dot(grad_logits_matmul, weight_chunk).to(compute_dtype)
 
-            old_grad_hidden = tl.load(grad_hidden_block_ptr, boundary_check=(0, 1)).to(compute_dtype)
-            tl.store(grad_hidden_block_ptr, old_grad_hidden + grad_hidden_delta, boundary_check=(0, 1))
+            if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+                grad_hidden_mask = hidden_blocks_offsets == (hidden_start // HIDDEN_BLOCK)
+                grad_hidden_acc += grad_hidden_delta.expand_dims(1) * grad_hidden_mask[None, :, None]
+            else:
+                old_grad_hidden = tl.load(grad_hidden_block_ptr, boundary_check=(0, 1)).to(compute_dtype)
+                tl.store(grad_hidden_block_ptr, old_grad_hidden + grad_hidden_delta, boundary_check=(0, 1))
+                grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_BLOCK))
 
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
-            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_BLOCK))
 
         # Reset hidden, advance vocab for weight; reset hidden for grad_hidden
         weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, -HIDDEN_RESET))
-        grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_RESET))
+        if not USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_RESET))
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
+
+    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+        # Write accumulated grad_hidden to global memory (single write, preserving fp32 precision)
+        HIDDEN_DIM_MAX: tl.constexpr = NUM_HIDDEN_BLOCKS * HIDDEN_BLOCK
+        hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
+        hidden_mask_full = hidden_offsets_full < hidden_dim
+        tl.store(
+            grad_joint_hidden_out_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
+            grad_hidden_acc.reshape([FLATTENED_BATCH_BLOCK, HIDDEN_DIM_MAX]),
+            mask=flattened_batch_valid_mask[:, None] & hidden_mask_full[None, :],
+        )
 
 
 @triton.jit
@@ -622,17 +645,28 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         vocab_size = weight.shape[0]
         device = joint_hidden.device
 
-        # TODO: after fixing backward kernel for joint_hidden (accumulation), use original dtype
+        USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR = False
+        hidden_bwd_hidden_block = 64
+        num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, hidden_bwd_hidden_block))
+
+        if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+            # Accumulate in fp32 registers, write once — allows native dtype output
+            grad_joint_hidden_dtype = joint_hidden.dtype
+            hidden_bwd_flattened_batch_block = 16  # reduced to fit 3D register accumulator
+        else:
+            grad_joint_hidden_dtype = float_dtype
+            hidden_bwd_flattened_batch_block = 64
+
         grad_joint_hidden = torch.zeros(
-            [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim], dtype=float_dtype, device=device
+            [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim],
+            dtype=grad_joint_hidden_dtype,
+            device=device,
         )
 
         if use_high_precision or joint_hidden.dtype != torch.bfloat16:
             hidden_bwd_vocab_block = 64
         else:
             hidden_bwd_vocab_block = 128
-        hidden_bwd_flattened_batch_block = 64
-        hidden_bwd_hidden_block = 64
         hidden_bwd_num_warps = 4
         hidden_bwd_num_stages = 2
 
@@ -657,8 +691,10 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             blank_id=blank_id,
             FLATTENED_BATCH_BLOCK=hidden_bwd_flattened_batch_block,
             HIDDEN_BLOCK=hidden_bwd_hidden_block,
+            NUM_HIDDEN_BLOCKS=num_hidden_blocks,
             VOCAB_BLOCK=hidden_bwd_vocab_block,
             USE_FP64=use_fp64,
+            USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR=USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=hidden_bwd_num_warps,
             num_stages=hidden_bwd_num_stages,
