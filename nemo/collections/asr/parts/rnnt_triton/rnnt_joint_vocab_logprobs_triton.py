@@ -17,18 +17,7 @@ import triton
 import triton.language as tl
 
 
-from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp
-
-
-@triton.jit
-def _matmul(a, b, USE_FP64: tl.constexpr, USE_HIGH_PRECISION: tl.constexpr):
-    if USE_FP64:
-        result = tl.sum(a.T[:, :, None] * b[:, None, :], axis=0)
-    elif USE_HIGH_PRECISION:
-        result = tl.dot(a, b, input_precision="ieee")
-    else:
-        result = tl.dot(a, b)
-    return result
+from nemo.collections.asr.parts.rnnt_triton.utils_triton import log_add_exp, matmul
 
 
 @triton.jit
@@ -134,7 +123,7 @@ def _rnnt_joint_vocab_fwd_kernel(
             hidden_chunk = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            block_logits += _matmul(
+            block_logits += matmul(
                 hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
@@ -297,7 +286,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             hidden_chunk = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            block_logits += _matmul(
+            block_logits += matmul(
                 hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
@@ -320,7 +309,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            grad_hidden_delta = _matmul(
+            grad_hidden_delta = matmul(
                 grad_logits_matmul, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
@@ -478,7 +467,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             joint_hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_tile = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            logits_block += _matmul(
+            logits_block += matmul(
                 joint_hidden_tile, weight_tile.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
@@ -504,7 +493,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
 
             hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            grad_weight_tile = _matmul(
+            grad_weight_tile = matmul(
                 grad_logits_matmul.T, hidden_tile, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 

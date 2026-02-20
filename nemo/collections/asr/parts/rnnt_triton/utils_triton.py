@@ -23,6 +23,17 @@ def log_add_exp(log_probs_1, log_probs_2):
 
 
 @triton.jit
+def matmul(a: tl.tensor, b: tl.tensor, USE_FP64: tl.constexpr, USE_HIGH_PRECISION: tl.constexpr):
+    if USE_FP64:
+        result = tl.sum(a.T[:, :, None] * b[:, None, :], axis=0)
+    elif USE_HIGH_PRECISION:
+        result = tl.dot(a, b, input_precision="ieee")
+    else:
+        result = tl.dot(a, b)
+    return result
+
+
+@triton.jit
 def sum_at_range(x: tl.tensor, y: tl.tensor, start, axis: tl.constexpr):
     """
     Return x[..., 0:start] + (x[..., start:start+y.shape[axis]] + y) + x[..., start+y.shape[axis]:]
