@@ -41,10 +41,8 @@ def _rnnt_joint_vocab_fwd_kernel(
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
-    USE_INT64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
-    int_dtype = tl.int64 if USE_INT64 else tl.int32
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
     matmul_dtype = (
         compute_dtype
@@ -52,7 +50,7 @@ def _rnnt_joint_vocab_fwd_kernel(
         else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
     )
 
-    flattened_batch_block_index = tl.program_id(axis=0).to(int_dtype)
+    flattened_batch_block_index = tl.program_id(axis=0)
     flattened_batch_start = flattened_batch_block_index * FLATTENED_BATCH_BLOCK
     flattened_batch_offsets = flattened_batch_start + tl.arange(0, FLATTENED_BATCH_BLOCK)
     flattened_batch_valid_mask = flattened_batch_offsets < flattened_batch_size
@@ -73,7 +71,6 @@ def _rnnt_joint_vocab_fwd_kernel(
     output_target_mask = flattened_batch_valid_mask & source_mask & target_label_mask
 
     vocab_offsets_in_block = tl.arange(0, VOCAB_BLOCK)
-    hidden_offsets = tl.arange(0, HIDDEN_BLOCK)
 
     log_sum_exp_score = tl.full([FLATTENED_BATCH_BLOCK], value=float("-inf"), dtype=compute_dtype)
     blank_logits = tl.zeros([FLATTENED_BATCH_BLOCK], dtype=compute_dtype)
@@ -86,34 +83,45 @@ def _rnnt_joint_vocab_fwd_kernel(
         other=0,
     )
 
-    for vocab_start_i32 in tl.range(0, vocab_size, VOCAB_BLOCK):
-        vocab_start = vocab_start_i32.to(int_dtype)
+    # Create block pointers once before the loops
+    NUM_HIDDEN_ITERS: tl.constexpr = (hidden_dim + HIDDEN_BLOCK - 1) // HIDDEN_BLOCK
+    HIDDEN_RESET: tl.constexpr = NUM_HIDDEN_ITERS * HIDDEN_BLOCK
+
+    joint_hidden_block_ptr = tl.make_block_ptr(
+        base=joint_hidden_ptr,
+        shape=(flattened_batch_size, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(flattened_batch_start, 0),
+        block_shape=(FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
+    weight_block_ptr = tl.make_block_ptr(
+        base=weight_ptr,
+        shape=(vocab_size, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(0, 0),
+        block_shape=(VOCAB_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
+    bias_block_ptr = tl.make_block_ptr(
+        base=bias_ptr,
+        shape=(vocab_size,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(VOCAB_BLOCK,),
+        order=(0,),
+    )
+
+    for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
         vocab_offsets = vocab_start + vocab_offsets_in_block
         vocab_mask = vocab_offsets < vocab_size
-        bias_chunk = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=0.0).to(compute_dtype)
+
+        bias_chunk = tl.load(bias_block_ptr, boundary_check=(0,)).to(compute_dtype)
 
         block_logits = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
-        for hidden_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            hidden_start = hidden_start_i32.to(int_dtype)
-            hidden_mask = (hidden_start + hidden_offsets) < hidden_dim
-
-            hidden_ptrs = (
-                joint_hidden_ptr
-                + flattened_batch_offsets[:, None] * hidden_dim
-                + hidden_start
-                + hidden_offsets[None, :]
-            )
-            hidden_chunk = tl.load(
-                hidden_ptrs,
-                mask=output_blank_mask[:, None] & hidden_mask[None, :],
-                other=0.0,
-            ).to(matmul_dtype)
-
-            weight_chunk = tl.load(
-                weight_ptr + vocab_offsets[:, None] * hidden_dim + hidden_start + hidden_offsets[None, :],
-                mask=vocab_mask[:, None] & hidden_mask[None, :],
-                other=0.0,
-            ).to(matmul_dtype)
+        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            hidden_chunk = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             if USE_FP64:
                 block_logits += tl.sum(hidden_chunk[:, None, :] * weight_chunk[None, :, :], axis=-1)
@@ -121,6 +129,14 @@ def _rnnt_joint_vocab_fwd_kernel(
                 block_logits += tl.dot(hidden_chunk, weight_chunk.T, input_precision="ieee").to(compute_dtype)
             else:
                 block_logits += tl.dot(hidden_chunk, weight_chunk.T).to(compute_dtype)
+
+            joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
+            weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
+
+        # Reset hidden dim, advance vocab dim for next iteration
+        joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_RESET))
+        weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, -HIDDEN_RESET))
+        bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
 
         block_logits = tl.where(vocab_mask[None, :], block_logits, -float("inf"))
         block_logits_max = tl.max(block_logits, axis=-1)
@@ -548,7 +564,6 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
-            USE_INT64=True,  # use int64 indexing; currently - always, further - relax condition
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=num_warps,
             num_stages=forward_num_stages,
