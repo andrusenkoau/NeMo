@@ -835,7 +835,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             [batch_size, src_max_length, tgt_max_length_plus_1], dtype=float_dtype, device=device
         )
         blank_logprobs = torch.zeros_like(target_logprobs)
-        lse = torch.empty_like(target_logprobs)
+        log_sum_exp_scores = torch.empty_like(target_logprobs)
 
         VOCAB_BLOCK = 64
         HIDDEN_BLOCK = 32
@@ -857,7 +857,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             bias_ptr=bias,
             target_logprobs_out_ptr=target_logprobs,
             blank_logprobs_out_ptr=blank_logprobs,
-            lse_out_ptr=lse,
+            lse_out_ptr=log_sum_exp_scores,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             joint_dim=hidden_dim,
@@ -881,7 +881,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             targets,
             src_lengths,
             tgt_lengths,
-            lse,
+            log_sum_exp_scores,
         )
         ctx.blank_id = blank_id
         ctx.use_fp64 = use_fp64
@@ -898,7 +898,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             targets,
             src_lengths,
             tgt_lengths,
-            lse,
+            log_sum_exp_scores,
         ) = ctx.saved_tensors
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
@@ -937,7 +937,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             weight_ptr=weight,
             bias_ptr=bias,
-            lse_ptr=lse,
+            lse_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             grad_encoder_partial_out_ptr=grad_encoder_partial,
