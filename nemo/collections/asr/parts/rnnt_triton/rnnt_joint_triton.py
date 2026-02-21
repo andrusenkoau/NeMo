@@ -82,12 +82,7 @@ def _rnnt_joint_fwd_kernel(
     target_label_mask = target_offsets < target_len  # target labels exist at u < target_len
     NUM_TILE_ELEMENTS: tl.constexpr = ENCODER_BLOCK * PREDICTOR_BLOCK
 
-    # Batch base pointers (source_offsets/target_offsets are absolute indices)
-    enc_batch_base = batch_i * max_src_len * hidden_dim
-    pred_batch_base = batch_i * max_tgt_len_plus_1 * hidden_dim
-
     vocab_chunk_offsets = tl.arange(0, VOCAB_BLOCK)
-    hidden_offsets = tl.arange(0, HIDDEN_BLOCK)
 
     # Initialize log-sum-exp accumulator, blank and target logits
     log_sum_exp_score = tl.full([NUM_TILE_ELEMENTS], value=float("-inf"), dtype=compute_dtype)
@@ -99,10 +94,26 @@ def _rnnt_joint_fwd_kernel(
     targets_predictor = tl.load(targets_ptr + batch_i * max_tgt_len + target_offsets, mask=target_label_mask, other=0)
     targets = targets_predictor[None, :].broadcast_to([ENCODER_BLOCK, PREDICTOR_BLOCK]).reshape([NUM_TILE_ELEMENTS])
 
-    # Create block pointers for weight and bias
+    # Create block pointers for encoder, predictor, weight, and bias
     NUM_HIDDEN_ITERS: tl.constexpr = (hidden_dim + HIDDEN_BLOCK - 1) // HIDDEN_BLOCK
     HIDDEN_RESET: tl.constexpr = NUM_HIDDEN_ITERS * HIDDEN_BLOCK
 
+    enc_block_ptr = tl.make_block_ptr(
+        base=encoder_output_ptr + batch_i * max_src_len * hidden_dim,
+        shape=(source_len, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(source_i_start.to(tl.int32), 0),
+        block_shape=(ENCODER_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
+    pred_block_ptr = tl.make_block_ptr(
+        base=predictor_output_ptr + batch_i * max_tgt_len_plus_1 * hidden_dim,
+        shape=(target_len + 1, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(target_i_start.to(tl.int32), 0),
+        block_shape=(PREDICTOR_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
     weight_block_ptr = tl.make_block_ptr(
         base=weight_ptr,
         shape=(vocab_size, hidden_dim),
@@ -130,32 +141,9 @@ def _rnnt_joint_fwd_kernel(
         block_logits = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
 
         # Inner loop over hidden dimension chunks
-        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            d_mask = (hidden_start + hidden_offsets) < hidden_dim
-
-            # Load enc/pred for this hidden chunk (manual pointer arithmetic)
-            enc_chunk = tl.load(
-                encoder_output_ptr
-                + enc_batch_base
-                + source_offsets[:, None] * hidden_dim
-                + hidden_start
-                + hidden_offsets[None, :],
-                mask=source_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            ).to(
-                matmul_dtype
-            )  # [ENCODER_BLOCK, HIDDEN_BLOCK]
-            pred_chunk = tl.load(
-                predictor_output_ptr
-                + pred_batch_base
-                + target_offsets[:, None] * hidden_dim
-                + hidden_start
-                + hidden_offsets[None, :],
-                mask=target_valid_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            ).to(
-                matmul_dtype
-            )  # [PREDICTOR_BLOCK, HIDDEN_BLOCK]
+        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            enc_chunk = tl.load(enc_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             # hidden = relu(enc + pred) -> [ENC, PRED, HIDDEN_BLOCK] -> [TILE, HIDDEN_BLOCK]
             hidden_chunk = (
@@ -173,9 +161,13 @@ def _rnnt_joint_fwd_kernel(
                 hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
+            enc_block_ptr = tl.advance(enc_block_ptr, (0, HIDDEN_BLOCK))
+            pred_block_ptr = tl.advance(pred_block_ptr, (0, HIDDEN_BLOCK))
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
 
-        # Reset weight hidden dim, advance vocab for next iteration
+        # Reset hidden dim for enc/pred/weight, advance vocab for weight/bias
+        enc_block_ptr = tl.advance(enc_block_ptr, (0, -HIDDEN_RESET))
+        pred_block_ptr = tl.advance(pred_block_ptr, (0, -HIDDEN_RESET))
         weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, -HIDDEN_RESET))
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
 
