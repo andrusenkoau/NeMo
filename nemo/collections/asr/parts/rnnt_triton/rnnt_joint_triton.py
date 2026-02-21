@@ -841,6 +841,8 @@ class RnntJointLogProbs(torch.autograd.Function):
         HIDDEN_BLOCK = 32
         ENCODER_BLOCK = 16
         PREDICTOR_BLOCK = 16
+        forward_num_stages = 1 if use_high_precision else 2
+        num_warps = 4
 
         num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
         num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
@@ -867,6 +869,8 @@ class RnntJointLogProbs(torch.autograd.Function):
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
+            num_warps=num_warps,
+            num_stages=forward_num_stages,
         )
 
         ctx.save_for_backward(
