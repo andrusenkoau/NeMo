@@ -140,11 +140,11 @@ def benchmark_standard_joint(
         del loss
 
         # Max peak memory (combined fwd+bwd)
+        clear_grads()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         baseline_memory = torch.cuda.memory_allocated()
-        clear_grads()
         loss = run_fwd()
         loss.backward()
         torch.cuda.synchronize()
@@ -287,11 +287,11 @@ def benchmark_triton_joint(
         del loss
 
         # Max peak memory (combined fwd+bwd)
+        clear_grads()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         baseline_memory = torch.cuda.memory_allocated()
-        clear_grads()
         loss = run_fwd()
         loss.backward()
         torch.cuda.synchronize()
@@ -434,11 +434,11 @@ def benchmark_triton_vocab_joint(
         backward_peak_memory = torch.cuda.max_memory_allocated() - backward_baseline_memory
         del loss
 
+        clear_grads()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         baseline_memory = torch.cuda.memory_allocated()
-        clear_grads()
         loss = run_fwd()
         loss.backward()
         torch.cuda.synchronize()
