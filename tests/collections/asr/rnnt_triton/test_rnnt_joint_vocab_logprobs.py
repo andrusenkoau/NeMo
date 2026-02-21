@@ -28,6 +28,7 @@ if TRITON_AVAILABLE:
 
 def _reference_joint_vocab_logprobs(joint_hidden, weight, bias, targets, src_lengths, tgt_lengths, blank_id):
     logits = functional.linear(joint_hidden, weight, bias)
+    # TODO: check with rnnt_logprobs_torch
     target_logprobs, blank_logprobs = rnnt_logprobs(
         logits=logits,
         targets=targets,
@@ -59,7 +60,7 @@ class TestRnntJointVocabLogProbsTriton:
         device = torch.device("cuda")
         torch.manual_seed(42)
         use_high_precision = True
-
+        # torch.autograd.set_detect_anomaly(True)
         batch_size, src_length, tgt_length, hidden_dim, vocab_size_no_blank = shape
         blank_id = vocab_size_no_blank
         vocab_size_with_blank = vocab_size_no_blank + 1
