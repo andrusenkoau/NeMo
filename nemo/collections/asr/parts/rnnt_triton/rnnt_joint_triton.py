@@ -56,9 +56,9 @@ def _rnnt_joint_fwd_kernel(
     Calculations are performed in float32 or float64 based on USE_FP64.
     When USE_HIGH_PRECISION is False, tl.dot uses TF32 (faster but ~10-bit mantissa).
     """
-    batch_i = tl.program_id(axis=0).to(tl.int64)
-    source_block_i = tl.program_id(axis=1).to(tl.int64)
-    target_block_i = tl.program_id(axis=2).to(tl.int64)
+    batch_i = tl.program_id(axis=0)
+    source_block_i = tl.program_id(axis=1)
+    target_block_i = tl.program_id(axis=2)
     source_i_start = source_block_i * ENCODER_BLOCK
     target_i_start = target_block_i * PREDICTOR_BLOCK
 
