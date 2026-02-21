@@ -279,7 +279,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         vocab_mask = vocab_offsets < vocab_size
 
         bias_chunk = tl.load(bias_block_ptr, boundary_check=(0,)).to(compute_dtype)
-        block_logits = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
+        logits_block = tl.zeros([FLATTENED_BATCH_BLOCK, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
 
         # Inner loop 1: recompute logits
         for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
@@ -288,7 +288,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             # weight_chunk: [VOCAB_BLOCK, HIDDEN_BLOCK]
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-            block_logits += matmul(
+            logits_block += matmul(
                 hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
@@ -299,14 +299,16 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_RESET))
 
         # Compute grad_logits
-        softmax = tl.exp(tl.where(vocab_mask[None, :], block_logits - lse[:, None], 0.0))
-        grad_logits = -softmax * sum_grad[:, None]
-        grad_logits += tl.where(vocab_offsets[None, :] == targets[:, None], grad_target[:, None], 0.0)
-        grad_logits += tl.where((vocab_offsets == blank_id)[None, :], grad_blank[:, None], 0.0)
-        grad_logits = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits, 0.0)
+        probabilities_block = tl.exp(tl.where(vocab_mask[None, :], logits_block - lse[:, None], 0.0))
+        grad_logits_block = (
+            -(sum_grad[:, None] * probabilities_block)
+            + (grad_blank[:, None] * (vocab_offsets == blank_id)[None, :])
+            + (grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]))
+        )
+        grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
 
         # Inner loop 2: compute grad_hidden (reverse iteration for cache reuse)
-        grad_logits_matmul = grad_logits.to(matmul_dtype)
+        grad_logits_matmul = grad_logits_block.to(matmul_dtype)
         if not USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
             grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_RESET))
         for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
