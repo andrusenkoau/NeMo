@@ -71,9 +71,12 @@ def rnnt_logprobs_torch(
     """
     device = logits.device
     batch_size = logits.shape[0]
+    tgt_length_max = logits.shape[2] - 1
     log_probs = F.log_softmax(logits, dim=-1)
     blank_scores = log_probs[..., blank_id]
-    targets = torch.cat((targets, torch.zeros([batch_size], dtype=targets.dtype, device=device).unsqueeze(1)), dim=-1)
+    # Truncate targets to match the U dimension of logits (handles padded targets when tgt_length=0)
+    targets = targets[:, :tgt_length_max]
+    targets = torch.cat((targets, torch.zeros([batch_size, 1], dtype=targets.dtype, device=device)), dim=-1)
     target_scores = torch.gather(
         log_probs, dim=-1, index=targets.unsqueeze(1).expand(log_probs.shape[:-1]).unsqueeze(-1)
     ).squeeze(-1)
@@ -88,8 +91,8 @@ def rnnt_logprobs_torch(
             src_lengths=src_lengths,
             tgt_lengths=tgt_lengths,
         )
-        target_scores *= mask_nb
-        blank_scores *= mask_blank
+        target_scores = target_scores * mask_nb
+        blank_scores = blank_scores * mask_blank
     return target_scores, blank_scores
 
 
