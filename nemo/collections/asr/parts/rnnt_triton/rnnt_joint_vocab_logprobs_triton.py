@@ -295,9 +295,8 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
 
-        # Reset hidden for both
+        # Reset hidden for joint_hidden only; weight stays at HIDDEN_RESET for reverse Loop 2
         joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_RESET))
-        weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_RESET))
 
         # Compute grad_logits
         softmax = tl.exp(tl.where(vocab_mask[None, :], block_logits - lse[:, None], 0.0))
@@ -306,9 +305,12 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         grad_logits += tl.where((vocab_offsets == blank_id)[None, :], grad_blank[:, None], 0.0)
         grad_logits = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits, 0.0)
 
-        # Inner loop 2: compute grad_hidden
+        # Inner loop 2: compute grad_hidden (reverse iteration for cache reuse)
         grad_logits_matmul = grad_logits.to(matmul_dtype)
-        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+        if not USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_RESET))
+        for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_BLOCK))
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             grad_hidden_delta = matmul(
@@ -316,23 +318,20 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             ).to(compute_dtype)
 
             if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-                grad_hidden_mask = hidden_blocks_offsets == (hidden_start // HIDDEN_BLOCK)
+                reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
+                grad_hidden_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
                 grad_hidden_acc += grad_hidden_delta.expand_dims(1) * grad_hidden_mask[None, :, None]
             else:
+                grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_BLOCK))
                 old_grad_hidden = tl.load(grad_hidden_block_ptr, boundary_check=(0, 1)).to(compute_dtype)
                 tl.store(
                     grad_hidden_block_ptr,
                     (old_grad_hidden + grad_hidden_delta).to(grad_hidden_block_ptr.dtype.element_ty),
                     boundary_check=(0, 1),
                 )
-                grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_BLOCK))
 
-            weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
-
-        # Reset hidden, advance vocab for weight; reset hidden for grad_hidden
-        weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, -HIDDEN_RESET))
-        if not USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_RESET))
+        # weight_block_ptr is at hidden 0 after reverse loop; advance vocab only
+        weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, 0))
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
 
     if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
@@ -469,6 +468,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         grad_logits_block += grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]).to(compute_dtype)
 
         # Inner loop 1: recompute logits
+        # joint_hidden_tile = tl.zeros([FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK], dtype=matmul_dtype)
         for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             joint_hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             weight_tile = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
@@ -480,8 +480,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
             weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
 
-        # Reset hidden for both
-        joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_RESET))
+        # Reset hidden for weight only; joint_hidden stays at HIDDEN_RESET for reverse Loop 2
         weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_RESET))
 
         probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
@@ -491,12 +490,15 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         # compute grad bias addition
         grad_bias_acc += tl.sum(grad_logits_block, axis=0)
 
-        # Inner loop 2: compute grad weight (atomic_add needs pointer arithmetic)
+        # Inner loop 2: compute grad weight (reverse iteration for cache reuse)
         grad_logits_matmul = grad_logits_block.to(matmul_dtype)
-        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
+        for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
+            hidden_offsets = reverse_hidden_start + tl.arange(0, HIDDEN_BLOCK)
             hidden_mask = hidden_offsets < hidden_dim
 
+            joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_BLOCK))
+            # if forward_hidden_idx > 0:
             joint_hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             grad_weight_tile = matmul(
@@ -504,7 +506,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
             ).to(compute_dtype)
 
             if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
-                grad_weight_mask = hidden_blocks_offsets == (hidden_start // HIDDEN_BLOCK)
+                grad_weight_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
                 grad_weight_acc += grad_weight_tile.expand_dims(1) * grad_weight_mask[None, :, None]
             else:
                 ptr = grad_weight_out_ptr + flattened_batch_split_index * (hidden_dim * vocab_size)
@@ -518,10 +520,8 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
                     mask=vocab_mask[:, None] & hidden_mask[None, :],
                 )
 
-            joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, HIDDEN_BLOCK))
-
-        # Advance batch, reset hidden
-        joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (FLATTENED_BATCH_BLOCK, -HIDDEN_RESET))
+        # joint_hidden_block_ptr is at hidden 0 after reverse loop; advance batch only
+        joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (FLATTENED_BATCH_BLOCK, 0))
 
     if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
         # Atomic add into global grads
