@@ -143,6 +143,8 @@ def _rnnt_joint_fwd_kernel(
                 + d_offsets[None, :],
                 mask=source_mask[:, None] & d_mask[None, :],
                 other=0.0,
+            ).to(
+                matmul_dtype
             )  # [ENC_CHUNK, D_CHUNK]
             pred_chunk = tl.load(
                 predictor_output_ptr
@@ -152,17 +154,15 @@ def _rnnt_joint_fwd_kernel(
                 + d_offsets[None, :],
                 mask=target_valid_mask[:, None] & d_mask[None, :],
                 other=0.0,
+            ).to(
+                matmul_dtype
             )  # [PRED_CHUNK, D_CHUNK]
 
             # hidden = relu(enc + pred) -> [ENC, PRED, D_CHUNK] -> [TILE, D_CHUNK]
-            hidden_chunk = (
-                tl.maximum(
-                    enc_chunk[:, None, :] + pred_chunk[None, :, :],
-                    0.0,
-                )
-                .to(matmul_dtype)
-                .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
-            )
+            hidden_chunk = tl.maximum(
+                enc_chunk[:, None, :] + pred_chunk[None, :, :],
+                0.0,
+            ).reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
 
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
