@@ -87,7 +87,7 @@ def _rnnt_joint_fwd_kernel(
     pred_batch_base = batch_i * max_tgt_len_plus_1 * hidden_dim
 
     vocab_chunk_offsets = tl.arange(0, VOCAB_BLOCK)
-    d_offsets = tl.arange(0, HIDDEN_BLOCK)
+    hidden_offsets = tl.arange(0, HIDDEN_BLOCK)
 
     # Initialize log-sum-exp accumulator, blank and target logits
     log_sum_exp_score = tl.full([NUM_TILE_ELEMENTS], value=float("-inf"), dtype=compute_dtype)
@@ -130,35 +130,34 @@ def _rnnt_joint_fwd_kernel(
         block_logits = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
 
         # Inner loop over hidden dimension chunks
-        for d_start_i32 in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            d_start = d_start_i32.to(tl.int64)
-            d_mask = (d_start + d_offsets) < hidden_dim
+        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            d_mask = (hidden_start + hidden_offsets) < hidden_dim
 
             # Load enc/pred for this hidden chunk (manual pointer arithmetic)
             enc_chunk = tl.load(
                 encoder_output_ptr
                 + enc_batch_base
                 + source_offsets[:, None] * hidden_dim
-                + d_start
-                + d_offsets[None, :],
+                + hidden_start
+                + hidden_offsets[None, :],
                 mask=source_mask[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(
                 matmul_dtype
-            )  # [ENC_CHUNK, D_CHUNK]
+            )  # [ENCODER_BLOCK, HIDDEN_BLOCK]
             pred_chunk = tl.load(
                 predictor_output_ptr
                 + pred_batch_base
                 + target_offsets[:, None] * hidden_dim
-                + d_start
-                + d_offsets[None, :],
+                + hidden_start
+                + hidden_offsets[None, :],
                 mask=target_valid_mask[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(
                 matmul_dtype
-            )  # [PRED_CHUNK, D_CHUNK]
+            )  # [PREDICTOR_BLOCK, HIDDEN_BLOCK]
 
-            # hidden = relu(enc + pred) -> [ENC, PRED, D_CHUNK] -> [TILE, D_CHUNK]
+            # hidden = relu(enc + pred) -> [ENC, PRED, HIDDEN_BLOCK] -> [TILE, HIDDEN_BLOCK]
             hidden_chunk = tl.maximum(
                 enc_chunk[:, None, :] + pred_chunk[None, :, :],
                 0.0,
