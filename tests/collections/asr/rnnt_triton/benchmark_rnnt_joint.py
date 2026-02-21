@@ -83,14 +83,9 @@ def benchmark_standard_joint(
     blank_id = num_classes
     max_target_plus_1 = max_targets + 1
 
-    torch.manual_seed(42)
     enc_proj = torch.randn(batch_size, max_time, hidden_dim, device=device, dtype=dtype, requires_grad=True)
     pred_proj = torch.randn(batch_size, max_target_plus_1, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-    weight = torch.randn(vocab_size, hidden_dim, device=device, dtype=dtype)
-    bias = torch.randn(vocab_size, device=device, dtype=dtype)
     linear = torch.nn.Linear(hidden_dim, vocab_size, device=device, dtype=dtype)
-    linear.weight = torch.nn.Parameter(weight)
-    linear.bias = torch.nn.Parameter(bias)
     targets = torch.randint(0, blank_id, (batch_size, max_targets), device=device, dtype=torch.long)
     src_lengths = torch.full([batch_size], max_time, device=device, dtype=torch.long)
     tgt_lengths = torch.full([batch_size], max_targets, device=device, dtype=torch.long)
@@ -111,7 +106,7 @@ def benchmark_standard_joint(
             enc_proj.grad = None
         if pred_proj.grad is not None:
             pred_proj.grad = None
-        linear.zero_grad()
+        linear.zero_grad(set_to_none=True)
 
     # Warmup
     for _ in range(warmup_iters):
@@ -226,11 +221,9 @@ def benchmark_triton_joint(
     blank_id = num_classes
     max_target_plus_1 = max_targets + 1
 
-    torch.manual_seed(42)
     enc_proj = torch.randn(batch_size, max_time, hidden_dim, device=device, dtype=dtype, requires_grad=True)
     pred_proj = torch.randn(batch_size, max_target_plus_1, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-    weight = torch.randn(vocab_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-    bias = torch.randn(vocab_size, device=device, dtype=dtype, requires_grad=True)
+    linear = torch.nn.Linear(hidden_dim, vocab_size, device=device, dtype=dtype)
     targets = torch.randint(0, blank_id, (batch_size, max_targets), device=device, dtype=torch.long)
     src_lengths = torch.full([batch_size], max_time, device=device, dtype=torch.long)
     tgt_lengths = torch.full([batch_size], max_targets, device=device, dtype=torch.long)
@@ -242,8 +235,8 @@ def benchmark_triton_joint(
             targets=targets,
             tgt_lengths=tgt_lengths,
             src_lengths=src_lengths,
-            weight=weight,
-            bias=bias,
+            weight=linear.weight,
+            bias=linear.bias,
             blank_id=blank_id,
         )
         loss_batch = rnnt_loss_from_logprobs_triton(
@@ -259,10 +252,7 @@ def benchmark_triton_joint(
             enc_proj.grad = None
         if pred_proj.grad is not None:
             pred_proj.grad = None
-        if weight.grad is not None:
-            weight.grad = None
-        if bias.grad is not None:
-            bias.grad = None
+        linear.zero_grad(set_to_none=True)
 
     # Warmup
     for _ in range(warmup_iters):
@@ -380,11 +370,9 @@ def benchmark_triton_vocab_joint(
     blank_id = num_classes
     max_target_plus_1 = max_targets + 1
 
-    torch.manual_seed(42)
     enc_proj = torch.randn(batch_size, max_time, hidden_dim, device=device, dtype=dtype, requires_grad=True)
     pred_proj = torch.randn(batch_size, max_target_plus_1, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-    weight = torch.randn(vocab_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-    bias = torch.randn(vocab_size, device=device, dtype=dtype, requires_grad=True)
+    linear = torch.nn.Linear(hidden_dim, vocab_size, device=device, dtype=dtype)
     targets = torch.randint(0, blank_id, (batch_size, max_targets), device=device, dtype=torch.long)
     src_lengths = torch.full([batch_size], max_time, device=device, dtype=torch.long)
     tgt_lengths = torch.full([batch_size], max_targets, device=device, dtype=torch.long)
@@ -397,8 +385,8 @@ def benchmark_triton_vocab_joint(
             targets=targets,
             tgt_lengths=tgt_lengths,
             src_lengths=src_lengths,
-            weight=weight,
-            bias=bias,
+            weight=linear.weight,
+            bias=linear.bias,
             blank_id=blank_id,
         )
         loss_batch = rnnt_loss_from_logprobs_triton(
@@ -414,10 +402,7 @@ def benchmark_triton_vocab_joint(
             enc_proj.grad = None
         if pred_proj.grad is not None:
             pred_proj.grad = None
-        if weight.grad is not None:
-            weight.grad = None
-        if bias.grad is not None:
-            bias.grad = None
+        linear.zero_grad(set_to_none=True)
 
     for _ in range(warmup_iters):
         clear_grads()
@@ -594,6 +579,8 @@ def main():
     gpu_name = torch.cuda.get_device_name(0)
     print(f"\nGPU: {gpu_name}")
     dtype = get_dtype(args.dtype)
+
+    torch.manual_seed(42)
 
     if args.joint == 'standard':
         results = benchmark_standard_joint(
