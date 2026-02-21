@@ -630,7 +630,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         device = joint_hidden.device
 
         USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR = False
-        FULL_PRECISION_JOINT_GRAD_CALC = True
+        FULL_PRECISION_JOINT_GRAD_CALC = False  # TODO: make param(?)
         hidden_bwd_hidden_block = 64
         num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, hidden_bwd_hidden_block))
 
