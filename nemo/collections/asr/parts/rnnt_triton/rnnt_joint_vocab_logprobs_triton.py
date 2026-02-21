@@ -283,7 +283,9 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
 
         # Inner loop 1: recompute logits
         for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            # hidden_chunk: [FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK]
             hidden_chunk = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            # weight_chunk: [VOCAB_BLOCK, HIDDEN_BLOCK]
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             block_logits += matmul(
