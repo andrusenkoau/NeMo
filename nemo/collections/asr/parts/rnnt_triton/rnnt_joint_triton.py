@@ -987,7 +987,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             weight_ptr=weight,
             bias_ptr=bias,
-            lse_ptr=lse,
+            lse_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             grad_weight_partial_out_ptr=grad_weight_partial,
