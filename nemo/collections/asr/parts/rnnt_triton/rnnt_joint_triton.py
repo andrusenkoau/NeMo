@@ -31,7 +31,7 @@ def _rnnt_joint_fwd_kernel(
     bias_ptr,
     target_logprobs_out_ptr,
     blank_logprobs_out_ptr,
-    lse_out_ptr,
+    log_sum_exp_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
     hidden_dim: tl.constexpr,
@@ -96,8 +96,8 @@ def _rnnt_joint_fwd_kernel(
 
     # Load target labels with batch offset
     max_tgt_len = max_tgt_len_plus_1 - 1
-    targets = tl.load(targets_ptr + batch_i * max_tgt_len + target_offsets, mask=target_label_mask, other=0)
-    targets_expanded = targets[None, :].broadcast_to([ENCODER_BLOCK, PREDICTOR_BLOCK]).reshape([NUM_TILE_ELEMENTS])
+    targets_predictor = tl.load(targets_ptr + batch_i * max_tgt_len + target_offsets, mask=target_label_mask, other=0)
+    targets = targets_predictor[None, :].broadcast_to([ENCODER_BLOCK, PREDICTOR_BLOCK]).reshape([NUM_TILE_ELEMENTS])
 
     # Create block pointers for weight and bias
     NUM_HIDDEN_ITERS: tl.constexpr = (hidden_dim + HIDDEN_BLOCK - 1) // HIDDEN_BLOCK
@@ -186,9 +186,7 @@ def _rnnt_joint_fwd_kernel(
 
         # Extract blank and target logits from this chunk
         blank_logits += tl.sum(tl.where((vocab_offsets == blank_id)[None, :], block_logits, 0.0), axis=-1)
-        target_logits += tl.sum(
-            tl.where(vocab_offsets[None, :] == targets_expanded[:, None], block_logits, 0.0), axis=-1
-        )
+        target_logits += tl.sum(tl.where(vocab_offsets[None, :] == targets[:, None], block_logits, 0.0), axis=-1)
 
     # Output index in [B, T, U+1] grid
     indices_grid = (batch_i * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
@@ -202,14 +200,14 @@ def _rnnt_joint_fwd_kernel(
     )
 
     # Store target logprobs (valid only for u < target_len)
-    target_store_mask = source_mask[:, None] & target_label_mask[None, :]
+    output_target_mask = source_mask[:, None] & target_label_mask[None, :]
     tl.store(
         target_logprobs_out_ptr + indices_grid,
         (target_logits - log_sum_exp_score).reshape([ENCODER_BLOCK, PREDICTOR_BLOCK]),
-        mask=target_store_mask,
+        mask=output_target_mask,
     )
     tl.store(
-        lse_out_ptr + indices_grid,
+        log_sum_exp_out_ptr + indices_grid,
         log_sum_exp_score.reshape([ENCODER_BLOCK, PREDICTOR_BLOCK]),
         mask=tile_valid_mask,
     )
@@ -884,7 +882,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             bias_ptr=bias,
             target_logprobs_out_ptr=target_logprobs,
             blank_logprobs_out_ptr=blank_logprobs,
-            lse_out_ptr=log_sum_exp_scores,
+            log_sum_exp_out_ptr=log_sum_exp_scores,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             hidden_dim=hidden_dim,

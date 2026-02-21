@@ -112,6 +112,7 @@ def _rnnt_joint_vocab_fwd_kernel(
         order=(0,),
     )
 
+    # Outer loop over vocab chunks
     for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
         vocab_offsets = vocab_start + vocab_offsets_in_block
         vocab_mask = vocab_offsets < vocab_size
@@ -136,10 +137,13 @@ def _rnnt_joint_vocab_fwd_kernel(
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
 
         block_logits = tl.where(vocab_mask[None, :], block_logits, -float("inf"))
-        block_logits_max = tl.max(block_logits, axis=-1)
+
+        # Online log-sum-exp
+        block_logits_max = tl.max(block_logits, axis=-1)  # [TILE]
         block_lse = tl.log(tl.sum(tl.exp(block_logits - block_logits_max[:, None]), axis=-1)) + block_logits_max
         log_sum_exp_score = log_add_exp(log_sum_exp_score, block_lse)
 
+        # Extract blank and target logits from this chunk
         blank_logits += tl.sum(tl.where((vocab_offsets == blank_id)[None, :], block_logits, 0.0), axis=-1)
         target_logits += tl.sum(tl.where(vocab_offsets[None, :] == targets[:, None], block_logits, 0.0), axis=-1)
 
