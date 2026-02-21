@@ -494,14 +494,13 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         # Inner loop 2: compute grad weight (atomic_add needs pointer arithmetic)
         grad_logits_matmul = grad_logits_block.to(matmul_dtype)
         for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
-            # TODO: try x2 multiplication
             hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
             hidden_mask = hidden_offsets < hidden_dim
 
-            hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            joint_hidden_tile = tl.load(joint_hidden_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             grad_weight_tile = matmul(
-                grad_logits_matmul.T, hidden_tile, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+                grad_logits_matmul.T, joint_hidden_tile, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
             if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
