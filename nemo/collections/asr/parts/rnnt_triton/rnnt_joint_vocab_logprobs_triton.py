@@ -299,7 +299,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_RESET))
 
         # Compute grad_logits
-        probabilities_block = tl.exp(tl.where(vocab_mask[None, :], logits_block - lse[:, None], 0.0))
+        probabilities_block = tl.exp(logits_block - lse[:, None])
         grad_logits_block = (
             -(sum_grad[:, None] * probabilities_block)
             + (grad_blank[:, None] * (vocab_offsets == blank_id)[None, :])
@@ -482,7 +482,6 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_RESET))
 
         probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
-        # sparse adds (only affect the blank/target columns)
         grad_logits_block = (
             -(grad_sum[:, None] * probabilities_block)
             + (grad_blank[:, None] * is_blank_vocab_col[None, :])
