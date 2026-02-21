@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as functional
 
-from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import rnnt_logprobs
+from nemo.collections.asr.parts.rnnt_triton.rnnt_logprobs import rnnt_logprobs_torch
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 from tests.collections.asr.decoding.utils import avoid_sync_operations
 
@@ -28,8 +28,7 @@ if TRITON_AVAILABLE:
 
 def _reference_joint_vocab_logprobs(joint_hidden, weight, bias, targets, src_lengths, tgt_lengths, blank_id):
     logits = functional.linear(joint_hidden, weight, bias)
-    # TODO: check with rnnt_logprobs_torch
-    target_logprobs, blank_logprobs = rnnt_logprobs(
+    target_logprobs, blank_logprobs = rnnt_logprobs_torch(
         logits=logits,
         targets=targets,
         blank_id=blank_id,
