@@ -158,10 +158,14 @@ def _rnnt_joint_fwd_kernel(
             )  # [PREDICTOR_BLOCK, HIDDEN_BLOCK]
 
             # hidden = relu(enc + pred) -> [ENC, PRED, HIDDEN_BLOCK] -> [TILE, HIDDEN_BLOCK]
-            hidden_chunk = tl.maximum(
-                enc_chunk[:, None, :] + pred_chunk[None, :, :],
-                0.0,
-            ).reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
+            hidden_chunk = (
+                tl.maximum(
+                    enc_chunk[:, None, :] + pred_chunk[None, :, :],
+                    0.0,
+                )
+                .to(matmul_dtype)
+                .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
+            )
 
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
