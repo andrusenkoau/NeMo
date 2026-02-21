@@ -1005,7 +1005,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=4,
-            num_stages=2,
+            num_stages=1 if use_high_precision else 2,
         )
 
         grad_weight = grad_weight_partial.sum(dim=0)
