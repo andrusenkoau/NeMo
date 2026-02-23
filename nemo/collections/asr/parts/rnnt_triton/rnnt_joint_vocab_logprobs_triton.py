@@ -386,8 +386,8 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
     )
 
-    vocab_block_index = tl.program_id(axis=0)
-    flattened_batch_split_index = tl.program_id(axis=1)
+    flattened_batch_split_index = tl.program_id(axis=0)
+    vocab_block_index = tl.program_id(axis=1)
     vocab_block_start = vocab_block_index * VOCAB_BLOCK
     vocab_offsets = vocab_block_start + tl.arange(0, VOCAB_BLOCK)
     vocab_mask = vocab_offsets < vocab_size
@@ -708,7 +708,7 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         weight_bias_num_warps = 4
         weight_bias_num_stages = 2
 
-        _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[(vocab_blocks, FLATTENED_BATCH_SPLITS)](
+        _rnnt_joint_vocab_partial_weight_bias_bwd_kernel[(FLATTENED_BATCH_SPLITS, vocab_blocks)](
             joint_hidden_ptr=joint_hidden,
             targets_ptr=targets,
             src_lengths_ptr=src_lengths,
