@@ -728,7 +728,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         )
 
         # convert grad to desired dtype
-        grad_weight = grad_weight.sum(dim=0).to(weight.dtype)
+        grad_weight = grad_weight.sum(dim=(0, 1)).to(weight.dtype)
         grad_bias = grad_bias.to(bias.dtype)
 
         return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None, None
