@@ -503,6 +503,7 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     batch_i = tl.program_id(axis=0)
     enc_pred_split_flat = tl.program_id(axis=1)
     vocab_block_i = tl.program_id(axis=2)
+    num_splits = tl.num_programs(axis=1)
 
     # Decompose flat split → (enc_split_i, pred_split_i)
     enc_split_i = enc_pred_split_flat // PREDICTOR_SPLITS
@@ -680,7 +681,6 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                     grad_weight_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
                     grad_weight_acc += grad_weight_tile.expand_dims(1) * grad_weight_mask[None, :, None]
                 else:
-                    num_splits = tl.num_programs(axis=1)
                     ptr = grad_weight_out_ptr + (batch_i * num_splits + enc_pred_split_flat) * (
                         vocab_size * hidden_dim
                     )
