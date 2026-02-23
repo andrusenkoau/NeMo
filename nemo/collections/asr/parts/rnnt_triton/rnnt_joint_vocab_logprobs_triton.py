@@ -303,16 +303,15 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         joint_hidden_block_ptr = tl.advance(joint_hidden_block_ptr, (0, -HIDDEN_RESET))
 
         # Compute grad_logits
-        probabilities_block = tl.exp(logits_block - lse[:, None])
+        probabilities_block = tl.clamp(tl.exp(logits_block - lse[:, None]), min=0.0, max=1.0)
         grad_logits_block = (
             -(sum_grad[:, None] * probabilities_block)
             + (grad_blank[:, None] * (vocab_offsets == blank_id)[None, :])
             + (grad_target[:, None] * (vocab_offsets[None, :] == targets[:, None]))
-        )
+        ).to(matmul_dtype)
         grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
 
         # Inner loop 2: compute grad_hidden (reverse iteration for cache reuse)
-        grad_logits_matmul = grad_logits_block.to(matmul_dtype)
         if not USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
             grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_RESET))
         for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
@@ -320,7 +319,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
             grad_hidden_delta = matmul(
-                grad_logits_matmul, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+                grad_logits_block, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
             if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
@@ -485,7 +484,7 @@ def _rnnt_joint_vocab_partial_weight_bias_bwd_kernel(
         # Reset hidden for weight only; joint_hidden stays at HIDDEN_RESET for reverse Loop 2
         weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_RESET))
 
-        probabilities_block = tl.exp(logits_block - log_sum_exp_scores[:, None])
+        probabilities_block = tl.clamp(tl.exp(logits_block - log_sum_exp_scores[:, None]), min=0.0, max=1.0)
         grad_logits_block = (
             -(grad_sum[:, None] * probabilities_block)
             + (grad_blank[:, None] * is_blank_vocab_col[None, :])

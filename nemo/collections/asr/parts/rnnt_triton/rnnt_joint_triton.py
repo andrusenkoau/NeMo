@@ -229,6 +229,7 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
     ENCODER_BLOCK: tl.constexpr,
     PREDICTOR_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
+    NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR: tl.constexpr,
@@ -241,12 +242,217 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
     Does not compute gradient for weight and bias.
 
     Each program handles a tile of [ENCODER_BLOCK, PREDICTOR_BLOCK] positions
-    and writes to its own unique slice in grad_encoder_partial / grad_predictor_partial.
+    and writes to its own unique slice in grad_joint_hidden.
     No atomic operations needed.
 
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
-    ...
+    compute_dtype = tl.float64 if USE_FP64 else tl.float32
+    matmul_dtype = (
+        compute_dtype
+        if USE_HIGH_PRECISION
+        else (tl.bfloat16 if weight_ptr.dtype.element_ty == tl.bfloat16 else compute_dtype)
+    )
+
+    batch_i = tl.program_id(axis=0)
+    source_block_i = tl.program_id(axis=1)
+    target_block_i = tl.program_id(axis=2)
+    source_i_start = source_block_i * ENCODER_BLOCK
+    target_i_start = target_block_i * PREDICTOR_BLOCK
+
+    source_len = tl.load(src_lengths_ptr + batch_i)
+    target_len = tl.load(tgt_lengths_ptr + batch_i)
+
+    if source_i_start >= source_len or target_i_start > target_len:
+        return
+
+    source_offsets = source_i_start + tl.arange(0, ENCODER_BLOCK)
+    target_offsets = target_i_start + tl.arange(0, PREDICTOR_BLOCK)
+    source_mask = source_offsets < source_len
+    target_valid_mask = target_offsets <= target_len
+    target_label_mask = target_offsets < target_len
+    NUM_TILE_ELEMENTS: tl.constexpr = ENCODER_BLOCK * PREDICTOR_BLOCK
+
+    vocab_chunk_offsets = tl.arange(0, VOCAB_BLOCK)
+
+    # Load target labels with batch offset
+    max_tgt_len = max_tgt_len_plus_1 - 1
+    targets_predictor = tl.load(targets_ptr + batch_i * max_tgt_len + target_offsets, mask=target_label_mask, other=0)
+    targets_expanded = (
+        targets_predictor[None, :].broadcast_to([ENCODER_BLOCK, PREDICTOR_BLOCK]).reshape([NUM_TILE_ELEMENTS])
+    )
+
+    # Index grid for [B, T, U+1] tensors
+    indices_grid = (batch_i * max_src_len + source_offsets[:, None]) * max_tgt_len_plus_1 + target_offsets[None, :]
+    tile_valid_mask = source_mask[:, None] & target_valid_mask[None, :]
+    target_store_mask = source_mask[:, None] & target_label_mask[None, :]
+    tile_flat_mask = tile_valid_mask.reshape([NUM_TILE_ELEMENTS])
+
+    # Load upstream gradients
+    lse = (
+        tl.load(log_sum_exp_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
+        .reshape([NUM_TILE_ELEMENTS])
+        .to(compute_dtype)
+    )
+    grad_target = (
+        tl.load(grad_target_scores_ptr + indices_grid, mask=target_store_mask, other=0.0)
+        .reshape([NUM_TILE_ELEMENTS])
+        .to(compute_dtype)
+    )
+    grad_blank = (
+        tl.load(grad_blank_scores_ptr + indices_grid, mask=tile_valid_mask, other=0.0)
+        .reshape([NUM_TILE_ELEMENTS])
+        .to(compute_dtype)
+    )
+    sum_grad = grad_target + grad_blank
+
+    # Block pointers for enc, pred, weight, bias (same as forward)
+    NUM_HIDDEN_ITERS: tl.constexpr = (hidden_dim + HIDDEN_BLOCK - 1) // HIDDEN_BLOCK
+    HIDDEN_RESET: tl.constexpr = NUM_HIDDEN_ITERS * HIDDEN_BLOCK
+
+    enc_block_ptr = tl.make_block_ptr(
+        base=encoder_output_ptr + batch_i * max_src_len * hidden_dim,
+        shape=(source_len, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(source_i_start.to(tl.int32), 0),
+        block_shape=(ENCODER_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
+    pred_block_ptr = tl.make_block_ptr(
+        base=predictor_output_ptr + batch_i * max_tgt_len_plus_1 * hidden_dim,
+        shape=(target_len + 1, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(target_i_start.to(tl.int32), 0),
+        block_shape=(PREDICTOR_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
+    weight_block_ptr = tl.make_block_ptr(
+        base=weight_ptr,
+        shape=(vocab_size, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(0, 0),
+        block_shape=(VOCAB_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
+    bias_block_ptr = tl.make_block_ptr(
+        base=bias_ptr,
+        shape=(vocab_size,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(VOCAB_BLOCK,),
+        order=(0,),
+    )
+
+    # Gradient accumulator setup
+    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+        grad_hidden_acc = tl.zeros([NUM_TILE_ELEMENTS, NUM_HIDDEN_BLOCKS, HIDDEN_BLOCK], dtype=compute_dtype)
+        hidden_blocks_offsets = tl.arange(0, NUM_HIDDEN_BLOCKS)
+
+    # Flat indices for grad_joint_hidden addressing (int64 for large tensors)
+    flat_tile_indices = indices_grid.reshape([NUM_TILE_ELEMENTS]).to(tl.int64)
+
+    # Outer vocab loop
+    for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
+        vocab_offsets = vocab_start + vocab_chunk_offsets
+        vocab_mask = vocab_offsets < vocab_size
+
+        bias_chunk = tl.load(bias_block_ptr, boundary_check=(0,)).to(compute_dtype)
+        logits_block = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
+
+        # Inner loop 1 (forward): recompute logits = relu(enc+pred) @ weight.T + bias
+        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            enc_chunk = tl.load(enc_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+
+            hidden_chunk = (
+                tl.maximum(enc_chunk[:, None, :] + pred_chunk[None, :, :], 0.0)
+                .to(matmul_dtype)
+                .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
+            )
+
+            weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+
+            logits_block += matmul(
+                hidden_chunk, weight_chunk.T, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
+
+            enc_block_ptr = tl.advance(enc_block_ptr, (0, HIDDEN_BLOCK))
+            pred_block_ptr = tl.advance(pred_block_ptr, (0, HIDDEN_BLOCK))
+            weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
+
+        # After loop 1: enc, pred, weight all at HIDDEN_RESET
+        # Do NOT reset enc/pred — loop 2 traverses backward through all three
+
+        # Compute grad_logits (softmax backward)
+        # Clamp logits - lse to <= 0 to prevent exp overflow from recomputation rounding
+        # logits_minus_lse = tl.minimum(logits_block - lse[:, None], 0.0)
+        probabilities_block = tl.clamp(tl.exp(logits_block - lse[:, None]), min=0.0, max=1.0)
+        grad_logits_block = (
+            -(sum_grad[:, None] * probabilities_block)
+            + (grad_blank[:, None] * (vocab_offsets == blank_id)[None, :])
+            + (grad_target[:, None] * (vocab_offsets[None, :] == targets_expanded[:, None]))
+        ).to(matmul_dtype)
+        grad_logits_block = tl.where(tile_flat_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
+
+        # Inner loop 2 (REVERSE): grad_hidden with relu backward
+        for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            # Decrement before loading (reverse traversal)
+            enc_block_ptr = tl.advance(enc_block_ptr, (0, -HIDDEN_BLOCK))
+            pred_block_ptr = tl.advance(pred_block_ptr, (0, -HIDDEN_BLOCK))
+            weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_BLOCK))
+
+            weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+
+            # grad_hidden_delta = grad_logits @ weight [NUM_TILE_ELEMENTS, HIDDEN_BLOCK]
+            grad_hidden_delta = matmul(
+                grad_logits_block, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
+            ).to(compute_dtype)
+
+            # Reload enc/pred for relu backward mask
+            enc_chunk = tl.load(enc_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
+            relu_mask = (enc_chunk[:, None, :] + pred_chunk[None, :, :] > 0.0).reshape(
+                [NUM_TILE_ELEMENTS, HIDDEN_BLOCK]
+            )
+            grad_hidden_delta = tl.where(relu_mask, grad_hidden_delta, 0.0)
+
+            if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+                reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
+                grad_hidden_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
+                grad_hidden_acc += grad_hidden_delta.expand_dims(1) * grad_hidden_mask[None, :, None]
+            else:
+                # Load-add-store to grad_joint_hidden at the correct hidden offset
+                reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
+                hidden_d_offsets = reverse_hidden_start + tl.arange(0, HIDDEN_BLOCK)
+                d_mask = hidden_d_offsets < hidden_dim
+
+                grad_addr = (
+                    grad_joint_hidden_out_ptr + flat_tile_indices[:, None] * hidden_dim + hidden_d_offsets[None, :]
+                )
+                store_mask = tile_flat_mask[:, None] & d_mask[None, :]
+                old_grad = tl.load(grad_addr, mask=store_mask, other=0.0).to(compute_dtype)
+                tl.store(
+                    grad_addr,
+                    (old_grad + grad_hidden_delta).to(grad_joint_hidden_out_ptr.dtype.element_ty),
+                    mask=store_mask,
+                )
+
+        # After reverse loop 2: enc, pred, weight all back at hidden=0
+        weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, 0))
+        bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
+
+    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
+        # Write accumulated grad_hidden to global memory
+        HIDDEN_DIM_MAX: tl.constexpr = NUM_HIDDEN_BLOCKS * HIDDEN_BLOCK
+        hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
+        hidden_mask_full = hidden_offsets_full < hidden_dim
+        tl.store(
+            grad_joint_hidden_out_ptr + flat_tile_indices[:, None] * hidden_dim + hidden_offsets_full[None, :],
+            grad_hidden_acc.reshape([NUM_TILE_ELEMENTS, HIDDEN_DIM_MAX]).to(
+                grad_joint_hidden_out_ptr.dtype.element_ty
+            ),
+            mask=tile_flat_mask[:, None] & hidden_mask_full[None, :],
+        )
 
 
 @triton.jit
@@ -738,8 +944,10 @@ class RnntJointLogProbs(torch.autograd.Function):
             dtype=grad_joint_hidden_dtype,
             device=device,
         )
-        num_encoder_blocks = 1
-        num_predictor_blocks = 2
+        num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
+        num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
+        num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, HIDDEN_BLOCK))
+        USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR = False
         num_warps = 4
         num_stages = 2
 
@@ -751,7 +959,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             weight_ptr=weight,
             bias_ptr=bias,
-            lse_ptr=log_sum_exp_scores,
+            log_sum_exp_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
             grad_joint_hidden_out_ptr=grad_joint_hidden,
@@ -763,8 +971,10 @@ class RnntJointLogProbs(torch.autograd.Function):
             ENCODER_BLOCK=ENCODER_BLOCK,
             PREDICTOR_BLOCK=PREDICTOR_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
+            NUM_HIDDEN_BLOCKS=num_hidden_blocks,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
+            USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR=USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=num_warps,
             num_stages=num_stages,
