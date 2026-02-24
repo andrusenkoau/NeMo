@@ -21,7 +21,7 @@ from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency import (
     ConsistencyRNNTLoss,
     consistency_rnnt_kld,
 )
-from nemo.core.utils.optional_libs import K2_AVAILABLE
+from nemo.core.utils.optional_libs import K2_AVAILABLE, TRITON_AVAILABLE
 
 
 def get_devices_for_testing(use_cpu_always: bool = False) -> list[torch.device]:
@@ -465,6 +465,67 @@ def test_consistency_full_loss(device: torch.device, symmetrical: bool, reductio
     assert loss >= 0
     assert torch.isfinite(loss)
 
+
+@pytest.mark.unit
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="triton unavailable")
+@pytest.mark.parametrize("symmetrical", [True, False])
+@pytest.mark.parametrize("reduction", ["mean_volume", "mean", "p_non_blank", "p_non_blank_with_grad"])
+def test_consistency_full_loss_use_triton_matches_torch(symmetrical: bool, reduction: str):
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+
+    B, T, U_plus_1, V = 3, 5, 4, 7
+    teacher_logits_base = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32)
+    student_logits_base = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32)
+
+    targets = torch.randint(0, V - 1, (B, U_plus_1 - 1), device=device)
+    src_lengths = torch.tensor([5, 3, 4], device=device)
+    tgt_lengths = torch.tensor([3, 2, 1], device=device)
+
+    def run(use_triton: bool):
+        module = ConsistencyFullRNNTLoss(
+            symmetrical=symmetrical,
+            use_triton=use_triton,
+            reduction=reduction,
+            blank_id=V - 1,
+        )
+        teacher_logits = teacher_logits_base.detach().clone().requires_grad_(True)
+        student_logits = student_logits_base.detach().clone().requires_grad_(True)
+        loss = module(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            targets=targets,
+            src_lengths=src_lengths,
+            tgt_lengths=tgt_lengths,
+        )
+        loss.backward()
+        teacher_grad = None if teacher_logits.grad is None else teacher_logits.grad.detach().clone()
+        student_grad = None if student_logits.grad is None else student_logits.grad.detach().clone()
+        return loss.detach(), teacher_grad, student_grad
+
+    torch_loss, torch_teacher_grad, torch_student_grad = run(use_triton=False)
+    triton_loss, triton_teacher_grad, triton_student_grad = run(use_triton=True)
+
+    assert torch.allclose(
+        triton_loss, torch_loss, atol=3e-5, rtol=3e-4
+    ), f"Loss mismatch. triton={triton_loss.item()}, torch={torch_loss.item()}"
+
+    if torch_teacher_grad is None:
+        assert triton_teacher_grad is None
+    else:
+        assert triton_teacher_grad is not None
+        assert torch.allclose(
+            triton_teacher_grad, torch_teacher_grad, atol=3e-4, rtol=2e-3
+        ), f"Teacher grad max diff: {(triton_teacher_grad - torch_teacher_grad).abs().max()}"
+
+    assert triton_student_grad is not None
+    assert torch_student_grad is not None
+    assert torch.allclose(
+        triton_student_grad, torch_student_grad, atol=3e-4, rtol=2e-3
+    ), f"Student grad max diff: {(triton_student_grad - torch_student_grad).abs().max()}"
+
+
 @pytest.mark.unit
 @pytest.mark.skipif(not K2_AVAILABLE, reason="k2 unavailable")
 @pytest.mark.parametrize("device", DEVICES_WITH_CPU)
@@ -497,6 +558,7 @@ def test_consistency_graph_rnnt_loss(device: torch.device, symmetrical: bool):
 # Tests for kl_loss_triton (Triton-based KL divergence loss)
 # =============================================================================
 
+
 def requires_cuda(fn):
     """Decorator to skip tests if CUDA is not available."""
     return pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")(fn)
@@ -504,6 +566,39 @@ def requires_cuda(fn):
 
 class TestKLLossTriton:
     """Tests for kl_loss_triton Triton implementation."""
+
+    @pytest.mark.unit
+    @requires_cuda
+    @pytest.mark.parametrize("symmetrical", [True, False])
+    @pytest.mark.parametrize("weighted", ["p_non_blank", "p_non_blank_with_grad"])
+    def test_kl_loss_triton_weighted_returns_batch_vector(self, symmetrical: bool, weighted: str):
+        from nemo.collections.asr.parts.rnnt_triton.rnnt_consistency_triton import kl_loss_triton
+
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        B, T, U_plus_1, V = 3, 4, 3, 8
+
+        teacher_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
+        student_logits = torch.randn(B, T, U_plus_1, V, device=device, dtype=torch.float32, requires_grad=True)
+        mask = torch.ones(B, T, U_plus_1, dtype=torch.bool, device=device)
+
+        loss = kl_loss_triton(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            mask=mask,
+            symmetrical=symmetrical,
+            blank_id=V - 1,
+            weighted=weighted,
+        )
+        assert loss.shape == (B,)
+        assert loss.ndim == 1
+
+        loss.mean().backward()
+        assert student_logits.grad is not None
+        if symmetrical or weighted == "p_non_blank_with_grad":
+            assert teacher_logits.grad is not None
+        else:
+            assert teacher_logits.grad is None
 
     @pytest.mark.unit
     @requires_cuda
@@ -531,8 +626,9 @@ class TestKLLossTriton:
         # F.kl_div expects (log Q, P) and computes sum P * (log P - log Q)
         pytorch_loss = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
 
-        assert torch.allclose(triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4), \
-            f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
+        assert torch.allclose(
+            triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4
+        ), f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -583,8 +679,9 @@ class TestKLLossTriton:
         pytorch_loss.backward()
         pytorch_grad = student_logits_pytorch.grad.clone()
 
-        assert torch.allclose(triton_grad, pytorch_grad, atol=1e-5, rtol=1e-4), \
-            f"Max grad diff: {(triton_grad - pytorch_grad).abs().max()}"
+        assert torch.allclose(
+            triton_grad, pytorch_grad, atol=1e-5, rtol=1e-4
+        ), f"Max grad diff: {(triton_grad - pytorch_grad).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -652,9 +749,10 @@ class TestKLLossTriton:
 
         # Verify we're well under the threshold that would indicate intermediate storage
         # Peak should be around 2x base (inputs + gradients), not 4x+ that intermediate storage would cause
-        assert peak_memory < max_allowed_without_intermediate, \
-            f"Peak memory {peak_memory / 1e9:.2f} GB suggests intermediate tensor stored. " \
+        assert peak_memory < max_allowed_without_intermediate, (
+            f"Peak memory {peak_memory / 1e9:.2f} GB suggests intermediate tensor stored. "
             f"Base: {base_memory / 1e9:.2f} GB, intermediate would add: {intermediate_storage_would_add / 1e9:.2f} GB"
+        )
 
     @pytest.mark.unit
     @requires_cuda
@@ -694,8 +792,9 @@ class TestKLLossTriton:
 
         loss = kl_loss_triton(logits, logits, mask, symmetrical=False)
 
-        assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5), \
-            f"KL(P||P) should be 0, got max={loss.abs().max()}"
+        assert torch.allclose(
+            loss, torch.zeros_like(loss), atol=1e-5
+        ), f"KL(P||P) should be 0, got max={loss.abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -732,8 +831,9 @@ class TestKLLossTriton:
         loss1 = kl_loss_triton(teacher_logits, student_logits, mask, symmetrical=True)
         loss2 = kl_loss_triton(student_logits, teacher_logits, mask, symmetrical=True)
 
-        assert torch.allclose(loss1, loss2, atol=1e-5), \
-            f"Symmetrical loss should be invariant to swap, diff={torch.abs(loss1 - loss2).max()}"
+        assert torch.allclose(
+            loss1, loss2, atol=1e-5
+        ), f"Symmetrical loss should be invariant to swap, diff={torch.abs(loss1 - loss2).max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -753,8 +853,9 @@ class TestKLLossTriton:
         loss.backward()
 
         # Teacher is detached in kl_loss_triton, so no gradient
-        assert teacher_logits.grad is None or torch.all(teacher_logits.grad == 0), \
-            "Teacher should not receive gradients (detached)"
+        assert teacher_logits.grad is None or torch.all(
+            teacher_logits.grad == 0
+        ), "Teacher should not receive gradients (detached)"
         # Student should have non-zero gradients
         assert student_logits.grad is not None
         assert not torch.all(student_logits.grad == 0), "Student should receive gradients"
@@ -807,8 +908,9 @@ class TestKLLossTriton:
         pytorch_loss = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
 
         assert torch.all(torch.isfinite(triton_loss)), "Triton loss contains NaN/Inf"
-        assert torch.allclose(triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4), \
-            f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
+        assert torch.allclose(
+            triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4
+        ), f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -841,13 +943,15 @@ class TestKLLossTriton:
         pytorch_grad = student_logits_pytorch.grad.clone()
 
         assert torch.all(torch.isfinite(triton_grad)), "Triton gradients contain NaN/Inf"
-        assert torch.allclose(triton_grad, pytorch_grad, atol=1e-5, rtol=1e-4), \
-            f"Max grad diff: {(triton_grad - pytorch_grad).abs().max()}"
+        assert torch.allclose(
+            triton_grad, pytorch_grad, atol=1e-5, rtol=1e-4
+        ), f"Max grad diff: {(triton_grad - pytorch_grad).abs().max()}"
 
 
 # =============================================================================
 # Tests for FusedKLDivTriton symmetric mode (Fused symmetric kernel)
 # =============================================================================
+
 
 class TestFusedSymmetricKLDivTriton:
     """Tests for the fused symmetric KL divergence Triton implementation."""
@@ -874,8 +978,9 @@ class TestFusedSymmetricKLDivTriton:
         # Fused symmetric kernel (symmetric=True)
         fused_loss = FusedKLDivTriton.apply(teacher_logits, student_logits, mask, True)
 
-        assert torch.allclose(fused_loss, two_kernel_loss, atol=1e-5, rtol=1e-4), \
-            f"Max diff: {(fused_loss - two_kernel_loss).abs().max()}"
+        assert torch.allclose(
+            fused_loss, two_kernel_loss, atol=1e-5, rtol=1e-4
+        ), f"Max diff: {(fused_loss - two_kernel_loss).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -906,8 +1011,9 @@ class TestFusedSymmetricKLDivTriton:
         kl_st = F.kl_div(teacher_log_probs, student_probs, reduction='none').sum(dim=-1)
         pytorch_loss = 0.5 * (kl_ts + kl_st)
 
-        assert torch.allclose(triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4), \
-            f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
+        assert torch.allclose(
+            triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4
+        ), f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -940,10 +1046,12 @@ class TestFusedSymmetricKLDivTriton:
         fused_teacher_grad = teacher_logits_fused.grad.clone()
         fused_student_grad = student_logits_fused.grad.clone()
 
-        assert torch.allclose(fused_teacher_grad, two_kernel_teacher_grad, atol=1e-5, rtol=1e-4), \
-            f"Teacher grad max diff: {(fused_teacher_grad - two_kernel_teacher_grad).abs().max()}"
-        assert torch.allclose(fused_student_grad, two_kernel_student_grad, atol=1e-5, rtol=1e-4), \
-            f"Student grad max diff: {(fused_student_grad - two_kernel_student_grad).abs().max()}"
+        assert torch.allclose(
+            fused_teacher_grad, two_kernel_teacher_grad, atol=1e-5, rtol=1e-4
+        ), f"Teacher grad max diff: {(fused_teacher_grad - two_kernel_teacher_grad).abs().max()}"
+        assert torch.allclose(
+            fused_student_grad, two_kernel_student_grad, atol=1e-5, rtol=1e-4
+        ), f"Student grad max diff: {(fused_student_grad - two_kernel_student_grad).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -985,10 +1093,12 @@ class TestFusedSymmetricKLDivTriton:
         pytorch_teacher_grad = teacher_logits_pytorch.grad.clone()
         pytorch_student_grad = student_logits_pytorch.grad.clone()
 
-        assert torch.allclose(triton_teacher_grad, pytorch_teacher_grad, atol=1e-5, rtol=1e-4), \
-            f"Teacher grad max diff: {(triton_teacher_grad - pytorch_teacher_grad).abs().max()}"
-        assert torch.allclose(triton_student_grad, pytorch_student_grad, atol=1e-5, rtol=1e-4), \
-            f"Student grad max diff: {(triton_student_grad - pytorch_student_grad).abs().max()}"
+        assert torch.allclose(
+            triton_teacher_grad, pytorch_teacher_grad, atol=1e-5, rtol=1e-4
+        ), f"Teacher grad max diff: {(triton_teacher_grad - pytorch_teacher_grad).abs().max()}"
+        assert torch.allclose(
+            triton_student_grad, pytorch_student_grad, atol=1e-5, rtol=1e-4
+        ), f"Student grad max diff: {(triton_student_grad - pytorch_student_grad).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -1031,8 +1141,9 @@ class TestFusedSymmetricKLDivTriton:
         loss.backward()
 
         # Gradients should be negatives: grad_teacher = -grad_student
-        assert torch.allclose(teacher_logits.grad, -student_logits.grad, atol=1e-5), \
-            f"Gradients should be negatives, max diff: {(teacher_logits.grad + student_logits.grad).abs().max()}"
+        assert torch.allclose(
+            teacher_logits.grad, -student_logits.grad, atol=1e-5
+        ), f"Gradients should be negatives, max diff: {(teacher_logits.grad + student_logits.grad).abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -1077,8 +1188,9 @@ class TestFusedSymmetricKLDivTriton:
 
         loss = kl_loss_triton(logits, logits, mask, symmetrical=True)
 
-        assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5), \
-            f"Symmetric KL(P||P) should be 0, got max={loss.abs().max()}"
+        assert torch.allclose(
+            loss, torch.zeros_like(loss), atol=1e-5
+        ), f"Symmetric KL(P||P) should be 0, got max={loss.abs().max()}"
 
     @pytest.mark.unit
     @requires_cuda
@@ -1151,8 +1263,9 @@ class TestFusedSymmetricKLDivTriton:
         pytorch_loss = 0.5 * (kl_ts + kl_st)
 
         assert torch.all(torch.isfinite(triton_loss)), "Triton loss contains NaN/Inf"
-        assert torch.allclose(triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4), \
-            f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
+        assert torch.allclose(
+            triton_loss, pytorch_loss, atol=1e-5, rtol=1e-4
+        ), f"Max diff: {(triton_loss - pytorch_loss).abs().max()}"
 
         # Also verify backward
         triton_loss.sum().backward()
