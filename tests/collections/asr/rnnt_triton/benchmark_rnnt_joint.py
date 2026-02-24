@@ -92,7 +92,11 @@ def benchmark_standard_joint(
     tgt_lengths = torch.full([batch_size], max_targets, device=device, dtype=torch.long)
 
     loss_module = RNNTLoss(
-        num_classes=vocab_size, loss_name=loss_name, loss_kwargs={'fastemit_lambda': 0.0}, reduction='sum'
+        # RNNTLoss expects `num_classes` to be blank index (vocab_size - 1), not vocab size.
+        num_classes=num_classes,
+        loss_name=loss_name,
+        loss_kwargs={'fastemit_lambda': 0.0},
+        reduction='sum',
     )
 
     def run_fwd():

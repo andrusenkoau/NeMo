@@ -92,7 +92,8 @@ def benchmark_rnnt_loss(
 
     # Create the loss module via NeMo entry point
     loss_module = RNNTLoss(
-        num_classes=vocab_size,
+        # RNNTLoss expects `num_classes` to be blank index (vocab_size - 1), not vocab size.
+        num_classes=blank_id,
         loss_name=loss_name,
         loss_kwargs={'fastemit_lambda': 0.0},
         reduction='sum',
