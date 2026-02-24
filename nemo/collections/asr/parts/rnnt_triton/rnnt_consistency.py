@@ -29,8 +29,8 @@ EPS = 1e-5
 class ConsistencyRNNTReductionType(PrettyStrEnum):
     MEAN = "mean"
     MEAN_VOLUME = "mean_volume"
-    P_BLANK = "p_blank"
-    P_BLANK_WITH_GRAD = "p_blank_with_grad"
+    P_NON_BLANK = "p_non_blank"
+    P_NON_BLANK_WITH_GRAD = "p_non_blank_with_grad"
 
 
 def _log1mexp(x: torch.Tensor) -> torch.Tensor:
@@ -316,6 +316,13 @@ class ConsistencyFullRNNTLoss(nn.Module):
                 student_logits=student_logits,
                 mask=mask,
                 symmetrical=self.symmetrical,
+                blank_id=self.blank_id,
+                weighted=(
+                    str(self.reduction)
+                    if self.reduction
+                    in {ConsistencyRNNTReductionType.P_NON_BLANK, ConsistencyRNNTReductionType.P_NON_BLANK_WITH_GRAD}
+                    else None
+                ),
             )
 
             match self.reduction:
@@ -323,12 +330,12 @@ class ConsistencyFullRNNTLoss(nn.Module):
                     kl_loss_value = kl_loss.sum() / mask.sum().clamp(min=1)
                 case ConsistencyRNNTReductionType.MEAN_VOLUME:
                     kl_loss_value = (kl_loss.sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp(min=1)).mean()
-                case ConsistencyRNNTReductionType.P_BLANK:
-                    assert kl_loss.dim() == 1
-                    raise NotImplementedError
-                case ConsistencyRNNTReductionType.P_BLANK_WITH_GRAD:
-                    assert kl_loss.dim() == 1
-                    raise NotImplementedError
+                case ConsistencyRNNTReductionType.P_NON_BLANK:
+                    assert kl_loss.dim() == 1  # already reduced
+                    kl_loss_value = kl_loss.mean()
+                case ConsistencyRNNTReductionType.P_NON_BLANK_WITH_GRAD:
+                    assert kl_loss.dim() == 1  # already reduced
+                    kl_loss_value = kl_loss.mean()
                 case _:
                     raise NotImplementedError(f"Unsupported reduction {self.reduction}")
         else:
@@ -358,10 +365,10 @@ class ConsistencyFullRNNTLoss(nn.Module):
                     kl_loss_value = kl_loss.sum() / mask.sum().clamp(min=1)
                 case ConsistencyRNNTReductionType.MEAN_VOLUME:
                     kl_loss_value = (kl_loss.sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp(min=1)).mean()
-                case ConsistencyRNNTReductionType.P_BLANK:
+                case ConsistencyRNNTReductionType.P_NON_BLANK:
                     weights = get_non_blank_weights().detach()
                     kl_loss_value = ((kl_loss * weights).sum(dim=(1, 2)) / (weights.sum(dim=(1, 2)) + EPS)).mean()
-                case ConsistencyRNNTReductionType.P_BLANK_WITH_GRAD:
+                case ConsistencyRNNTReductionType.P_NON_BLANK_WITH_GRAD:
                     weights = get_non_blank_weights()
                     kl_loss_value = ((kl_loss * weights).sum(dim=(1, 2)) / (weights.sum(dim=(1, 2)) + EPS)).mean()
                 case _:

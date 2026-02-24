@@ -179,6 +179,7 @@ class FusedKLDivTriton(torch.autograd.Function):
         student_logits: torch.Tensor,
         mask: torch.Tensor,
         symmetric: bool = False,
+        blank_id: int | None = None,
         weighted: str | None = None,
     ):
         """
@@ -236,7 +237,9 @@ class FusedKLDivTriton(torch.autograd.Function):
         symmetric = ctx.symmetric
 
         student_grad_logits = torch.zeros_like(student_logits)
-        teacher_grad_logits = torch.zeros_like(teacher_logits) if symmetric else student_grad_logits  # dummy if not symmetric
+        teacher_grad_logits = (
+            torch.zeros_like(teacher_logits) if symmetric else student_grad_logits
+        )  # dummy if not symmetric
         grad_kl_loss = grad_kl_loss.contiguous()
 
         _kl_div_bwd_kernel[(teacher_logits.shape[0], teacher_logits.shape[1], teacher_logits.shape[2])](
@@ -265,6 +268,7 @@ def kl_loss_triton(
     student_logits: torch.Tensor,
     mask: torch.Tensor,
     symmetrical: bool = False,
+    blank_id: int | None = None,
     weighted: str | None = None,
 ) -> torch.Tensor:
     """
@@ -280,7 +284,7 @@ def kl_loss_triton(
         tensor of size [B, T, U+1] with consistency loss
     """
     if symmetrical:
-        return FusedKLDivTriton.apply(teacher_logits, student_logits, mask, True, weighted)
+        return FusedKLDivTriton.apply(teacher_logits, student_logits, mask, True, blank_id, weighted)
     else:
         # Non-symmetric: only student receives gradients, teacher is detached
-        return FusedKLDivTriton.apply(teacher_logits.detach(), student_logits, mask, False, weighted)
+        return FusedKLDivTriton.apply(teacher_logits.detach(), student_logits, mask, False, blank_id, weighted)
