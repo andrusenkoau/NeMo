@@ -179,6 +179,7 @@ class FusedKLDivTriton(torch.autograd.Function):
         student_logits: torch.Tensor,
         mask: torch.Tensor,
         symmetric: bool = False,
+        weighted: str | None = None,
     ):
         """
         Args:
@@ -191,6 +192,8 @@ class FusedKLDivTriton(torch.autograd.Function):
         Returns:
             loss of size [B, T, U+1]
         """
+        if weighted is not None:
+            raise NotImplementedError
         assert teacher_logits.is_contiguous()
         assert student_logits.is_contiguous()
         assert teacher_logits.shape == student_logits.shape
@@ -213,6 +216,7 @@ class FusedKLDivTriton(torch.autograd.Function):
         ctx.save_for_backward(teacher_logits, student_logits, mask)
         ctx.use_fp64 = use_fp64
         ctx.symmetric = symmetric
+        ctx.weighted = weighted
         return kl_loss
 
     @staticmethod
@@ -261,6 +265,7 @@ def kl_loss_triton(
     student_logits: torch.Tensor,
     mask: torch.Tensor,
     symmetrical: bool = False,
+    weighted: str | None = None,
 ) -> torch.Tensor:
     """
     Memory-efficient implementation of kl-div loss for RNN-T in Triton
@@ -275,7 +280,7 @@ def kl_loss_triton(
         tensor of size [B, T, U+1] with consistency loss
     """
     if symmetrical:
-        return FusedKLDivTriton.apply(teacher_logits, student_logits, mask, True)
+        return FusedKLDivTriton.apply(teacher_logits, student_logits, mask, True, weighted)
     else:
         # Non-symmetric: only student receives gradients, teacher is detached
-        return FusedKLDivTriton.apply(teacher_logits.detach(), student_logits, mask, False)
+        return FusedKLDivTriton.apply(teacher_logits.detach(), student_logits, mask, False, weighted)
