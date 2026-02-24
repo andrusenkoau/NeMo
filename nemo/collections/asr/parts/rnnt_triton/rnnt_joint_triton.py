@@ -558,6 +558,7 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
         for pred_tile_start in tl.range(pred_range_start, pred_range_end, PREDICTOR_BLOCK):
 
             # Block pointers for enc/pred at this tile position
+            # TODO: sequential reading + contiguous
             enc_block_ptr = tl.make_block_ptr(
                 base=encoder_output_ptr + batch_i * max_src_len * hidden_dim,
                 shape=(source_len, hidden_dim),
