@@ -165,6 +165,11 @@ class RnntLogProbs(torch.autograd.Function):
         assert logits.is_contiguous()  # logits are huge, so here we just check if logits are contiguous
         targets = targets.contiguous()
         device = logits.device
+        num_labels = logits.shape[-1]
+        if blank_id < 0 or blank_id >= num_labels:
+            raise ValueError(
+                f"blank_id ({blank_id}) must be in range [0, {num_labels - 1}] for logits with {num_labels} labels."
+            )
         # Use float64 if input is float64, otherwise float32
         use_fp64 = logits.dtype == torch.float64
         float_dtype = torch.float64 if use_fp64 else torch.float32
@@ -191,7 +196,7 @@ class RnntLogProbs(torch.autograd.Function):
             tgt_lengths_ptr=tgt_lengths,
             max_source_len=logits.shape[1],
             max_target_len_plus_1=logits.shape[2],
-            num_labels=logits.shape[3],
+            num_labels=num_labels,
             blank_id=blank_id,
             target_scores_out_ptr=target_scores,
             blank_scores_out_ptr=blank_scores,
