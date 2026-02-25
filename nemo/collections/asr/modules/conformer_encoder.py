@@ -707,6 +707,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         # logging.info(f"self.att_chunk_context_size: {self.att_chunk_context_size}")
         # logging.warning(f"cur_att_context_size: {cur_att_context_size}")
+        if len(cur_att_context_size) == 2 and cur_att_context_size[-1] == 26:
+            cur_att_context_size = [-1,-1]
         # logging.warning(f"dcc_chunk: {dcc_chunk}")
 
         if not bypass_pre_encode:
