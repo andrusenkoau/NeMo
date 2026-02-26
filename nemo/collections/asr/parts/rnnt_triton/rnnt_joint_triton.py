@@ -220,7 +220,8 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
     log_sum_exp_ptr,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
-    grad_joint_hidden_out_ptr,
+    grad_encoder_out_ptr,
+    grad_predictor_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
     hidden_dim: tl.constexpr,
@@ -240,8 +241,8 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
     Does not compute gradient for weight and bias.
 
     Each program handles a tile of [ENCODER_BLOCK, PREDICTOR_BLOCK] positions
-    and writes to its own unique slice in grad_joint_hidden.
-    No atomic operations needed.
+    and accumulates partial gradients directly into grad_encoder / grad_predictor.
+    Since multiple tiles contribute to the same output rows, atomic adds are used.
 
     Calculations are performed in float32 or float64 based on USE_FP64.
     """
@@ -341,8 +342,9 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
         order=(0,),
     )
 
-    # Flat indices for grad_joint_hidden addressing (int64 for large tensors)
-    flat_tile_indices = indices_grid.reshape([NUM_TILE_ELEMENTS]).to(tl.int64)
+    # Flat indices for grad_encoder / grad_predictor addressing (int64 for large tensors)
+    source_flat_indices = (batch_i * max_src_len + source_offsets).to(tl.int64)
+    target_flat_indices = (batch_i * max_tgt_len_plus_1 + target_offsets).to(tl.int64)
 
     # Outer vocab loop
     for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
@@ -408,19 +410,28 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
                 [NUM_TILE_ELEMENTS, HIDDEN_BLOCK]
             )
             grad_hidden_delta = tl.where(relu_mask, grad_hidden_delta, 0.0)
+            grad_hidden_delta = grad_hidden_delta.reshape([ENCODER_BLOCK, PREDICTOR_BLOCK, HIDDEN_BLOCK])
 
-            # Load-add-store to grad_joint_hidden at the correct hidden offset
             reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
             hidden_d_offsets = reverse_hidden_start + tl.arange(0, HIDDEN_BLOCK)
-            d_mask = hidden_d_offsets < hidden_dim
+            hidden_mask = hidden_d_offsets < hidden_dim
 
-            grad_addr = grad_joint_hidden_out_ptr + flat_tile_indices[:, None] * hidden_dim + hidden_d_offsets[None, :]
-            store_mask = tile_flat_mask[:, None] & d_mask[None, :]
-            old_grad = tl.load(grad_addr, mask=store_mask, other=0.0).to(compute_dtype)
-            tl.store(
-                grad_addr,
-                (old_grad + grad_hidden_delta).to(grad_joint_hidden_out_ptr.dtype.element_ty),
-                mask=store_mask,
+            # grad_encoder[b, src, hidden] = sum_tgt grad_hidden[b, src, tgt, hidden]
+            grad_encoder_delta = tl.sum(grad_hidden_delta, axis=1)
+            tl.atomic_add(
+                grad_encoder_out_ptr + source_flat_indices[:, None] * hidden_dim + hidden_d_offsets[None, :],
+                grad_encoder_delta,
+                mask=source_mask[:, None] & hidden_mask[None, :],
+                sem="relaxed",  # no need to guarantee order of adding - no read inside kernel
+            )
+
+            # grad_predictor[b, tgt, hidden] = sum_src grad_hidden[b, src, tgt, hidden]
+            grad_predictor_delta = tl.sum(grad_hidden_delta, axis=0)
+            tl.atomic_add(
+                grad_predictor_out_ptr + target_flat_indices[:, None] * hidden_dim + hidden_d_offsets[None, :],
+                grad_predictor_delta,
+                mask=target_valid_mask[:, None] & hidden_mask[None, :],
+                sem="relaxed",  # no need to guarantee order of adding - no read inside kernel
             )
 
         # After reverse loop 2: enc, pred, weight all back at hidden=0
@@ -783,7 +794,6 @@ class RnntJointLogProbs(torch.autograd.Function):
         vocab_size = weight.shape[0]
         device = encoder_output_projected.device
 
-        hidden_dtype = encoder_output_projected.dtype
         if encoder_output_projected.dtype != predictor_output_projected.dtype:
             raise NotImplementedError
 
@@ -796,12 +806,14 @@ class RnntJointLogProbs(torch.autograd.Function):
         ENCODER_BLOCK = 8
         PREDICTOR_BLOCK = 8
 
-        FULL_PRECISION_JOINT_GRAD_CALC = use_high_precision  # TODO: make extra param later
-        grad_joint_hidden_dtype = float_dtype if FULL_PRECISION_JOINT_GRAD_CALC else hidden_dtype
-
-        grad_joint_hidden = torch.zeros(
-            [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim],
-            dtype=grad_joint_hidden_dtype,
+        grad_encoder = torch.zeros(
+            [batch_size, src_max_length, hidden_dim],
+            dtype=float_dtype,
+            device=device,
+        )
+        grad_predictor = torch.zeros(
+            [batch_size, tgt_max_length_plus_1, hidden_dim],
+            dtype=float_dtype,
             device=device,
         )
         num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
@@ -820,7 +832,8 @@ class RnntJointLogProbs(torch.autograd.Function):
             log_sum_exp_ptr=log_sum_exp_scores,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
-            grad_joint_hidden_out_ptr=grad_joint_hidden,
+            grad_encoder_out_ptr=grad_encoder,
+            grad_predictor_out_ptr=grad_predictor,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
             hidden_dim=hidden_dim,
@@ -835,9 +848,6 @@ class RnntJointLogProbs(torch.autograd.Function):
             num_warps=num_warps,
             num_stages=num_stages,
         )
-
-        grad_encoder = grad_joint_hidden.sum(dim=2).to(encoder_output_projected.dtype)
-        grad_predictor = grad_joint_hidden.sum(dim=1).to(predictor_output_projected.dtype)
 
         # Weight and bias gradients via split-K kernel
         HIDDEN_BLOCK = 64
@@ -887,6 +897,8 @@ class RnntJointLogProbs(torch.autograd.Function):
         )
 
         # convert grad to desired dtype
+        grad_encoder = grad_encoder.to(encoder_output_projected.dtype)
+        grad_predictor = grad_predictor.to(predictor_output_projected.dtype)
         grad_weight = grad_weight.to(weight.dtype)
         grad_bias = grad_bias.to(bias.dtype)
 
