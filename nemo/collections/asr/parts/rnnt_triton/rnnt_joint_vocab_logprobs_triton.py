@@ -262,15 +262,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         block_shape=(VOCAB_BLOCK,),
         order=(0,),
     )
-
-    grad_hidden_block_ptr = tl.make_block_ptr(
-        base=grad_joint_hidden_out_ptr,
-        shape=(flattened_batch_size, hidden_dim),
-        strides=(hidden_dim, 1),
-        offsets=(flattened_batch_start, 0),
-        block_shape=(FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK),
-        order=(1, 0),
-    )
+    flattened_batch_flat_indices = flattened_batch_offsets.to(tl.int64)
 
     for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
         vocab_offsets = vocab_start + vocab_offsets_in_block
@@ -306,8 +298,7 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
 
         # Inner loop 2: compute grad_hidden (reverse iteration for cache reuse)
-        grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_RESET))
-        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+        for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_BLOCK))
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
@@ -315,12 +306,17 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
                 grad_logits_block, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
-            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_BLOCK))
-            old_grad_hidden = tl.load(grad_hidden_block_ptr, boundary_check=(0, 1)).to(compute_dtype)
-            tl.store(
-                grad_hidden_block_ptr,
-                (old_grad_hidden + grad_hidden_delta).to(grad_hidden_block_ptr.dtype.element_ty),
-                boundary_check=(0, 1),
+            reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
+            hidden_offsets = reverse_hidden_start + tl.arange(0, HIDDEN_BLOCK)
+            hidden_mask = hidden_offsets < hidden_dim
+
+            tl.atomic_add(
+                grad_joint_hidden_out_ptr
+                + flattened_batch_flat_indices[:, None] * hidden_dim
+                + hidden_offsets[None, :],
+                grad_hidden_delta,
+                mask=output_blank_mask[:, None] & hidden_mask[None, :],
+                sem="relaxed",  # no need to guarantee order of adding - no read inside kernel
             )
 
         # weight_block_ptr is at hidden 0 after reverse loop; advance vocab only
