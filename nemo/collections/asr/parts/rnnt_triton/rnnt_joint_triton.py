@@ -479,7 +479,6 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     ENCODER_BLOCK: tl.constexpr,
     PREDICTOR_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
-    NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
@@ -672,9 +671,8 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                     grad_logits_matmul.T, hidden_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
                 ).to(compute_dtype)
 
-                ptr = grad_weight_out_ptr + enc_pred_split_flat * (vocab_size * hidden_dim)
                 tl.atomic_add(
-                    ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
+                    grad_weight_out_ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
                     grad_weight_tile,
                     mask=vocab_mask[:, None] & hidden_mask[None, :],
                     sem="relaxed",  # no need to guarantee order of adding - no read inside kernel
@@ -874,7 +872,6 @@ class RnntJointLogProbs(torch.autograd.Function):
 
         # Weight and bias gradients via split-K kernel
         HIDDEN_BLOCK = 64
-        NUM_HIDDEN_BLOCKS = triton.next_power_of_2(triton.cdiv(hidden_dim, HIDDEN_BLOCK))
         VOCAB_BLOCK = 64  # TODO: 128 for bfloat16
         ENCODER_BLOCK = 16
         PREDICTOR_BLOCK = 8
@@ -913,7 +910,6 @@ class RnntJointLogProbs(torch.autograd.Function):
             ENCODER_BLOCK=ENCODER_BLOCK,
             PREDICTOR_BLOCK=PREDICTOR_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
-            NUM_HIDDEN_BLOCKS=NUM_HIDDEN_BLOCKS,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
