@@ -482,7 +482,6 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
-    USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
     """
@@ -503,7 +502,6 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
     batch_i = tl.program_id(axis=0)
     enc_pred_split_flat = tl.program_id(axis=1)
     vocab_block_i = tl.program_id(axis=2)
-    num_splits = tl.num_programs(axis=1)
 
     # Decompose flat split → (enc_split_i, pred_split_i)
     enc_split_i = enc_pred_split_flat // PREDICTOR_SPLITS
@@ -531,10 +529,6 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
 
     # Accumulators
     grad_bias_acc = tl.zeros((VOCAB_BLOCK,), dtype=compute_dtype)
-
-    if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
-        grad_weight_acc = tl.zeros([VOCAB_BLOCK, NUM_HIDDEN_BLOCKS, HIDDEN_BLOCK], dtype=compute_dtype)
-        hidden_blocks_offsets = tl.arange(0, NUM_HIDDEN_BLOCKS)
 
     NUM_HIDDEN_ITERS: tl.constexpr = (hidden_dim + HIDDEN_BLOCK - 1) // HIDDEN_BLOCK
     HIDDEN_RESET: tl.constexpr = NUM_HIDDEN_ITERS * HIDDEN_BLOCK
@@ -678,43 +672,20 @@ def _rnnt_joint_partial_weight_bias_bwd_kernel(
                     grad_logits_matmul.T, hidden_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
                 ).to(compute_dtype)
 
-                if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
-                    grad_weight_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
-                    grad_weight_acc += grad_weight_tile.expand_dims(1) * grad_weight_mask[None, :, None]
-                else:
-                    ptr = grad_weight_out_ptr + (batch_i * num_splits + enc_pred_split_flat) * (
-                        vocab_size * hidden_dim
-                    )
-                    old_grad = tl.load(
-                        ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
-                        mask=vocab_mask[:, None] & hidden_mask[None, :],
-                    )
-                    tl.store(
-                        ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
-                        old_grad + grad_weight_tile,
-                        mask=vocab_mask[:, None] & hidden_mask[None, :],
-                    )
-
-            # After reverse loop: enc/pred back at hidden=0
-
-    # Final stores
-    if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR:
-        HIDDEN_DIM_MAX: tl.constexpr = NUM_HIDDEN_BLOCKS * HIDDEN_BLOCK
-        hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
-        hidden_mask_full = hidden_offsets_full < hidden_dim
-        num_splits = tl.num_programs(axis=1)
-        ptr = grad_weight_out_ptr + (batch_i * num_splits + enc_pred_split_flat) * (vocab_size * hidden_dim)
-        tl.store(
-            ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
-            grad_weight_acc.reshape([VOCAB_BLOCK, HIDDEN_DIM_MAX]),
-            mask=vocab_mask[:, None] & hidden_mask_full[None, :],
-        )
+                ptr = grad_weight_out_ptr + enc_pred_split_flat * (vocab_size * hidden_dim)
+                tl.atomic_add(
+                    ptr + vocab_offsets[:, None] * hidden_dim + hidden_offsets[None, :],
+                    grad_weight_tile,
+                    mask=vocab_mask[:, None] & hidden_mask[None, :],
+                    sem="relaxed",  # no need to guarantee order of adding - no read inside kernel
+                )
 
     # Atomic add into global grad_bias (multiple programs contribute)
     tl.atomic_add(
         grad_bias_out_ptr + vocab_offsets,
         grad_bias_acc,
         mask=vocab_mask,
+        sem="relaxed",  # no need to guarantee order of adding - no read inside kernel
     )
 
 
@@ -902,10 +873,9 @@ class RnntJointLogProbs(torch.autograd.Function):
         grad_predictor = grad_joint_hidden.sum(dim=1).to(predictor_output_projected.dtype)
 
         # Weight and bias gradients via split-K kernel
-        USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR = False  # disable for now
         HIDDEN_BLOCK = 64
         NUM_HIDDEN_BLOCKS = triton.next_power_of_2(triton.cdiv(hidden_dim, HIDDEN_BLOCK))
-        VOCAB_BLOCK = 16 if USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR else 64
+        VOCAB_BLOCK = 64  # TODO: 128 for bfloat16
         ENCODER_BLOCK = 16
         PREDICTOR_BLOCK = 8
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
@@ -914,10 +884,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         ENCODER_X_PREDICTOR_SPLITS = ENCODER_SPLITS * PREDICTOR_SPLITS
 
         # grad output variables
-        # grad_weight = torch.zeros([vocab_size, hidden_dim], dtype=float_dtype, device=device)
-        grad_weight = torch.zeros(
-            [batch_size, ENCODER_X_PREDICTOR_SPLITS, vocab_size, hidden_dim], dtype=float_dtype, device=device
-        )
+        grad_weight = torch.zeros([vocab_size, hidden_dim], dtype=float_dtype, device=device)
         grad_bias = torch.zeros([vocab_size], dtype=float_dtype, device=device)
 
         weight_bias_num_warps = 4
@@ -950,13 +917,12 @@ class RnntJointLogProbs(torch.autograd.Function):
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
-            USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR=USE_GLOBAL_WEIGHT_GRAD_ACCUMULATOR,
             num_warps=weight_bias_num_warps,
             num_stages=weight_bias_num_stages,
         )
 
         # convert grad to desired dtype
-        grad_weight = grad_weight.sum(dim=(0, 1)).to(weight.dtype)
+        grad_weight = grad_weight.to(weight.dtype)
         grad_bias = grad_bias.to(bias.dtype)
 
         return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None, None
