@@ -232,7 +232,6 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
     NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
-    USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
     """
@@ -343,11 +342,6 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
         order=(0,),
     )
 
-    # Gradient accumulator setup
-    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-        grad_hidden_acc = tl.zeros([NUM_TILE_ELEMENTS, NUM_HIDDEN_BLOCKS, HIDDEN_BLOCK], dtype=compute_dtype)
-        hidden_blocks_offsets = tl.arange(0, NUM_HIDDEN_BLOCKS)
-
     # Flat indices for grad_joint_hidden addressing (int64 for large tensors)
     flat_tile_indices = indices_grid.reshape([NUM_TILE_ELEMENTS]).to(tl.int64)
 
@@ -416,43 +410,23 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
             )
             grad_hidden_delta = tl.where(relu_mask, grad_hidden_delta, 0.0)
 
-            if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-                reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
-                grad_hidden_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
-                grad_hidden_acc += grad_hidden_delta.expand_dims(1) * grad_hidden_mask[None, :, None]
-            else:
-                # Load-add-store to grad_joint_hidden at the correct hidden offset
-                reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
-                hidden_d_offsets = reverse_hidden_start + tl.arange(0, HIDDEN_BLOCK)
-                d_mask = hidden_d_offsets < hidden_dim
+            # Load-add-store to grad_joint_hidden at the correct hidden offset
+            reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
+            hidden_d_offsets = reverse_hidden_start + tl.arange(0, HIDDEN_BLOCK)
+            d_mask = hidden_d_offsets < hidden_dim
 
-                grad_addr = (
-                    grad_joint_hidden_out_ptr + flat_tile_indices[:, None] * hidden_dim + hidden_d_offsets[None, :]
-                )
-                store_mask = tile_flat_mask[:, None] & d_mask[None, :]
-                old_grad = tl.load(grad_addr, mask=store_mask, other=0.0).to(compute_dtype)
-                tl.store(
-                    grad_addr,
-                    (old_grad + grad_hidden_delta).to(grad_joint_hidden_out_ptr.dtype.element_ty),
-                    mask=store_mask,
-                )
+            grad_addr = grad_joint_hidden_out_ptr + flat_tile_indices[:, None] * hidden_dim + hidden_d_offsets[None, :]
+            store_mask = tile_flat_mask[:, None] & d_mask[None, :]
+            old_grad = tl.load(grad_addr, mask=store_mask, other=0.0).to(compute_dtype)
+            tl.store(
+                grad_addr,
+                (old_grad + grad_hidden_delta).to(grad_joint_hidden_out_ptr.dtype.element_ty),
+                mask=store_mask,
+            )
 
         # After reverse loop 2: enc, pred, weight all back at hidden=0
         weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, 0))
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
-
-    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-        # Write accumulated grad_hidden to global memory
-        HIDDEN_DIM_MAX: tl.constexpr = NUM_HIDDEN_BLOCKS * HIDDEN_BLOCK
-        hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
-        hidden_mask_full = hidden_offsets_full < hidden_dim
-        tl.store(
-            grad_joint_hidden_out_ptr + flat_tile_indices[:, None] * hidden_dim + hidden_offsets_full[None, :],
-            grad_hidden_acc.reshape([NUM_TILE_ELEMENTS, HIDDEN_DIM_MAX]).to(
-                grad_joint_hidden_out_ptr.dtype.element_ty
-            ),
-            mask=tile_flat_mask[:, None] & hidden_mask_full[None, :],
-        )
 
 
 @triton.jit
@@ -834,7 +808,6 @@ class RnntJointLogProbs(torch.autograd.Function):
         num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
         num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
         num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, HIDDEN_BLOCK))
-        USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR = False
         num_warps = 4
         num_stages = 2
 
@@ -861,7 +834,6 @@ class RnntJointLogProbs(torch.autograd.Function):
             NUM_HIDDEN_BLOCKS=num_hidden_blocks,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
-            USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR=USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=num_warps,
             num_stages=num_stages,
@@ -872,7 +844,7 @@ class RnntJointLogProbs(torch.autograd.Function):
 
         # Weight and bias gradients via split-K kernel
         HIDDEN_BLOCK = 64
-        VOCAB_BLOCK = 64  # TODO: 128 for bfloat16
+        VOCAB_BLOCK = 64
         ENCODER_BLOCK = 16
         PREDICTOR_BLOCK = 8
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
