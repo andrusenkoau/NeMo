@@ -185,10 +185,8 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
     blank_id: tl.constexpr,
     FLATTENED_BATCH_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
-    NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
-    USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
@@ -265,18 +263,14 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         order=(0,),
     )
 
-    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-        grad_hidden_acc = tl.zeros([FLATTENED_BATCH_BLOCK, NUM_HIDDEN_BLOCKS, HIDDEN_BLOCK], dtype=compute_dtype)
-        hidden_blocks_offsets = tl.arange(0, NUM_HIDDEN_BLOCKS)
-    else:
-        grad_hidden_block_ptr = tl.make_block_ptr(
-            base=grad_joint_hidden_out_ptr,
-            shape=(flattened_batch_size, hidden_dim),
-            strides=(hidden_dim, 1),
-            offsets=(flattened_batch_start, 0),
-            block_shape=(FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK),
-            order=(1, 0),
-        )
+    grad_hidden_block_ptr = tl.make_block_ptr(
+        base=grad_joint_hidden_out_ptr,
+        shape=(flattened_batch_size, hidden_dim),
+        strides=(hidden_dim, 1),
+        offsets=(flattened_batch_start, 0),
+        block_shape=(FLATTENED_BATCH_BLOCK, HIDDEN_BLOCK),
+        order=(1, 0),
+    )
 
     for vocab_start in tl.range(0, vocab_size, VOCAB_BLOCK):
         vocab_offsets = vocab_start + vocab_offsets_in_block
@@ -312,9 +306,8 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
         grad_logits_block = tl.where(output_blank_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
 
         # Inner loop 2: compute grad_hidden (reverse iteration for cache reuse)
-        if not USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_RESET))
-        for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+        grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, HIDDEN_RESET))
+        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             weight_block_ptr = tl.advance(weight_block_ptr, (0, -HIDDEN_BLOCK))
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
@@ -322,33 +315,17 @@ def _rnnt_joint_vocab_partial_hidden_bwd_kernel(
                 grad_logits_block, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
             ).to(compute_dtype)
 
-            if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-                reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
-                grad_hidden_mask = hidden_blocks_offsets == (reverse_hidden_start // HIDDEN_BLOCK)
-                grad_hidden_acc += grad_hidden_delta.expand_dims(1) * grad_hidden_mask[None, :, None]
-            else:
-                grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_BLOCK))
-                old_grad_hidden = tl.load(grad_hidden_block_ptr, boundary_check=(0, 1)).to(compute_dtype)
-                tl.store(
-                    grad_hidden_block_ptr,
-                    (old_grad_hidden + grad_hidden_delta).to(grad_hidden_block_ptr.dtype.element_ty),
-                    boundary_check=(0, 1),
-                )
+            grad_hidden_block_ptr = tl.advance(grad_hidden_block_ptr, (0, -HIDDEN_BLOCK))
+            old_grad_hidden = tl.load(grad_hidden_block_ptr, boundary_check=(0, 1)).to(compute_dtype)
+            tl.store(
+                grad_hidden_block_ptr,
+                (old_grad_hidden + grad_hidden_delta).to(grad_hidden_block_ptr.dtype.element_ty),
+                boundary_check=(0, 1),
+            )
 
         # weight_block_ptr is at hidden 0 after reverse loop; advance vocab only
         weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, 0))
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
-
-    if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-        # Write accumulated grad_hidden to global memory (single write, preserving fp32 precision)
-        HIDDEN_DIM_MAX: tl.constexpr = NUM_HIDDEN_BLOCKS * HIDDEN_BLOCK
-        hidden_offsets_full = tl.arange(0, HIDDEN_DIM_MAX)
-        hidden_mask_full = hidden_offsets_full < hidden_dim
-        tl.store(
-            grad_joint_hidden_out_ptr + flattened_batch_offsets[:, None] * hidden_dim + hidden_offsets_full[None, :],
-            grad_hidden_acc.reshape([FLATTENED_BATCH_BLOCK, HIDDEN_DIM_MAX]),
-            mask=flattened_batch_valid_mask[:, None] & hidden_mask_full[None, :],
-        )
 
 
 @triton.jit
@@ -611,18 +588,11 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
         vocab_size = weight.shape[0]
         device = joint_hidden.device
 
-        USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR = False
         FULL_PRECISION_JOINT_GRAD_CALC = use_high_precision  # TODO: make extra param(?)
-        hidden_bwd_hidden_block = 64
-        num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, hidden_bwd_hidden_block))
+        HIDDEN_BLOCK = 64
 
-        if USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR:
-            # Accumulate in fp32 registers, write once — allows native dtype output
-            grad_joint_hidden_dtype = joint_hidden.dtype
-            hidden_bwd_flattened_batch_block = 16  # reduced to fit 3D register accumulator
-        else:
-            grad_joint_hidden_dtype = float_dtype if FULL_PRECISION_JOINT_GRAD_CALC else joint_hidden.dtype
-            hidden_bwd_flattened_batch_block = 64
+        grad_joint_hidden_dtype = float_dtype if FULL_PRECISION_JOINT_GRAD_CALC else joint_hidden.dtype
+        FLATTENED_BATCH_BLOCK = 64
 
         grad_joint_hidden = torch.zeros(
             [batch_size, src_max_length, tgt_max_length_plus_1, hidden_dim],
@@ -630,14 +600,15 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             device=device,
         )
 
-        if use_high_precision or joint_hidden.dtype != torch.bfloat16:
-            hidden_bwd_vocab_block = 64
+        if joint_hidden.dtype.itemsize == 2:
+            # bfloat16, float16
+            VOCAB_BLOCK = 128
         else:
-            hidden_bwd_vocab_block = 128
+            VOCAB_BLOCK = 64
         hidden_bwd_num_warps = 4
         hidden_bwd_num_stages = 2
 
-        hidden_bwd_flattened_batch_blocks = triton.cdiv(flattened_batch_size, hidden_bwd_flattened_batch_block)
+        hidden_bwd_flattened_batch_blocks = triton.cdiv(flattened_batch_size, FLATTENED_BATCH_BLOCK)
 
         _rnnt_joint_vocab_partial_hidden_bwd_kernel[(hidden_bwd_flattened_batch_blocks,)](
             joint_hidden_ptr=joint_hidden,
@@ -656,19 +627,17 @@ class RnntJointVocabLogProbs(torch.autograd.Function):
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
-            FLATTENED_BATCH_BLOCK=hidden_bwd_flattened_batch_block,
-            HIDDEN_BLOCK=hidden_bwd_hidden_block,
-            NUM_HIDDEN_BLOCKS=num_hidden_blocks,
-            VOCAB_BLOCK=hidden_bwd_vocab_block,
+            FLATTENED_BATCH_BLOCK=FLATTENED_BATCH_BLOCK,
+            HIDDEN_BLOCK=HIDDEN_BLOCK,
+            VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
-            USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR=USE_GLOBAL_HIDDEN_GRAD_ACCUMULATOR,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=hidden_bwd_num_warps,
             num_stages=hidden_bwd_num_stages,
         )
 
-        HIDDEN_BLOCK = 64
         VOCAB_BLOCK = 64
+        HIDDEN_BLOCK = 64
         FLATTENED_BATCH_BLOCK = 128
         vocab_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK)
         FLATTENED_BATCH_SPLITS = 64
