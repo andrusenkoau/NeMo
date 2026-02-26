@@ -229,7 +229,6 @@ def _rnnt_joint_partial_enc_pred_bwd_kernel(
     ENCODER_BLOCK: tl.constexpr,
     PREDICTOR_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
-    NUM_HIDDEN_BLOCKS: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
@@ -807,7 +806,6 @@ class RnntJointLogProbs(torch.autograd.Function):
         )
         num_encoder_blocks = triton.cdiv(src_max_length, ENCODER_BLOCK)
         num_predictor_blocks = triton.cdiv(tgt_max_length_plus_1, PREDICTOR_BLOCK)
-        num_hidden_blocks = triton.next_power_of_2(triton.cdiv(hidden_dim, HIDDEN_BLOCK))
         num_warps = 4
         num_stages = 2
 
@@ -831,7 +829,6 @@ class RnntJointLogProbs(torch.autograd.Function):
             ENCODER_BLOCK=ENCODER_BLOCK,
             PREDICTOR_BLOCK=PREDICTOR_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
-            NUM_HIDDEN_BLOCKS=num_hidden_blocks,
             VOCAB_BLOCK=VOCAB_BLOCK,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
