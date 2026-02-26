@@ -136,6 +136,7 @@ def _rnnt_joint_vocab_fwd_kernel(
         weight_block_ptr = tl.advance(weight_block_ptr, (VOCAB_BLOCK, -HIDDEN_RESET))
         bias_block_ptr = tl.advance(bias_block_ptr, (VOCAB_BLOCK,))
 
+        # Mask invalid vocab positions
         block_logits = tl.where(vocab_mask[None, :], block_logits, -float("inf"))
 
         # Online log-sum-exp

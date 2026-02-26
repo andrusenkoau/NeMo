@@ -349,6 +349,7 @@ def _rnnt_joint_bwd_kernel(
             bias_tile = tl.load(bias_ptr + vocab_offsets, mask=vocab_mask, other=-float("inf")).to(compute_dtype)
             logits_block = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype) + bias_tile[None, :]
 
+            # Inner loop 1: recompute logits
             for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
                 enc_chunk = tl.load(enc_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
                 pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
@@ -358,7 +359,7 @@ def _rnnt_joint_bwd_kernel(
                     .to(matmul_dtype)
                     .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
                 )
-
+                # weight_chunk: [VOCAB_BLOCK, HIDDEN_BLOCK]
                 weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
                 logits_block += matmul(
@@ -369,6 +370,7 @@ def _rnnt_joint_bwd_kernel(
                 pred_block_ptr = tl.advance(pred_block_ptr, (0, HIDDEN_BLOCK))
                 weight_block_ptr = tl.advance(weight_block_ptr, (0, HIDDEN_BLOCK))
 
+            # Compute grad_logits
             probabilities_block = tl.exp(logits_block - lse[:, None])
             grad_logits_block = (
                 -(sum_grad[:, None] * probabilities_block)
@@ -378,6 +380,7 @@ def _rnnt_joint_bwd_kernel(
             grad_logits_block = tl.where(tile_flat_mask[:, None] & vocab_mask[None, :], grad_logits_block, 0.0)
             grad_bias_acc += tl.sum(grad_logits_block, axis=0)
 
+            # Inner loop 2: compute grad_hidden and grad_weight in reverse iteration for cache reuse
             grad_logits_matmul = grad_logits_block.to(matmul_dtype)
             for forward_hidden_idx in tl.range(0, hidden_dim, HIDDEN_BLOCK):
                 reverse_hidden_start = HIDDEN_RESET - HIDDEN_BLOCK - forward_hidden_idx
@@ -411,10 +414,7 @@ def _rnnt_joint_bwd_kernel(
                 grad_hidden_delta = matmul(
                     grad_logits_matmul, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
                 ).to(compute_dtype)
-                relu_mask = (enc_chunk[:, None, :] + pred_chunk[None, :, :] > 0.0).reshape(
-                    [NUM_TILE_ELEMENTS, HIDDEN_BLOCK]
-                )
-                grad_hidden_delta = tl.where(relu_mask, grad_hidden_delta, 0.0)
+                grad_hidden_delta = tl.where(hidden_chunk > 0.0, grad_hidden_delta, 0.0)
                 grad_hidden_delta = grad_hidden_delta.reshape([ENCODER_BLOCK, PREDICTOR_BLOCK, HIDDEN_BLOCK])
 
                 grad_encoder_delta = tl.sum(grad_hidden_delta, axis=1)
