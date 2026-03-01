@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
+
 import torch
 import triton
 import triton.language as tl
@@ -34,6 +36,9 @@ def _rnnt_joint_fwd_kernel(
     log_sum_exp_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
+    dropout_seed: int,
+    dropout_p: float,
+    dropout_inv_keep_prob: float,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
@@ -41,6 +46,7 @@ def _rnnt_joint_fwd_kernel(
     PREDICTOR_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
+    USE_DROPOUT: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
@@ -81,6 +87,9 @@ def _rnnt_joint_fwd_kernel(
     target_valid_mask = target_offsets <= target_len  # blank is valid at u == target_len
     target_label_mask = target_offsets < target_len  # target labels exist at u < target_len
     NUM_TILE_ELEMENTS: tl.constexpr = ENCODER_BLOCK * PREDICTOR_BLOCK
+    tile_base_offsets = (batch_i * max_src_len + source_offsets).to(tl.int64)[
+        :, None
+    ] * max_tgt_len_plus_1 + target_offsets[None, :].to(tl.int64)
 
     vocab_chunk_offsets = tl.arange(0, VOCAB_BLOCK)
 
@@ -141,7 +150,7 @@ def _rnnt_joint_fwd_kernel(
         block_logits = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype) + bias_chunk[None, :]
 
         # Inner loop over hidden dimension chunks
-        for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+        for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
             enc_chunk = tl.load(enc_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
             pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
@@ -154,6 +163,20 @@ def _rnnt_joint_fwd_kernel(
                 .to(matmul_dtype)
                 .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
             )
+            if USE_DROPOUT:
+                hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
+                hidden_mask = hidden_offsets < hidden_dim
+                dropout_offsets = tile_base_offsets[:, :, None] * hidden_dim + hidden_offsets[None, None, :].to(
+                    tl.int64
+                )
+                dropout_keep_mask = (
+                    tl.rand(dropout_seed, dropout_offsets.reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])) >= dropout_p
+                )
+                hidden_chunk = tl.where(
+                    dropout_keep_mask & hidden_mask[None, :],
+                    hidden_chunk * dropout_inv_keep_prob,
+                    0.0,
+                )
 
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
@@ -226,6 +249,9 @@ def _rnnt_joint_bwd_kernel(
     grad_bias_out_ptr,
     max_src_len: int,
     max_tgt_len_plus_1: int,
+    dropout_seed: int,
+    dropout_p: float,
+    dropout_inv_keep_prob: float,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     blank_id: tl.constexpr,
@@ -235,6 +261,7 @@ def _rnnt_joint_bwd_kernel(
     PREDICTOR_BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
     VOCAB_BLOCK: tl.constexpr,
+    USE_DROPOUT: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_HIGH_PRECISION: tl.constexpr,
 ):
@@ -308,6 +335,9 @@ def _rnnt_joint_bwd_kernel(
 
             source_offsets = enc_tile_start + tl.arange(0, ENCODER_BLOCK)
             target_offsets = pred_tile_start + tl.arange(0, PREDICTOR_BLOCK)
+            tile_base_offsets = (batch_i * max_src_len + source_offsets).to(tl.int64)[
+                :, None
+            ] * max_tgt_len_plus_1 + target_offsets[None, :].to(tl.int64)
             source_mask = (source_offsets < source_len) & (source_offsets < enc_range_end)
             target_valid_mask = (target_offsets <= target_len) & (target_offsets < pred_range_end)
             target_label_mask = (target_offsets < target_len) & (target_offsets < pred_range_end)
@@ -350,7 +380,7 @@ def _rnnt_joint_bwd_kernel(
             logits_block = tl.zeros([NUM_TILE_ELEMENTS, VOCAB_BLOCK], dtype=compute_dtype) + bias_tile[None, :]
 
             # Inner loop 1: recompute logits
-            for _ in tl.range(0, hidden_dim, HIDDEN_BLOCK):
+            for hidden_start in tl.range(0, hidden_dim, HIDDEN_BLOCK):
                 enc_chunk = tl.load(enc_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
                 pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
@@ -359,6 +389,20 @@ def _rnnt_joint_bwd_kernel(
                     .to(matmul_dtype)
                     .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
                 )
+                if USE_DROPOUT:
+                    hidden_offsets = hidden_start + tl.arange(0, HIDDEN_BLOCK)
+                    hidden_mask = hidden_offsets < hidden_dim
+                    dropout_offsets = tile_base_offsets[:, :, None] * hidden_dim + hidden_offsets[None, None, :].to(
+                        tl.int64
+                    )
+                    dropout_keep_mask = (
+                        tl.rand(dropout_seed, dropout_offsets.reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])) >= dropout_p
+                    )
+                    hidden_chunk = tl.where(
+                        dropout_keep_mask & hidden_mask[None, :],
+                        hidden_chunk * dropout_inv_keep_prob,
+                        0.0,
+                    )
                 # weight_chunk: [VOCAB_BLOCK, HIDDEN_BLOCK]
                 weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
@@ -395,11 +439,27 @@ def _rnnt_joint_bwd_kernel(
                 pred_chunk = tl.load(pred_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
                 weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
 
-                hidden_chunk = (
+                relu_chunk = (
                     tl.maximum(enc_chunk[:, None, :] + pred_chunk[None, :, :], 0.0)
                     .to(matmul_dtype)
                     .reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])
                 )
+                if USE_DROPOUT:
+                    dropout_offsets = tile_base_offsets[:, :, None] * hidden_dim + hidden_offsets[None, None, :].to(
+                        tl.int64
+                    )
+                    dropout_keep_mask = (
+                        tl.rand(dropout_seed, dropout_offsets.reshape([NUM_TILE_ELEMENTS, HIDDEN_BLOCK])) >= dropout_p
+                    )
+                    dropout_relu_mask = dropout_keep_mask & (relu_chunk > 0.0)
+                    hidden_chunk = tl.where(
+                        dropout_keep_mask & hidden_mask[None, :],
+                        relu_chunk * dropout_inv_keep_prob,
+                        0.0,
+                    )
+                else:
+                    dropout_relu_mask = relu_chunk > 0.0
+                    hidden_chunk = relu_chunk
 
                 grad_weight_delta = matmul(
                     grad_logits_matmul.T, hidden_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
@@ -414,7 +474,10 @@ def _rnnt_joint_bwd_kernel(
                 grad_hidden_delta = matmul(
                     grad_logits_matmul, weight_chunk, USE_FP64=USE_FP64, USE_HIGH_PRECISION=USE_HIGH_PRECISION
                 ).to(compute_dtype)
-                grad_hidden_delta = tl.where(hidden_chunk > 0.0, grad_hidden_delta, 0.0)
+                if USE_DROPOUT:
+                    grad_hidden_delta = tl.where(dropout_relu_mask, grad_hidden_delta * dropout_inv_keep_prob, 0.0)
+                else:
+                    grad_hidden_delta = tl.where(dropout_relu_mask, grad_hidden_delta, 0.0)
                 grad_hidden_delta = grad_hidden_delta.reshape([ENCODER_BLOCK, PREDICTOR_BLOCK, HIDDEN_BLOCK])
 
                 grad_encoder_delta = tl.sum(grad_hidden_delta, axis=1)
@@ -460,13 +523,24 @@ class RnntJointLogProbs(torch.autograd.Function):
         blank_id: int,
         activation: str = "relu",
         dropout_p: float = 0.0,
+        dropout_seed: int | None = None,
         use_high_precision: bool = False,
     ):
         if activation != "relu":
             raise NotImplementedError("Only relu activation is supported")
 
-        if dropout_p != 0.0:
-            raise NotImplementedError("Dropout is not supported yet")
+        if dropout_p < 0.0 or dropout_p >= 1.0:
+            raise ValueError("dropout_p must be in range [0.0, 1.0)")
+        use_dropout = dropout_p > 0.0
+        dropout_keep_prob = 1.0 - dropout_p
+        dropout_inv_keep_prob = 1.0 / dropout_keep_prob if use_dropout else 1.0
+        if use_dropout:
+            if dropout_seed is None:
+                dropout_seed = random.randint(0, 2**31 - 1)
+            elif not (0 <= dropout_seed < 2**31):
+                raise ValueError("dropout_seed must be in range [0, 2**31)")
+        else:
+            dropout_seed = 0
 
         use_fp64 = encoder_output_projected.dtype == torch.float64
         float_dtype = torch.float64 if use_fp64 else torch.float32
@@ -511,6 +585,9 @@ class RnntJointLogProbs(torch.autograd.Function):
             log_sum_exp_out_ptr=log_sum_exp_scores,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
+            dropout_seed=dropout_seed,
+            dropout_p=dropout_p,
+            dropout_inv_keep_prob=dropout_inv_keep_prob,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
@@ -518,6 +595,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             PREDICTOR_BLOCK=PREDICTOR_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
+            USE_DROPOUT=use_dropout,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=num_warps,
@@ -537,6 +615,10 @@ class RnntJointLogProbs(torch.autograd.Function):
         ctx.blank_id = blank_id
         ctx.use_fp64 = use_fp64
         ctx.use_high_precision = use_high_precision
+        ctx.use_dropout = use_dropout
+        ctx.dropout_seed = dropout_seed
+        ctx.dropout_p = dropout_p
+        ctx.dropout_inv_keep_prob = dropout_inv_keep_prob
         return target_logprobs, blank_logprobs
 
     @staticmethod
@@ -554,6 +636,10 @@ class RnntJointLogProbs(torch.autograd.Function):
         blank_id = ctx.blank_id
         use_fp64 = ctx.use_fp64
         use_high_precision = ctx.use_high_precision
+        use_dropout = ctx.use_dropout
+        dropout_seed = ctx.dropout_seed
+        dropout_p = ctx.dropout_p
+        dropout_inv_keep_prob = ctx.dropout_inv_keep_prob
         float_dtype = torch.float64 if use_fp64 else torch.float32
 
         grad_target_scores = grad_target_scores.contiguous()
@@ -611,6 +697,9 @@ class RnntJointLogProbs(torch.autograd.Function):
             grad_bias_out_ptr=grad_bias,
             max_src_len=src_max_length,
             max_tgt_len_plus_1=tgt_max_length_plus_1,
+            dropout_seed=dropout_seed,
+            dropout_p=dropout_p,
+            dropout_inv_keep_prob=dropout_inv_keep_prob,
             hidden_dim=hidden_dim,
             vocab_size=vocab_size,
             blank_id=blank_id,
@@ -620,6 +709,7 @@ class RnntJointLogProbs(torch.autograd.Function):
             PREDICTOR_BLOCK=PREDICTOR_BLOCK,
             HIDDEN_BLOCK=HIDDEN_BLOCK,
             VOCAB_BLOCK=VOCAB_BLOCK,
+            USE_DROPOUT=use_dropout,
             USE_FP64=use_fp64,
             USE_HIGH_PRECISION=use_high_precision,
             num_warps=bwd_num_warps,
@@ -632,7 +722,7 @@ class RnntJointLogProbs(torch.autograd.Function):
         grad_weight = grad_weight.to(weight.dtype)
         grad_bias = grad_bias.to(bias.dtype)
 
-        return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None, None
+        return grad_encoder, grad_predictor, None, None, None, grad_weight, grad_bias, None, None, None, None, None
 
 
 def rnnt_joint_logprobs_triton(
@@ -646,6 +736,7 @@ def rnnt_joint_logprobs_triton(
     blank_id: int,
     activation: str = "relu",
     dropout_p: float = 0.0,
+    dropout_seed: int | None = None,
     use_high_precision: bool = False,
 ):
     target_logprobs, blank_logprobs = RnntJointLogProbs.apply(
@@ -659,6 +750,7 @@ def rnnt_joint_logprobs_triton(
         blank_id,
         activation,
         dropout_p,
+        dropout_seed,
         use_high_precision,
     )
     return target_logprobs, blank_logprobs

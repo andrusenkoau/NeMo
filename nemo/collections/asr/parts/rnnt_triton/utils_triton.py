@@ -60,3 +60,18 @@ def sum_at_block(x: tl.tensor, y: tl.tensor, block_id, axis: tl.constexpr):
     return (x.reshape(x_shape_by_blocks) + y.expand_dims(axis) * mask.reshape(mask_broadcastable_shape)).reshape(
         x.shape
     )
+
+@triton.jit
+def dropout_scale_mask_kernel(
+    mask_out_ptr,
+    total_elements: int,
+    dropout_seed: int,
+    dropout_p: float,
+    dropout_inv_keep_prob: float,
+    BLOCK: tl.constexpr,
+):
+    flat_offsets = tl.program_id(axis=0) * BLOCK + tl.arange(0, BLOCK)
+    valid_mask = flat_offsets < total_elements
+    keep_mask = tl.rand(dropout_seed, flat_offsets.to(tl.int64)) >= dropout_p
+    dropout_scale_mask = tl.where(keep_mask, dropout_inv_keep_prob, 0.0)
+    tl.store(mask_out_ptr + flat_offsets, dropout_scale_mask, mask=valid_mask)

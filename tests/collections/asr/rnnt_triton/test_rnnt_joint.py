@@ -21,11 +21,46 @@ from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 from tests.collections.asr.decoding.utils import avoid_sync_operations
 
 if TRITON_AVAILABLE:
+    import triton
+
     from nemo.collections.asr.parts.rnnt_triton.rnnt_joint_triton import rnnt_joint_logprobs_triton
+    from nemo.collections.asr.parts.rnnt_triton.utils_triton import dropout_scale_mask_kernel
 
 
-def _reference_joint_logprobs(enc, pred, weight, bias, targets, src_lengths, tgt_lengths, blank_id):
+def _triton_dropout_scale_mask(shape, dropout_p, dropout_seed, device, dtype):
+    if dropout_p == 0.0:
+        return torch.ones(shape, device=device, dtype=dtype)
+    total_elements = 1
+    for dim in shape:
+        total_elements *= dim
+    dropout_inv_keep_prob = 1.0 / (1.0 - dropout_p)
+    mask_flat = torch.empty([total_elements], device=device, dtype=torch.float32)
+    BLOCK = 1024
+    dropout_scale_mask_kernel[(triton.cdiv(total_elements, BLOCK),)](
+        mask_out_ptr=mask_flat,
+        total_elements=total_elements,
+        dropout_seed=dropout_seed,
+        dropout_p=dropout_p,
+        dropout_inv_keep_prob=dropout_inv_keep_prob,
+        BLOCK=BLOCK,
+    )
+    return mask_flat.view(shape).to(dtype)
+
+
+def _reference_joint_logprobs(
+    enc,
+    pred,
+    weight,
+    bias,
+    targets,
+    src_lengths,
+    tgt_lengths,
+    blank_id,
+    dropout_scale_mask=None,
+):
     joint_hidden = torch.relu(enc.unsqueeze(2) + pred.unsqueeze(1))
+    if dropout_scale_mask is not None:
+        joint_hidden = joint_hidden * dropout_scale_mask
     logits = F.linear(joint_hidden, weight, bias)
     target_logprobs, blank_logprobs = rnnt_logprobs_torch(
         logits=logits,
@@ -141,7 +176,7 @@ class TestRnntJointTriton:
         # bf16 tolerance is higher than fused-vocab test because our kernel computes
         # relu(enc+pred) on-the-fly in float32 (with use_high_precision), while the PyTorch
         # reference computes it in bf16. This causes small differences that scale with gradient magnitude.
-        weight_bias_atol = 1e+1 if float_dtype == torch.bfloat16 else 1e-4  # TODO: fix to match triton_vocab
+        weight_bias_atol = 1e1 if float_dtype == torch.bfloat16 else 1e-4  # TODO: fix to match triton_vocab
         weight_bias_rtol = 1e-3 if float_dtype == torch.bfloat16 else 1e-5
         assert torch.allclose(
             weight_tri.grad.float(), weight_ref.grad.float(), atol=weight_bias_atol, rtol=weight_bias_rtol
@@ -259,6 +294,150 @@ class TestRnntJointTriton:
 
         assert torch.allclose(target_tri, target_ref, atol=5e-3)
         assert torch.allclose(blank_tri, blank_ref, atol=5e-3)
+
+    def test_dropout_forward_and_backward_matches_reference(self):
+        device = torch.device("cuda")
+        torch.manual_seed(42)
+        use_high_precision = True
+        batch_size = 2
+        src_length = 4
+        tgt_length = 3
+        hidden_dim = 16
+        vocab_size_no_blank = 8
+        blank_id = vocab_size_no_blank
+        vocab_size_with_blank = vocab_size_no_blank + 1
+        dropout_p = 0.3
+        dropout_seed = 123456
+
+        enc = torch.randn(batch_size, src_length, hidden_dim, device=device, dtype=torch.float32)
+        pred = torch.randn(batch_size, tgt_length + 1, hidden_dim, device=device, dtype=torch.float32)
+        weight = torch.randn(vocab_size_with_blank, hidden_dim, device=device, dtype=torch.float32)
+        bias = torch.randn(vocab_size_with_blank, device=device, dtype=torch.float32)
+        targets = torch.randint(0, vocab_size_no_blank, (batch_size, tgt_length), device=device, dtype=torch.long)
+        src_lengths = torch.full([batch_size], src_length, device=device, dtype=torch.long)
+        tgt_lengths = torch.full([batch_size], tgt_length, device=device, dtype=torch.long)
+
+        dropout_scale_mask = _triton_dropout_scale_mask(
+            shape=[batch_size, src_length, tgt_length + 1, hidden_dim],
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        enc_ref = enc.detach().clone().requires_grad_(True)
+        pred_ref = pred.detach().clone().requires_grad_(True)
+        weight_ref = weight.detach().clone().requires_grad_(True)
+        bias_ref = bias.detach().clone().requires_grad_(True)
+        target_ref, blank_ref = _reference_joint_logprobs(
+            enc=enc_ref,
+            pred=pred_ref,
+            weight=weight_ref,
+            bias=bias_ref,
+            targets=targets,
+            src_lengths=src_lengths,
+            tgt_lengths=tgt_lengths,
+            blank_id=blank_id,
+            dropout_scale_mask=dropout_scale_mask,
+        )
+
+        enc_tri = enc.detach().clone().requires_grad_(True)
+        pred_tri = pred.detach().clone().requires_grad_(True)
+        weight_tri = weight.detach().clone().requires_grad_(True)
+        bias_tri = bias.detach().clone().requires_grad_(True)
+        target_tri, blank_tri = rnnt_joint_logprobs_triton(
+            encoder_output_projected=enc_tri,
+            predictor_output_projected=pred_tri,
+            targets=targets,
+            tgt_lengths=tgt_lengths,
+            src_lengths=src_lengths,
+            weight=weight_tri,
+            bias=bias_tri,
+            blank_id=blank_id,
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed,
+            use_high_precision=use_high_precision,
+        )
+
+        assert torch.allclose(target_tri, target_ref, atol=1e-5)
+        assert torch.allclose(blank_tri, blank_ref, atol=1e-5)
+
+        torch.manual_seed(123)
+        target_scales = torch.rand_like(target_ref)
+        blank_scales = torch.rand_like(blank_ref)
+        loss_ref = (target_scales * target_ref + blank_scales * blank_ref).sum()
+        loss_tri = (target_scales * target_tri + blank_scales * blank_tri).sum()
+        loss_ref.backward()
+        loss_tri.backward()
+
+        assert torch.allclose(enc_tri.grad, enc_ref.grad, atol=1e-3, rtol=1e-5)
+        assert torch.allclose(pred_tri.grad, pred_ref.grad, atol=1e-3, rtol=1e-5)
+        assert torch.allclose(weight_tri.grad, weight_ref.grad, atol=2e-3, rtol=1e-5)
+        assert torch.allclose(bias_tri.grad, bias_ref.grad, atol=2e-3, rtol=1e-5)
+
+    def test_dropout_seed_controls_forward_determinism(self):
+        device = torch.device("cuda")
+        torch.manual_seed(42)
+        batch_size = 2
+        src_length = 4
+        tgt_length = 3
+        hidden_dim = 16
+        vocab_size_no_blank = 8
+        blank_id = vocab_size_no_blank
+        vocab_size_with_blank = vocab_size_no_blank + 1
+        dropout_p = 0.3
+        dropout_seed_same = 777
+        dropout_seed_different = 778
+
+        enc = torch.randn(batch_size, src_length, hidden_dim, device=device, dtype=torch.float32)
+        pred = torch.randn(batch_size, tgt_length + 1, hidden_dim, device=device, dtype=torch.float32)
+        weight = torch.randn(vocab_size_with_blank, hidden_dim, device=device, dtype=torch.float32)
+        bias = torch.randn(vocab_size_with_blank, device=device, dtype=torch.float32)
+        targets = torch.randint(0, vocab_size_no_blank, (batch_size, tgt_length), device=device, dtype=torch.long)
+        src_lengths = torch.full([batch_size], src_length, device=device, dtype=torch.long)
+        tgt_lengths = torch.full([batch_size], tgt_length, device=device, dtype=torch.long)
+
+        target_same_0, blank_same_0 = rnnt_joint_logprobs_triton(
+            encoder_output_projected=enc,
+            predictor_output_projected=pred,
+            targets=targets,
+            tgt_lengths=tgt_lengths,
+            src_lengths=src_lengths,
+            weight=weight,
+            bias=bias,
+            blank_id=blank_id,
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed_same,
+        )
+        target_same_1, blank_same_1 = rnnt_joint_logprobs_triton(
+            encoder_output_projected=enc,
+            predictor_output_projected=pred,
+            targets=targets,
+            tgt_lengths=tgt_lengths,
+            src_lengths=src_lengths,
+            weight=weight,
+            bias=bias,
+            blank_id=blank_id,
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed_same,
+        )
+        target_different, blank_different = rnnt_joint_logprobs_triton(
+            encoder_output_projected=enc,
+            predictor_output_projected=pred,
+            targets=targets,
+            tgt_lengths=tgt_lengths,
+            src_lengths=src_lengths,
+            weight=weight,
+            bias=bias,
+            blank_id=blank_id,
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed_different,
+        )
+
+        assert torch.equal(target_same_0, target_same_1)
+        assert torch.equal(blank_same_0, blank_same_1)
+        assert not torch.equal(target_same_0, target_different)
+        assert not torch.equal(blank_same_0, blank_different)
 
     def test_edge_case_blank_only(self):
         device = torch.device("cuda")
