@@ -174,8 +174,8 @@ def _rnnt_joint_fwd_kernel(
                 )
                 hidden_chunk = tl.where(
                     dropout_keep_mask & hidden_mask[None, :],
-                    hidden_chunk * dropout_inv_keep_prob,
-                    0.0,
+                    hidden_chunk * dropout_inv_keep_prob.to(matmul_dtype),
+                    0,
                 )
 
             weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
@@ -400,8 +400,8 @@ def _rnnt_joint_bwd_kernel(
                     )
                     hidden_chunk = tl.where(
                         dropout_keep_mask & hidden_mask[None, :],
-                        hidden_chunk * dropout_inv_keep_prob,
-                        0.0,
+                        hidden_chunk * dropout_inv_keep_prob.to(matmul_dtype),
+                        0,
                     )
                 # weight_chunk: [VOCAB_BLOCK, HIDDEN_BLOCK]
                 weight_chunk = tl.load(weight_block_ptr, boundary_check=(0, 1)).to(matmul_dtype)
@@ -454,8 +454,8 @@ def _rnnt_joint_bwd_kernel(
                     dropout_relu_mask = dropout_keep_mask & (relu_chunk > 0.0)
                     hidden_chunk = tl.where(
                         dropout_keep_mask & hidden_mask[None, :],
-                        relu_chunk * dropout_inv_keep_prob,
-                        0.0,
+                        relu_chunk * dropout_inv_keep_prob.to(matmul_dtype),
+                        0,
                     )
                 else:
                     dropout_relu_mask = relu_chunk > 0.0
