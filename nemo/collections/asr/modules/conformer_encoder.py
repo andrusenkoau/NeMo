@@ -334,6 +334,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         use_pytorch_sdpa: bool = False,
         use_pytorch_sdpa_backends=None,
         sync_max_audio_length: bool = True,
+        use_pure_transformer_block: bool = False,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -358,6 +359,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             use_pytorch_sdpa_backends = []
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.sync_max_audio_length = sync_max_audio_length
+        self.use_pure_transformer_block = use_pure_transformer_block
 
         assert conv_context_style in ["regular", "dcc", "dcc_rc"], f"Invalid conv_context_style: {conv_context_style}!"
         self.conv_context_style = conv_context_style
@@ -508,6 +510,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 use_bias=use_bias,
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                use_pure_transformer_block=self.use_pure_transformer_block,
             )
             self.layers.append(layer)
 

@@ -61,6 +61,8 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         dropout_att (float): dropout probabilities for attention distributions
         use_bias (bool): Apply bias to all Linear and Conv1d layers from each ConformerLayer to improve activation flow and stabilize training of huge models.
             Defaults to True.
+        use_pure_transformer_block (bool): If True, use pure transformer architecture (MHA -> FeedForward) instead of Conformer (FeedForward -> MHA -> Conv -> FeedForward).
+            Defaults to False.
     """
 
     def __init__(
@@ -84,6 +86,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         use_bias=True,
         use_pytorch_sdpa=False,
         use_pytorch_sdpa_backends=None,
+        use_pure_transformer_block=False,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -94,74 +97,133 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.self_attention_model = self_attention_model
         self.n_heads = n_heads
         self.fc_factor = 0.5
-
-        # first feed forward module
-        self.norm_feed_forward1 = LayerNorm(d_model)
-        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
-
-        # convolution module
-        self.norm_conv = LayerNorm(d_model)
-        self.conv = ConformerConvolution(
-            d_model=d_model,
-            kernel_size=conv_kernel_size,
-            conv_context_style=conv_context_style,
-            norm_type=conv_norm_type,
-            conv_context_size=conv_context_size,
-            use_bias=use_bias,
-        )
-
-        # multi-headed self-attention module
-        self.norm_self_att = LayerNorm(d_model)
-        MHA_max_cache_len = att_context_size[0]
-
-        if self_attention_model == 'rel_pos':
-            self.self_attn = RelPositionMultiHeadAttention(
-                n_head=n_heads,
-                n_feat=d_model,
-                dropout_rate=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
-                max_cache_len=MHA_max_cache_len,
-                use_bias=use_bias,
-                use_pytorch_sdpa=self.use_pytorch_sdpa,
-                use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
-            )
-        elif self_attention_model == 'rel_pos_local_attn':
-            self.self_attn = RelPositionMultiHeadAttentionLongformer(
-                n_head=n_heads,
-                n_feat=d_model,
-                dropout_rate=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
-                max_cache_len=MHA_max_cache_len,
-                att_context_size=att_context_size,
-                global_tokens=global_tokens,
-                global_tokens_spacing=global_tokens_spacing,
-                global_attn_separate=global_attn_separate,
-                use_bias=use_bias,
-            )
-        elif self_attention_model == 'abs_pos':
-            self.self_attn = MultiHeadAttention(
-                n_head=n_heads,
-                n_feat=d_model,
-                dropout_rate=dropout_att,
-                max_cache_len=MHA_max_cache_len,
-                use_bias=use_bias,
-                use_pytorch_sdpa=self.use_pytorch_sdpa,
-                use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
-            )
+        
+        # Store transformer mode flags
+        self.use_pure_transformer_block = use_pure_transformer_block
+        
+        if use_pure_transformer_block:
+            # Pure Transformer mode: MHA -> FeedForward (pre-norm architecture)
+            # Multi-headed self-attention module
+            self.norm_self_att = LayerNorm(d_model)
+            MHA_max_cache_len = att_context_size[0]
+            
+            if self_attention_model == 'rel_pos':
+                self.self_attn = RelPositionMultiHeadAttention(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    max_cache_len=MHA_max_cache_len,
+                    use_bias=use_bias,
+                    use_pytorch_sdpa=self.use_pytorch_sdpa,
+                    use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                )
+            elif self_attention_model == 'rel_pos_local_attn':
+                self.self_attn = RelPositionMultiHeadAttentionLongformer(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    max_cache_len=MHA_max_cache_len,
+                    att_context_size=att_context_size,
+                    global_tokens=global_tokens,
+                    global_tokens_spacing=global_tokens_spacing,
+                    global_attn_separate=global_attn_separate,
+                    use_bias=use_bias,
+                )
+            elif self_attention_model == 'abs_pos':
+                self.self_attn = MultiHeadAttention(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    max_cache_len=MHA_max_cache_len,
+                    use_bias=use_bias,
+                    use_pytorch_sdpa=self.use_pytorch_sdpa,
+                    use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                )
+            else:
+                raise ValueError(
+                    f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
+                    f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
+                )
+            
+            # Single feed forward module for pure transformer
+            self.norm_feed_forward = LayerNorm(d_model)
+            self.feed_forward = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+            
+            self.dropout = nn.Dropout(dropout)
+            self.norm_out = LayerNorm(d_model)
         else:
-            raise ValueError(
-                f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
-                f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
+            # first feed forward module
+            self.norm_feed_forward1 = LayerNorm(d_model)
+            self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+
+            # convolution module
+            self.norm_conv = LayerNorm(d_model)
+            self.conv = ConformerConvolution(
+                d_model=d_model,
+                kernel_size=conv_kernel_size,
+                conv_context_style=conv_context_style,
+                norm_type=conv_norm_type,
+                conv_context_size=conv_context_size,
+                use_bias=use_bias,
             )
 
-        # second feed forward module
-        self.norm_feed_forward2 = LayerNorm(d_model)
-        self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+            # multi-headed self-attention module
+            self.norm_self_att = LayerNorm(d_model)
+            MHA_max_cache_len = att_context_size[0]
 
-        self.dropout = nn.Dropout(dropout)
-        self.norm_out = LayerNorm(d_model)
+            if self_attention_model == 'rel_pos':
+                self.self_attn = RelPositionMultiHeadAttention(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    max_cache_len=MHA_max_cache_len,
+                    use_bias=use_bias,
+                    use_pytorch_sdpa=self.use_pytorch_sdpa,
+                    use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                )
+            elif self_attention_model == 'rel_pos_local_attn':
+                self.self_attn = RelPositionMultiHeadAttentionLongformer(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    max_cache_len=MHA_max_cache_len,
+                    att_context_size=att_context_size,
+                    global_tokens=global_tokens,
+                    global_tokens_spacing=global_tokens_spacing,
+                    global_attn_separate=global_attn_separate,
+                    use_bias=use_bias,
+                )
+            elif self_attention_model == 'abs_pos':
+                self.self_attn = MultiHeadAttention(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    max_cache_len=MHA_max_cache_len,
+                    use_bias=use_bias,
+                    use_pytorch_sdpa=self.use_pytorch_sdpa,
+                    use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                )
+            else:
+                raise ValueError(
+                    f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
+                    f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
+                )
+
+            # second feed forward module
+            self.norm_feed_forward2 = LayerNorm(d_model)
+            self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+
+            self.dropout = nn.Dropout(dropout)
+            self.norm_out = LayerNorm(d_model)
+
 
     def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, dcc_chunk=None):
         """
@@ -178,68 +240,207 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             cache_last_channel (torch.tensor) : next cache for MHA layers (B, T_cache, d_model)
             cache_last_time (torch.tensor) : next cache for convolutional layers (B, d_model, T_cache)
         """
-        residual = x
-        x = self.norm_feed_forward1(x)
-        x = self.feed_forward1(x)
-        residual = residual + self.dropout(x) * self.fc_factor
-
-        # import ipdb; ipdb.set_trace()
-
-        x = self.norm_self_att(residual)
-        if self.self_attention_model == 'rel_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
-        elif self.self_attention_model == 'rel_pos_local_attn':
-            x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
-        elif self.self_attention_model == 'abs_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
+        if self.use_pure_transformer_block:
+            # Pure Transformer mode: Pre-norm MHA -> Pre-norm FFN
+            residual = x
+            
+            # Multi-Head Attention with pre-norm
+            x = self.norm_self_att(residual)
+            if self.self_attention_model == 'rel_pos':
+                x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            elif self.self_attention_model == 'rel_pos_local_attn':
+                x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            elif self.self_attention_model == 'abs_pos':
+                x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
+            else:
+                x = None
+            
+            if x is not None and cache_last_channel is not None:
+                (x, cache_last_channel) = x
+            
+            residual = residual + self.dropout(x)
+            
+            # Adapter support after MHA
+            if self.is_adapter_available():
+                pack_input = {
+                    'x': residual,
+                    'loc': 'mha',
+                    'att_mask': att_mask,
+                    'pos_emb': pos_emb,
+                }
+                pack_input = self.forward_enabled_adapters(pack_input)
+                residual = pack_input['x']
+            
+            # FeedForward with pre-norm
+            x = self.norm_feed_forward(residual)
+            x = self.feed_forward(x)
+            residual = residual + self.dropout(x)
+            
+            # Final layer norm
+            x = self.norm_out(residual)
+            
+            # Adapter support after FFN
+            if self.is_adapter_available():
+                pack_input = {
+                    'x': x,
+                    'loc': 'post',
+                }
+                pack_input = self.forward_enabled_adapters(pack_input)
+                x = pack_input['x']
+            
+            # Access mixin support
+            if self.is_access_enabled(getattr(self, "model_guid", None)) and self.access_cfg.get(
+                'save_encoder_tensors', False
+            ):
+                self.register_accessible_tensor(name='encoder', tensor=x)
+            
+            if cache_last_channel is None:
+                return x
+            else:
+                # For pure transformer, cache_last_time is not used (no conv)
+                return x, cache_last_channel, None
         else:
-            x = None
+            # Standard Conformer mode: FeedForward -> MHA -> Conv -> FeedForward
+            residual = x
+            x = self.norm_feed_forward1(x)
+            x = self.feed_forward1(x)
+            residual = residual + self.dropout(x) * self.fc_factor
 
-        if x is not None and cache_last_channel is not None:
-            (x, cache_last_channel) = x
+            # import ipdb; ipdb.set_trace()
 
-        residual = residual + self.dropout(x)
+            x = self.norm_self_att(residual)
+            if self.self_attention_model == 'rel_pos':
+                x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            elif self.self_attention_model == 'rel_pos_local_attn':
+                x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            elif self.self_attention_model == 'abs_pos':
+                x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
+            else:
+                x = None
 
-        if self.is_adapter_available():
-            # Call the MHA adapters
-            pack_input = {
-                'x': residual,
-                'loc': 'mha',
-                'att_mask': att_mask,
-                'pos_emb': pos_emb,
-            }
-            pack_input = self.forward_enabled_adapters(pack_input)
-            residual = pack_input['x']
+            if x is not None and cache_last_channel is not None:
+                (x, cache_last_channel) = x
 
-        x = self.norm_conv(residual)
-        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
-        if cache_last_time is not None:
-            (x, cache_last_time) = x
-        residual = residual + self.dropout(x)
+            residual = residual + self.dropout(x)
 
-        x = self.norm_feed_forward2(residual)
-        x = self.feed_forward2(x)
-        residual = residual + self.dropout(x) * self.fc_factor
+            if self.is_adapter_available():
+                # Call the MHA adapters
+                pack_input = {
+                    'x': residual,
+                    'loc': 'mha',
+                    'att_mask': att_mask,
+                    'pos_emb': pos_emb,
+                }
+                pack_input = self.forward_enabled_adapters(pack_input)
+                residual = pack_input['x']
 
-        x = self.norm_out(residual)
+            x = self.norm_conv(residual)
+            x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
+            if cache_last_time is not None:
+                (x, cache_last_time) = x
+            residual = residual + self.dropout(x)
 
-        if self.is_adapter_available():
-            # Call the adapters
-            pack_input = {
-                'x': x,
-                'loc': 'post',
-            }
-            pack_input = self.forward_enabled_adapters(pack_input)
-            x = pack_input['x']
+            x = self.norm_feed_forward2(residual)
+            x = self.feed_forward2(x)
+            residual = residual + self.dropout(x) * self.fc_factor
 
-        if self.is_access_enabled(getattr(self, "model_guid", None)) and self.access_cfg.get(
-            'save_encoder_tensors', False
-        ):
-            self.register_accessible_tensor(name='encoder', tensor=x)
-        if cache_last_channel is None:
-            return x
-        else:
-            return x, cache_last_channel, cache_last_time
+            x = self.norm_out(residual)
+
+            if self.is_adapter_available():
+                # Call the adapters
+                pack_input = {
+                    'x': x,
+                    'loc': 'post',
+                }
+                pack_input = self.forward_enabled_adapters(pack_input)
+                x = pack_input['x']
+
+            if self.is_access_enabled(getattr(self, "model_guid", None)) and self.access_cfg.get(
+                'save_encoder_tensors', False
+            ):
+                self.register_accessible_tensor(name='encoder', tensor=x)
+            if cache_last_channel is None:
+                return x
+            else:
+                return x, cache_last_channel, cache_last_time
+
+    # def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, dcc_chunk=None):
+    #     """
+    #     Args:
+    #         x (torch.Tensor): input signals (B, T, d_model)
+    #         att_mask (torch.Tensor): attention masks(B, T, T)
+    #         pos_emb (torch.Tensor): (L, 1, d_model)
+    #         pad_mask (torch.tensor): padding mask
+    #         cache_last_channel (torch.tensor) : cache for MHA layers (B, T_cache, d_model)
+    #         cache_last_time (torch.tensor) : cache for convolutional layers (B, d_model, T_cache)
+    #         dcc_chunk (int) : chunk size for dynamic chunked convolution
+    #     Returns:
+    #         x (torch.Tensor): (B, T, d_model)
+    #         cache_last_channel (torch.tensor) : next cache for MHA layers (B, T_cache, d_model)
+    #         cache_last_time (torch.tensor) : next cache for convolutional layers (B, d_model, T_cache)
+    #     """
+    #     residual = x
+    #     x = self.norm_feed_forward1(x)
+    #     x = self.feed_forward1(x)
+    #     residual = residual + self.dropout(x) * self.fc_factor
+
+    #     # import ipdb; ipdb.set_trace()
+
+    #     x = self.norm_self_att(residual)
+    #     if self.self_attention_model == 'rel_pos':
+    #         x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+    #     elif self.self_attention_model == 'rel_pos_local_attn':
+    #         x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
+    #     elif self.self_attention_model == 'abs_pos':
+    #         x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
+    #     else:
+    #         x = None
+
+    #     if x is not None and cache_last_channel is not None:
+    #         (x, cache_last_channel) = x
+
+    #     residual = residual + self.dropout(x)
+
+    #     if self.is_adapter_available():
+    #         # Call the MHA adapters
+    #         pack_input = {
+    #             'x': residual,
+    #             'loc': 'mha',
+    #             'att_mask': att_mask,
+    #             'pos_emb': pos_emb,
+    #         }
+    #         pack_input = self.forward_enabled_adapters(pack_input)
+    #         residual = pack_input['x']
+
+    #     x = self.norm_conv(residual)
+    #     x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, dcc_chunk=dcc_chunk)
+    #     if cache_last_time is not None:
+    #         (x, cache_last_time) = x
+    #     residual = residual + self.dropout(x)
+
+    #     x = self.norm_feed_forward2(residual)
+    #     x = self.feed_forward2(x)
+    #     residual = residual + self.dropout(x) * self.fc_factor
+
+    #     x = self.norm_out(residual)
+
+    #     if self.is_adapter_available():
+    #         # Call the adapters
+    #         pack_input = {
+    #             'x': x,
+    #             'loc': 'post',
+    #         }
+    #         pack_input = self.forward_enabled_adapters(pack_input)
+    #         x = pack_input['x']
+
+    #     if self.is_access_enabled(getattr(self, "model_guid", None)) and self.access_cfg.get(
+    #         'save_encoder_tensors', False
+    #     ):
+    #         self.register_accessible_tensor(name='encoder', tensor=x)
+    #     if cache_last_channel is None:
+    #         return x
+    #     else:
+    #         return x, cache_last_channel, cache_last_time
 
 
 class ConformerConvolution(nn.Module):
