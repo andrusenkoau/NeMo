@@ -75,7 +75,7 @@ def benchmark_standard_joint(
     max_time: int = 150,
     hidden_dim: int = 640,
     num_classes: int = 1024,
-    max_targets: int = 36,
+    max_targets: int = 72,
     forward_only: bool = False,
     dropout_p: float = 0.2,
 ) -> BenchmarkResults:
@@ -221,7 +221,7 @@ def benchmark_triton_joint(
     max_time: int = 150,
     hidden_dim: int = 640,
     num_classes: int = 1024,
-    max_targets: int = 36,
+    max_targets: int = 72,
     forward_only: bool = False,
     dropout_p: float = 0.2,
 ) -> BenchmarkResults:
@@ -371,7 +371,7 @@ def benchmark_triton_vocab_joint(
     max_time: int = 150,
     hidden_dim: int = 640,
     num_classes: int = 1024,
-    max_targets: int = 36,
+    max_targets: int = 72,
     forward_only: bool = False,
     dropout_p: float = 0.2,
 ) -> BenchmarkResults:
@@ -577,7 +577,7 @@ def main():
     )
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--max-time', type=int, default=150)
-    parser.add_argument('--max-targets', type=int, default=36, help='Maximum target sequence length (default: 36)')
+    parser.add_argument('--max-targets', type=int, default=72, help='Maximum target sequence length (default: 72)')
     parser.add_argument('--hidden-dim', type=int, default=640)
     parser.add_argument('--num-classes', type=int, default=1024)
     parser.add_argument('--warmup-iterations', type=int, default=10)
