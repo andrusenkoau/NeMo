@@ -482,6 +482,44 @@ class TestTritonRnntLoss:
 
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
+    def test_mask_non_finite_zeroes_loss_and_gradients(self, device):
+        rng = np.random.RandomState(2026)
+        acts = rng.randn(2, 4, 3, 5).astype(np.float32)
+        labels = [[1, 2], [3, 1]]
+
+        labels_tensor = torch.LongTensor(labels).cuda()
+        lengths = torch.LongTensor([4, 4]).cuda()
+        label_lengths = torch.LongTensor([2, 2]).cuda()
+
+        clean_acts_tensor = torch.from_numpy(acts.copy()).cuda().requires_grad_(True)
+        clean_loss = TritonRnntLoss(blank=0)(clean_acts_tensor, labels_tensor, lengths, label_lengths).detach()
+
+        corrupt_acts = acts.copy()
+        corrupt_acts[1, 0, 0, 0] = np.nan
+
+        unmasked_acts_tensor = torch.from_numpy(corrupt_acts.copy()).cuda().requires_grad_(True)
+        unmasked_loss = TritonRnntLoss(blank=0)(unmasked_acts_tensor, labels_tensor, lengths, label_lengths)
+        assert not torch.isfinite(unmasked_loss).all()
+
+        masked_acts_tensor = torch.from_numpy(corrupt_acts).cuda().requires_grad_(True)
+        masked_loss = TritonRnntLoss(blank=0, mask_non_finite=True)(
+            masked_acts_tensor, labels_tensor, lengths, label_lengths
+        )
+
+        assert torch.all(torch.isfinite(masked_loss))
+        assert torch.allclose(masked_loss[0], clean_loss[0], atol=1e-5, rtol=1e-5)
+        assert torch.allclose(masked_loss[1:], torch.zeros_like(masked_loss[1:]))
+
+        masked_loss_mean = masked_loss.mean()
+        assert torch.isfinite(masked_loss_mean)
+        masked_loss_mean.backward()
+        torch.cuda.synchronize()
+
+        assert torch.all(torch.isfinite(masked_acts_tensor.grad))
+        assert torch.count_nonzero(masked_acts_tensor.grad[1]).item() == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('device', DEVICES)
     @pytest.mark.parametrize('fastemit_lambda', [0.001, 0.01, 0.1])
     def test_fastemit_small_random(self, device, fastemit_lambda):
         """Compare FastEmit loss and gradients against numpy reference."""

@@ -109,6 +109,18 @@ def _rnnt_logprobs_bwd_kernel(
 
     compute_dtype = tl.float64 if USE_FP64 else tl.float32
 
+    blank_grad = tl.load(
+        grad_blank_scores_ptr + ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i)
+    ).to(compute_dtype)
+    target_i_valid = target_i < target_len
+    target_grad = tl.load(
+        grad_target_scores_ptr + ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i),
+        mask=target_i_valid,
+        other=0.0,
+    ).to(compute_dtype)
+    if blank_grad == 0.0 and target_grad == 0.0:
+        return
+
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits/grad_logits
     flat_index_grid = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
     flat_index_logits = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
@@ -124,9 +136,6 @@ def _rnnt_logprobs_bwd_kernel(
     # softmax for gradient
     softmax = tl.exp(log_softmax)
 
-    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grid).to(compute_dtype)
-    target_i_valid = target_i < target_len
-    target_grad = tl.load(grad_target_scores_ptr + flat_index_grid, mask=target_i_valid, other=0.0).to(compute_dtype)
     target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i, mask=target_i_valid, other=-1)
 
     grad_not_in_targets = (-softmax) * (blank_grad + target_grad)
