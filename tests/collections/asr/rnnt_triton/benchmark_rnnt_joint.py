@@ -28,6 +28,7 @@ import sys
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.parts.rnnt_triton.rnnt_joint_triton import rnnt_joint_logprobs_triton
@@ -74,8 +75,9 @@ def benchmark_standard_joint(
     max_time: int = 150,
     hidden_dim: int = 640,
     num_classes: int = 1024,
-    max_targets: int = 36,
+    max_targets: int = 72,
     forward_only: bool = False,
+    dropout_p: float = 0.2,
 ) -> BenchmarkResults:
     """Benchmark standard joint (materialize logits) + loss."""
     device = torch.device('cuda')
@@ -102,6 +104,8 @@ def benchmark_standard_joint(
     def run_fwd():
         hidden = enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1)
         hidden.relu_()
+        if dropout_p > 0.0:
+            hidden = F.dropout(hidden, p=dropout_p, training=True)
         logits = linear(hidden)
         loss = loss_module(log_probs=logits, targets=targets, input_lengths=src_lengths, target_lengths=tgt_lengths)
         return loss
@@ -217,8 +221,9 @@ def benchmark_triton_joint(
     max_time: int = 150,
     hidden_dim: int = 640,
     num_classes: int = 1024,
-    max_targets: int = 36,
+    max_targets: int = 72,
     forward_only: bool = False,
+    dropout_p: float = 0.2,
 ) -> BenchmarkResults:
     """Benchmark fused Triton joint + Triton loss."""
     device = torch.device('cuda')
@@ -244,6 +249,7 @@ def benchmark_triton_joint(
             weight=linear.weight,
             bias=linear.bias,
             blank_id=blank_id,
+            dropout_p=dropout_p,
         )
         loss_batch = rnnt_loss_from_logprobs_triton(
             target_logprobs=target_logprobs,
@@ -365,8 +371,9 @@ def benchmark_triton_vocab_joint(
     max_time: int = 150,
     hidden_dim: int = 640,
     num_classes: int = 1024,
-    max_targets: int = 36,
+    max_targets: int = 72,
     forward_only: bool = False,
+    dropout_p: float = 0.2,
 ) -> BenchmarkResults:
     if loss_name != 'rnnt_triton':
         raise ValueError("Joint implementation `triton_vocab` supports only `rnnt_triton` loss.")
@@ -387,6 +394,8 @@ def benchmark_triton_vocab_joint(
     def run_fwd():
         joint_hidden = enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1)
         joint_hidden.relu_()
+        if dropout_p > 0.0:
+            joint_hidden = F.dropout(joint_hidden, p=dropout_p, training=True)
         target_logprobs, blank_logprobs = rnnt_joint_vocab_logprobs_triton(
             joint_hidden=joint_hidden,
             targets=targets,
@@ -568,7 +577,7 @@ def main():
     )
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--max-time', type=int, default=150)
-    parser.add_argument('--max-targets', type=int, default=36, help='Maximum target sequence length (default: 36)')
+    parser.add_argument('--max-targets', type=int, default=72, help='Maximum target sequence length (default: 72)')
     parser.add_argument('--hidden-dim', type=int, default=640)
     parser.add_argument('--num-classes', type=int, default=1024)
     parser.add_argument('--warmup-iterations', type=int, default=10)
@@ -576,6 +585,7 @@ def main():
     parser.add_argument(
         '-fo', '--forward-only', action='store_true', help='Benchmark forward pass only (skip backward)'
     )
+    parser.add_argument('--no-dropout', action='store_true', help='Disable dropout (enabled by default, p=0.2)')
 
     args = parser.parse_args()
 
@@ -589,6 +599,8 @@ def main():
 
     torch.manual_seed(42)
 
+    dropout_p = 0.0 if args.no_dropout else 0.2
+
     if args.joint == 'standard':
         results = benchmark_standard_joint(
             loss_name=args.loss,
@@ -601,6 +613,7 @@ def main():
             num_classes=args.num_classes,
             max_targets=args.max_targets,
             forward_only=args.forward_only,
+            dropout_p=dropout_p,
         )
     elif args.joint == 'triton':
         if args.loss != 'rnnt_triton':
@@ -615,6 +628,7 @@ def main():
             num_classes=args.num_classes,
             max_targets=args.max_targets,
             forward_only=args.forward_only,
+            dropout_p=dropout_p,
         )
     else:
         results = benchmark_triton_vocab_joint(
@@ -628,6 +642,7 @@ def main():
             num_classes=args.num_classes,
             max_targets=args.max_targets,
             forward_only=args.forward_only,
+            dropout_p=dropout_p,
         )
 
     print_results(results)

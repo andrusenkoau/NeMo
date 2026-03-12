@@ -105,6 +105,7 @@ def _rnnt_bwd_kernel(
     alpha_ptr,
     src_lengths_ptr,
     tgt_lengths_ptr,
+    grad_rnnt_loss_ptr,
     target_logprobs_grad_out_ptr,
     blank_logprobs_grad_out_ptr,
     max_src_len,
@@ -128,6 +129,9 @@ def _rnnt_bwd_kernel(
 
     src_len = tl.load(src_lengths_ptr + batch_i).to(tl.int64)
     tgt_len = tl.load(tgt_lengths_ptr + batch_i).to(tl.int64)
+    grad_rnnt_loss = tl.load(grad_rnnt_loss_ptr + batch_i).to(compute_dtype)
+    if grad_rnnt_loss == 0.0:
+        return
 
     batch_offset = batch_i * max_src_len * max_tgt_len_plus_1
 
@@ -140,7 +144,7 @@ def _rnnt_bwd_kernel(
     log_like = final_alpha + final_blank_lp
 
     # Gradient at final state: blank_grad[src_len-1, tgt_len] = -1.0
-    tl.store(blank_logprobs_grad_out_ptr + final_idx, -1.0)
+    tl.store(blank_logprobs_grad_out_ptr + final_idx, -grad_rnnt_loss)
 
     num_diags = src_len + tgt_len
     offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
@@ -197,7 +201,7 @@ def _rnnt_bwd_kernel(
         alpha_val = tl.load(alpha_ptr + cur_idx, mask=mask, other=NEG_INF).to(compute_dtype)
         blank_grad = tl.where(
             blank_mask,
-            -tl.exp(alpha_val + blank_beta + blank_lp - log_like),
+            -tl.exp(alpha_val + blank_beta + blank_lp - log_like) * grad_rnnt_loss,
             0.0,
         )
         tl.store(blank_logprobs_grad_out_ptr + cur_idx, blank_grad, mask=mask)
@@ -205,7 +209,7 @@ def _rnnt_bwd_kernel(
         # target_grad[t, u] = -exp(alpha[t, u] + beta[t, u+1] + target_logprobs[t, u] - log_like)
         target_grad = tl.where(
             emit_mask,
-            -tl.exp(alpha_val + emit_beta + emit_lp - log_like),
+            -tl.exp(alpha_val + emit_beta + emit_lp - log_like) * grad_rnnt_loss,
             0.0,
         )
         tl.store(target_logprobs_grad_out_ptr + cur_idx, target_grad, mask=mask)
@@ -286,6 +290,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
         fastemit_lambda = ctx.fastemit_lambda
         float_dtype = torch.float64 if use_fp64 else torch.float32
         batch_size, src_max_length, tgt_max_length_plus_1 = target_logprobs.shape
+        grad_rnnt_loss = grad_rnnt_loss.to(float_dtype).contiguous()
 
         target_logprobs_grad = torch.zeros(
             [batch_size, src_max_length, tgt_max_length_plus_1],
@@ -306,6 +311,7 @@ class TritonRnntLossFunction(torch.autograd.Function):
             alpha_ptr=alpha,
             src_lengths_ptr=src_lengths,
             tgt_lengths_ptr=tgt_lengths,
+            grad_rnnt_loss_ptr=grad_rnnt_loss,
             target_logprobs_grad_out_ptr=target_logprobs_grad,
             blank_logprobs_grad_out_ptr=blank_logprobs_grad,
             max_src_len=src_max_length,
@@ -318,11 +324,6 @@ class TritonRnntLossFunction(torch.autograd.Function):
         # FastEmit: scale emit (target) gradients by (1 + fastemit_lambda), blank unchanged
         if fastemit_lambda != 0.0:
             target_logprobs_grad = target_logprobs_grad * (1.0 + fastemit_lambda)
-
-        # Multiply by upstream gradient
-        grad_rnnt_loss = grad_rnnt_loss.to(float_dtype).view(-1, 1, 1)
-        target_logprobs_grad = target_logprobs_grad * grad_rnnt_loss
-        blank_logprobs_grad = blank_logprobs_grad * grad_rnnt_loss
 
         return target_logprobs_grad, blank_logprobs_grad, None, None, None
 
