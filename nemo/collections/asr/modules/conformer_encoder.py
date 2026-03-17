@@ -721,7 +721,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 elif self.conv_context_style in ["dcc", "dcc_rc"]:
                     dcc_chunk = cur_att_context_size[1]
 
-                logging.info(f"cur_att_context_size: {cur_att_context_size}")
+                # logging.info(f"cur_att_context_size: {cur_att_context_size}")
                 # raise ValueError("Stop here")
 
 
