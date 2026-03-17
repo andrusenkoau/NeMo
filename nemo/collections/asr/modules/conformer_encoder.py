@@ -111,8 +111,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_probs (List[float]): a list of probabilities of each one of the att_context_size
             when a list of them is passed. If not specified, uniform distribution is being used.
             Defaults to None
-        att_context_style (str): 'regular' or 'chunked_limited'.
+        att_context_style (str): 'regular', 'chunked_limited', 'chunked_limited_with_rc'.
             Defaults to 'regular'
+        use_fixed_contexts (bool): when True and att_context_style is 'chunked_limited_with_rc',
+            sample from pre-prepared [left, middle, right] triplets in att_context_size (e.g. one per
+            fixed latency: 1.12s, 0.56s, etc.) instead of sampling left, middle, and right
+            independently from att_chunk_context_size. Same format as cache-aware streaming.
+            Defaults to False
         xscaling (bool): enables scaling the inputs to the multi-headed attention layers by `sqrt(d_model)`.
             Defaults to True.
         untie_biases (bool): whether to not share (untie) the bias weights between layers of Transformer-XL
@@ -307,6 +312,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_probs=None,
         att_chunk_context_size=None,
         att_context_style='regular',
+        use_fixed_contexts=False,
         att_zero_rc_weight=None,
         skip_att_chunk_rc_prob=0.0,
         dual_mode_training=False,
@@ -342,6 +348,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.n_layers = n_layers
         self._feat_in = feat_in
         self.att_context_style = att_context_style
+        self.use_fixed_contexts = use_fixed_contexts
+        if use_fixed_contexts:
+            assert att_context_style == "chunked_limited_with_rc", (
+                "use_fixed_contexts is only supported for att_context_style='chunked_limited_with_rc'"
+            )
+            assert att_context_size is not None, (
+                "use_fixed_contexts requires att_context_size as list of [left, middle, right] triplets"
+            )
         self.skip_att_chunk_rc_prob = skip_att_chunk_rc_prob
         self.dual_mode_training = dual_mode_training
         self.hybrid_dual_mode = hybrid_dual_mode
@@ -395,6 +409,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             conv_context_size=conv_context_size,
             conv_context_style=conv_context_style,
             conv_kernel_size=conv_kernel_size,
+            use_fixed_contexts=use_fixed_contexts,
         )
 
         if xscaling:
@@ -663,29 +678,83 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         dcc_chunk = None
         # select a random att_context_size with the distribution specified by att_context_probs during training
         # for non-validation cases like test, validation or inference, it uses the first mode in self.att_context_size
-        if self.training and (len(self.att_context_size_all) > 1 or self.att_chunk_context_size is not None):
+        # if self.training and (len(self.att_context_size_all) > 1 or self.att_chunk_context_size is not None):
+        #     if self.att_context_style == "chunked_limited":
+        #         cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
+        #     elif self.att_context_style == "chunked_limited_with_rc":
+        #         left_context = random.choices(self.att_chunk_context_size[0])[0]
+        #         middle_context = random.choices(self.att_chunk_context_size[1])[0]
+        #         if self.att_rc_weights is not None:
+        #             right_context = random.choices(self.att_chunk_context_size[2], weights=self.att_rc_weights)[0]
+        #         else:
+        #             right_context = random.choices(self.att_chunk_context_size[2])[0]
+        #         cur_att_context_size = [left_context, middle_context, right_context]
+
+        if self.training and (
+            len(self.att_context_size_all) > 1
+            or self.att_chunk_context_size is not None
+            or (self.att_context_style == "chunked_limited_with_rc" and self.use_fixed_contexts)
+        ):
             if self.att_context_style == "chunked_limited":
                 cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
             elif self.att_context_style == "chunked_limited_with_rc":
-                left_context = random.choices(self.att_chunk_context_size[0])[0]
-                middle_context = random.choices(self.att_chunk_context_size[1])[0]
-                if self.att_rc_weights is not None:
-                    right_context = random.choices(self.att_chunk_context_size[2], weights=self.att_rc_weights)[0]
+                if self.use_fixed_contexts:
+                    # Sample from pre-prepared [left, middle, right] triplets (e.g. one per fixed latency)
+                    cur_att_context_size = list(
+                        random.choices(
+                            self.att_context_size_all, weights=self.att_context_probs
+                        )[0]
+                    )
                 else:
-                    right_context = random.choices(self.att_chunk_context_size[2])[0]
-                cur_att_context_size = [left_context, middle_context, right_context]
-
-                # logging.info(f"cur_att_context_size: {cur_att_context_size}")
-                # logging.info(f"self.att_rc_weights: {self.att_rc_weights}")
-                # logging.info(f"right_context: {right_context}")
-                # raise ValueError("Stop here")
+                    left_context = random.choices(self.att_chunk_context_size[0])[0]
+                    middle_context = random.choices(self.att_chunk_context_size[1])[0]
+                    if self.att_rc_weights is not None:
+                        right_context = random.choices(
+                            self.att_chunk_context_size[2], weights=self.att_rc_weights
+                        )[0]
+                    else:
+                        right_context = random.choices(self.att_chunk_context_size[2])[0]
+                    cur_att_context_size = [left_context, middle_context, right_context]
 
                 if random.random() < self.unified_asr_prob:
-                    # pure offline mode with full context
                     cur_att_context_size = [-1, -1, -1]
                 elif self.conv_context_style in ["dcc", "dcc_rc"]:
-                    # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
                     dcc_chunk = cur_att_context_size[1]
+
+                logging.info(f"cur_att_context_size: {cur_att_context_size}")
+                # raise ValueError("Stop here")
+
+
+            # elif self.att_context_style == "chunked_limited_with_rc" and self.use_fixed_contexts:
+            #     # Sample from pre-prepared [left, middle, right] triplets (e.g. one per fixed latency)
+            #     cur_att_context_size = random.choices(
+            #         self.att_context_size_all, weights=self.att_context_probs
+            #     )[0]
+            #     cur_att_context_size = list(cur_att_context_size)
+            #     if random.random() < self.unified_asr_prob:
+            #         cur_att_context_size = [-1, -1, -1]
+            #     elif self.conv_context_style in ["dcc", "dcc_rc"]:
+            #         dcc_chunk = cur_att_context_size[1]
+            # elif self.att_context_style == "chunked_limited_with_rc":
+            #     left_context = random.choices(self.att_chunk_context_size[0])[0]
+            #     middle_context = random.choices(self.att_chunk_context_size[1])[0]
+            #     if self.att_rc_weights is not None:
+            #         right_context = random.choices(self.att_chunk_context_size[2], weights=self.att_rc_weights)[0]
+            #     else:
+            #         right_context = random.choices(self.att_chunk_context_size[2])[0]
+            #     cur_att_context_size = [left_context, middle_context, right_context]
+
+            #     # logging.info(f"cur_att_context_size: {cur_att_context_size}")
+            #     # logging.info(f"self.att_rc_weights: {self.att_rc_weights}")
+            #     # logging.info(f"right_context: {right_context}")
+            #     # raise ValueError("Stop here")
+
+            #     if random.random() < self.unified_asr_prob:
+            #         # pure offline mode with full context
+            #         cur_att_context_size = [-1, -1, -1]
+            #     elif self.conv_context_style in ["dcc", "dcc_rc"]:
+            #         # add chunking for convolutions in Conformer layer to adopt model for streaming decoding
+            #         dcc_chunk = cur_att_context_size[1]
         else:
             if self.att_context_style == "chunked_limited_with_rc":
                 if self.training:
@@ -1000,7 +1069,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         return mask
 
     def _calc_context_sizes(
-        self, att_context_size, att_context_probs, att_context_style, conv_context_size, conv_context_style, conv_kernel_size
+        self, att_context_size, att_context_probs, att_context_style, conv_context_size, conv_context_style, conv_kernel_size, use_fixed_contexts=False
     ):
         # convert att_context_size to a standard list of lists
         if att_context_size:
@@ -1024,8 +1093,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             att_context_size_all = [[-1, -1]]
 
         if att_context_style == "chunked_limited_with_rc":
-            # att_context_size_all = [[self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]]
-            att_context_size_all = [[-1, -1, -1]]
+            if use_fixed_contexts and att_context_size:
+                # use_fixed_contexts: att_context_size is list of [left, middle, right] triplets (already parsed above)
+                for att_cs in att_context_size_all:
+                    if len(att_cs) != 3:
+                        raise ValueError(
+                            "With use_fixed_contexts, each att_context_size entry must be [left, middle, right] (3 ints)."
+                        )
+            else:
+                # att_context_size_all = [[self.att_chunk_context_size[0][-1], self.att_chunk_context_size[1][-1], self.att_chunk_context_size[2][-1]]]
+                att_context_size_all = [[-1, -1, -1]]
 
         if att_context_probs:
             if len(att_context_probs) != len(att_context_size_all):
