@@ -361,7 +361,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.sync_max_audio_length = sync_max_audio_length
 
-
         assert conv_context_style in ["regular", "dcc", "dcc_rc"], f"Invalid conv_context_style: {conv_context_style}!"
         self.conv_context_style = conv_context_style
         self.conv_kernel_size = conv_kernel_size
@@ -370,8 +369,12 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.dual_mode_training = dual_mode_training
         self.unified_asr_prob = unified_asr_prob
         if att_chunk_context_size is not None:
-            assert att_context_style == "chunked_limited_with_rc", "att_chunk_context_size is only supported for chunked_limited_with_rc attention style!"
-            assert len(att_chunk_context_size) == 3, "att_chunk_context_size must have 3 elements: [left_context, chunk_size, right_context]"
+            assert (
+                att_context_style == "chunked_limited_with_rc"
+            ), "att_chunk_context_size is only supported for chunked_limited_with_rc attention style!"
+            assert (
+                len(att_chunk_context_size) == 3
+            ), "att_chunk_context_size must have 3 elements: [left_context, chunk_size, right_context]"
             self.att_chunk_context_size = att_chunk_context_size
         else:
             self.att_chunk_context_size = None
@@ -855,8 +858,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     )
                     att_mask = torch.logical_and(att_mask, chunked_limited_mask.unsqueeze(0))
             elif self.att_context_style == "chunked_limited_with_rc" and sum(att_context_size) != -3:
-                assert len(att_context_size) == 3, "att_context_size must have 3 elements: [left_context, chunk_size, right_context]"
-                
+                assert (
+                    len(att_context_size) == 3
+                ), "att_context_size must have 3 elements: [left_context, chunk_size, right_context]"
+
                 left_context_frames = att_context_size[0]
                 chunk_size_frames = att_context_size[1]
                 right_context_frames = att_context_size[2]
@@ -867,22 +872,23 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 window_start = chunk_idx * chunk_size_frames - left_context_frames
                 window_start = torch.maximum(window_start, torch.zeros_like(window_start))
                 window_end = chunk_idx * chunk_size_frames + chunk_size_frames - 1 + right_context_frames
-                
+
                 if self.training and self.skip_att_chunk_rc_prob > 0.0:
                     chunks_num = max_audio_length // chunk_size_frames
                     for chunk_step in range(chunks_num):
                         if random.random() < self.skip_att_chunk_rc_prob:
-                            window_end[chunk_step*chunk_size_frames:chunk_step*chunk_size_frames+chunk_size_frames] -= right_context_frames
-                
+                            window_end[
+                                chunk_step * chunk_size_frames : chunk_step * chunk_size_frames + chunk_size_frames
+                            ] -= right_context_frames
+
                 window_end = torch.minimum(window_end, torch.full_like(window_end, max_audio_length - 1))
                 # Create the mask: frame i can see frame j if window_start[i] <= j <= window_end[i]
                 j_indices = frame_idx.unsqueeze(0)  # [1, T]
                 window_start_expanded = window_start.unsqueeze(1)  # [T, 1]
-                window_end_expanded = window_end.unsqueeze(1)      # [T, 1]
+                window_end_expanded = window_end.unsqueeze(1)  # [T, 1]
 
                 chunked_limited_mask = torch.logical_and(
-                    j_indices >= window_start_expanded,
-                    j_indices <= window_end_expanded
+                    j_indices >= window_start_expanded, j_indices <= window_end_expanded
                 )
                 att_mask = torch.logical_and(att_mask, chunked_limited_mask.unsqueeze(0))
         else:

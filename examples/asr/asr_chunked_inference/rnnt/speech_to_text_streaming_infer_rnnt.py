@@ -133,7 +133,9 @@ class TranscriptionConfig:
     )
     right_context_secs: float = 2  # right context
 
-    att_context_size_as_chunk: bool = True  # whether to use the att_context_size as chunk size (importand for extra-low latency)
+    att_context_size_as_chunk: bool = (
+        True  # whether to use the att_context_size as chunk size (importand for extra-low latency)
+    )
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
     # device anyway, and do inference on CPU only if CUDA device is not found.
@@ -303,7 +305,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     # unified ASR model: use the att_context_size as chunk size (important for extra-low latency)
     if asr_model.cfg.encoder.att_context_style == 'chunked_limited_with_rc' and cfg.att_context_size_as_chunk:
         asr_model.encoder.set_default_att_context_size(
-            att_context_size=[context_encoder_frames.left,context_encoder_frames.chunk,context_encoder_frames.right]
+            att_context_size=[context_encoder_frames.left, context_encoder_frames.chunk, context_encoder_frames.right]
         )
 
     logging.info(
