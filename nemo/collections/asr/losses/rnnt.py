@@ -153,6 +153,14 @@ RNNT_LOSS_RESOLVER = {
         is_available=True,
         installation_msg="Pure Pytorch implementation of TDT loss. Slow and for debugging purposes only.",
     ),
+    "rnnt_triton": RNNTLossConfig(
+        loss_name="rnnt_triton", # will be added later
+        lib_name="torch",
+        min_version='0.0',
+        is_available=True,
+        installation_msg="Triton RNN-T loss",
+        force_float32=False,
+    ),
 }
 
 RNNT_LOSS_RESOLVER['default'] = RNNT_LOSS_RESOLVER['warprnnt_numba']
@@ -322,6 +330,8 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
     elif loss_name == "graph_w_transducer":
         loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, GraphWTransducerLoss.__init__, ignore_params={"blank"})
         loss_func = GraphWTransducerLoss(blank=blank_idx, **loss_kwargs)
+    elif loss_name == "rnnt_triton":
+        loss_func = None # will be added later
     else:
         raise ValueError(
             f"Invalid value of `loss_name`: {loss_name}. Allowed loss names are :" f"{loss_function_names}"
