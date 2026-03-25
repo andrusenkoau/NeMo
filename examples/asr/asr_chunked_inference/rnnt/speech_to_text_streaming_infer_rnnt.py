@@ -134,7 +134,7 @@ class TranscriptionConfig:
     right_context_secs: float = 2  # right context
 
     att_context_size_as_chunk: bool = (
-        True  # whether to use the att_context_size as chunk size (importand for extra-low latency)
+        True  # whether to use the att_context_size as chunk size (important for extra-low latency)
     )
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
