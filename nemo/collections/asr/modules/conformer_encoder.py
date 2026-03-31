@@ -112,7 +112,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             when a list of them is passed. If not specified, uniform distribution is being used.
             Defaults to None
         att_chunk_context_size (List[List[int]]): specifies the context sizes for unified (offline/streaming) ASR training.
-            It defined the range of Left, Middle, and Right context sizes for the attention mechanism.
+            It defines the range of Left, Middle, and Right context sizes for the attention mechanism.
             At each streaming step, the context size is sampled from the range of Left, Middle, and Right context sizes.
             Example: att_chunk_context_size=[[70],[1,2,7,13],[0,1,3,7,13]] -> sampling -> [70, 2, 3] -> attention mask generation
         att_context_style (str): 'regular', 'chunked_limited', or 'chunked_limited_with_rc'.
@@ -130,12 +130,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             `None` means `[(conv_kernel_size-1)//2`, `(conv_kernel_size-1)//2]`, and 'causal' means
             `[(conv_kernel_size-1), 0]`.
             Defaults to None.
-        conv_context_style (str): 'regular', 'dcc', or 'dcc_rc'
+        conv_context_style (str): 'regular' or 'dcc'
             DCC - Dynamic Chunked Convolution that is used for unified ASR training.
             Defaults to 'regular'.
-        att_zero_rc_weight (float): the weight of the right context in the attention mechanism during unified ASR training.
-            Only relevant if att_context_style is 'chunked_limited_with_rc'
-            Defaults to None.
         conv_dual_mode (bool): specifies if convolution should be dual mode when dual_offline mode is being used.
             When enables, the left half of the convolution kernel would get masked in streaming cases.
             Defaults to False.
@@ -317,9 +314,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_probs=None,
         att_chunk_context_size=None,
         att_context_style='regular',
-        att_zero_rc_weight=None,
-        dual_mode_training=False,
-        unified_asr_prob=None,
         xscaling=True,
         untie_biases=True,
         pos_emb_max_len=5000,
@@ -361,13 +355,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.sync_max_audio_length = sync_max_audio_length
 
-        assert conv_context_style in ["regular", "dcc", "dcc_rc"], f"Invalid conv_context_style: {conv_context_style}!"
+        assert conv_context_style in ["regular", "dcc"], f"Invalid conv_context_style: {conv_context_style}!"
         self.conv_context_style = conv_context_style
         self.conv_kernel_size = conv_kernel_size
 
         # Setting up the att_chunk_context_size
-        self.dual_mode_training = dual_mode_training
-        self.unified_asr_prob = unified_asr_prob
         if att_chunk_context_size is not None:
             assert (
                 att_context_style == "chunked_limited_with_rc"
@@ -378,15 +370,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             self.att_chunk_context_size = att_chunk_context_size
         else:
             self.att_chunk_context_size = None
-
-        # setting up att_rc_weights:
-        if att_zero_rc_weight is not None and self.att_chunk_context_size[2][0] == 0:
-            assert 0 <= att_zero_rc_weight <= 1, "att_zero_rc_weight must be between 0 and 1!"
-            non_zero_rc_weight = (1 - att_zero_rc_weight) / len(self.att_chunk_context_size[2][1:])
-            self.att_rc_weights = [non_zero_rc_weight] * len(self.att_chunk_context_size[2])
-            self.att_rc_weights[0] = att_zero_rc_weight
-        else:
-            self.att_rc_weights = None
 
         # Setting up the att_context_size
         (
@@ -865,6 +848,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 left_context_frames = att_context_size[0]
                 chunk_size_frames = att_context_size[1]
                 right_context_frames = att_context_size[2]
+                assert chunk_size_frames >= 1, "chunk_size_frames must be greater than 0!"
                 # Calculate chunk index for each frame (which processing group it belongs to)
                 frame_idx = torch.arange(0, max_audio_length, dtype=torch.int, device=att_mask.device)
                 chunk_idx = torch.div(frame_idx, chunk_size_frames, rounding_mode="trunc")
@@ -1026,7 +1010,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             lookahead_steps = att_context_size[1]
             streaming_cfg.cache_drop_size = 0
         elif self.att_context_style == "chunked_limited_with_rc":
-            lookahead_steps = att_context_size[1] * self.n_layers + self.conv_context_size[1] * self.n_layers
+            lookahead_steps = att_context_size[2] * self.n_layers + self.conv_context_size[1] * self.n_layers
             streaming_cfg.cache_drop_size = 0
         elif self.att_context_style == "regular":
             lookahead_steps = att_context_size[1] * self.n_layers + self.conv_context_size[1] * self.n_layers
