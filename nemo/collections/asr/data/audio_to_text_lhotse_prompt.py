@@ -67,14 +67,18 @@ class LhotseSpeechToTextBpeDatasetWithPrompt(torch.utils.data.Dataset):
     def _get_prompt_index(self, prompt_key: str) -> int:
         """
         Maps prompt keys to indices using the prompt dictionary.
+        Falls back to "unk" key if the language is not found.
         """
         if not self.prompt_dict:
             raise ValueError("Prompt dictionary is empty. Please provide a valid prompt_dictionary in the config.")
 
         if prompt_key not in self.prompt_dict:
+            if "unk" in self.prompt_dict:
+                return self.prompt_dict["unk"]
             available_keys = list(self.prompt_dict.keys())
             raise ValueError(
-                f"Unknown prompt key: '{prompt_key}'. Available prompts: {available_keys[:10]}{'...' if len(available_keys) > 10 else ''}"
+                f"Unknown prompt key: '{prompt_key}' and no 'unk' fallback in prompt_dictionary. "
+                f"Available prompts: {available_keys[:10]}{'...' if len(available_keys) > 10 else ''}"
             )
 
         return self.prompt_dict[prompt_key]

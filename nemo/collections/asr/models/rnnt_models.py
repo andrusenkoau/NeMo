@@ -1470,9 +1470,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         """Construct one-hot prompt tensor from already-preprocessed signal."""
         prompt_id = self.prompt_dictionary.get(target_lang)
         if prompt_id is None:
+            prompt_id = self.prompt_dictionary.get("unk")
+        if prompt_id is None:
             available = list(self.prompt_dictionary.keys())[:10]
             raise ValueError(
-                f"Unknown target_lang='{target_lang}'. Available: {available}{'...' if len(self.prompt_dictionary) > 10 else ''}"
+                f"Unknown target_lang='{target_lang}' and no 'unk' fallback in prompt_dictionary. "
+                f"Available: {available}{'...' if len(self.prompt_dictionary) > 10 else ''}"
             )
 
         batch_size = processed_signal.shape[0]
