@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import copy
+import math
 import os
+from dataclasses import dataclass
 from math import ceil
 from typing import Any, Dict, List, Optional, Union
 
@@ -27,6 +29,7 @@ from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.data.audio_to_text_lhotse_prompt import LhotseSpeechToTextBpeDatasetWithPrompt
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
@@ -51,8 +54,15 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LabelsType, LengthsType, NeuralType, SpectrogramType
 from nemo.utils import logging
+
+
+@dataclass
+class RNNTPromptTranscribeConfig(TranscribeConfig):
+    """Transcription config with optional language prompt for prompt-conditioned RNNT models."""
+
+    target_lang: Optional[str] = None
 
 
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
@@ -64,6 +74,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.world_size = 1
         if trainer is not None:
             self.world_size = trainer.world_size
+
+        # Must be set before super().__init__() because ModelPT triggers setup_training_data
+        # which calls _setup_dataloader_from_config that checks this flag.
+        self.use_prompt = cfg.get('model_defaults', {}).get('initialize_prompt_feature', False)
 
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -202,6 +216,57 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.dual_mode_training and self.hybrid_dual_mode:
             raise ValueError("Only one dual mode can be active at a time: dual_mode_training or hybrid_dual_mode")
 
+        # Setup prompt conditioning (lang ID injection post-encoder)
+        self.use_prompt = self.cfg.model_defaults.get('initialize_prompt_feature', False)
+        if self.use_prompt:
+            self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
+            prompt_dict = self.cfg.model_defaults.get('prompt_dictionary', None)
+            if prompt_dict is None:
+                raise ValueError("prompt_dictionary must be provided in model_defaults when initialize_prompt_feature=True")
+            self.prompt_dictionary = prompt_dict
+
+            enc_hidden = self.cfg.model_defaults.enc_hidden
+            self.prompt_kernel = torch.nn.Sequential(
+                torch.nn.Linear(self.num_prompts + enc_hidden, enc_hidden * 2),
+                torch.nn.ReLU(),
+                torch.nn.Linear(enc_hidden * 2, enc_hidden),
+            )
+            logging.info(
+                f"Prompt conditioning enabled: num_prompts={self.num_prompts}, "
+                f"languages={list(self.prompt_dictionary.keys())}"
+            )
+
+
+    def _apply_prompt(self, encoded: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
+        """
+        Apply prompt conditioning to encoder output via concatenation + projection.
+
+        Args:
+            encoded: Encoder output of shape (B, D, T).
+            prompt: One-hot prompt tensor of shape (B, T, num_prompts).
+
+        Returns:
+            Prompt-conditioned encoder output of shape (B, D, T).
+        """
+        # logging.warning(f"encoded shape: {encoded.shape}, prompt shape: {prompt.shape}")
+        # logging.warning(f"prompt: {prompt}")
+        
+        encoded_t = encoded.transpose(1, 2)  # B*D*T -> B*T*D
+        if prompt.shape[1] > encoded_t.shape[1]:
+            prompt = prompt[:, : encoded_t.shape[1], :]
+        elif prompt.shape[1] < encoded_t.shape[1]:
+            pad = torch.zeros(
+                prompt.shape[0],
+                encoded_t.shape[1] - prompt.shape[1],
+                prompt.shape[2],
+                device=prompt.device,
+                dtype=prompt.dtype,
+            )
+            prompt = torch.cat([prompt, pad], dim=1)
+        out_dtype = encoded_t.dtype
+        concat_states = torch.cat([encoded_t, prompt], dim=-1)
+        encoded_t = self.prompt_kernel(concat_states).to(out_dtype)
+        return encoded_t.transpose(1, 2)  # B*T*D -> B*D*T
 
     def setup_optim_normalization(self):
         """
@@ -316,6 +381,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         verbose: bool = True,
         timestamps: Optional[bool] = None,
         override_config: Optional[TranscribeConfig] = None,
+        target_lang: Optional[str] = None,
     ) -> TranscriptionReturnType:
         """
         Uses greedy decoding to transcribe audio files. Use this method for debugging and prototyping.
@@ -347,6 +413,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             override_config: (Optional[TranscribeConfig]) override transcription config pre-defined by the user.
                 **Note**: All other arguments in the function will be ignored if override_config is passed.
                 You should call this argument as `model.transcribe(audio, override_config=TranscribeConfig(...))`.
+            target_lang: (Optional[str]) target language for prompt-conditioned models (e.g. "en", "de").
+                Ignored if the model does not use prompt conditioning.
 
         Returns:
             Returns a tuple of 2 items -
@@ -378,6 +446,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if need_change_decoding:
                 self.change_decoding_strategy(self.cfg.decoding, verbose=False)
+
+        # Build override_config with target_lang if prompt model and no override_config provided
+        if self.use_prompt and target_lang is not None and override_config is None:
+            override_config = RNNTPromptTranscribeConfig(
+                batch_size=batch_size,
+                return_hypotheses=return_hypotheses,
+                num_workers=num_workers,
+                channel_selector=channel_selector,
+                augmentor=augmentor,
+                verbose=verbose,
+                timestamps=timestamps,
+                target_lang=target_lang,
+            )
+        elif self.use_prompt and target_lang is not None and override_config is not None:
+            if not hasattr(override_config, 'target_lang'):
+                override_config = RNNTPromptTranscribeConfig(**override_config.__dict__, target_lang=target_lang)
+            else:
+                override_config.target_lang = target_lang
 
         return super().transcribe(
             audio=audio,
@@ -541,16 +627,28 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Automatically inject args from model config to dataloader config
         audio_to_text_dataset.inject_dataloader_value_from_model_config(self.cfg, config, key='sample_rate')
         audio_to_text_dataset.inject_dataloader_value_from_model_config(self.cfg, config, key='labels')
-
+        
         if config.get("use_lhotse"):
-            return get_lhotse_dataloader_from_config(
-                config,
-                # During transcription, the model is initially loaded on the CPU.
-                # To ensure the correct global_rank and world_size are set,
-                # these values must be passed from the configuration.
-                global_rank=self.global_rank if not config.get("do_transcribe", False) else config.get("global_rank"),
-                world_size=self.world_size if not config.get("do_transcribe", False) else config.get("world_size"),
-                dataset=LhotseSpeechToTextBpeDataset(
+            if self.use_prompt:
+                # Inject prompt-related settings from model config into data config
+                if not config.get('prompt_dictionary'):
+                    with open_dict(config):
+                        config['prompt_dictionary'] = self.cfg.model_defaults.get('prompt_dictionary')
+                        config['num_prompts'] = self.cfg.model_defaults.get('num_prompts', 128)
+                        config['subsampling_factor'] = self.cfg.get('subsampling_factor', 8)
+                        config['window_stride'] = self.cfg.preprocessor.get('window_stride', 0.01)
+                dataset = LhotseSpeechToTextBpeDatasetWithPrompt(
+                    tokenizer=make_parser(
+                        labels=config.get('labels', None),
+                        name=config.get('parser', 'en'),
+                        unk_id=config.get('unk_index', -1),
+                        blank_id=config.get('blank_index', -1),
+                        do_normalize=config.get('normalize_transcripts', False),
+                    ),
+                    cfg=config,
+                )
+            else:
+                dataset = LhotseSpeechToTextBpeDataset(
                     tokenizer=make_parser(
                         labels=config.get('labels', None),
                         name=config.get('parser', 'en'),
@@ -559,7 +657,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                         do_normalize=config.get('normalize_transcripts', False),
                     ),
                     return_cuts=config.get("do_transcribe", False),
-                ),
+                )
+            return get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank if not config.get("do_transcribe", False) else config.get("global_rank"),
+                world_size=self.world_size if not config.get("do_transcribe", False) else config.get("world_size"),
+                dataset=dataset,
             )
 
         dataset = audio_to_text_dataset.get_audio_to_text_char_dataset_from_config(
@@ -714,12 +817,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             input_signal_eltype = AudioSignal()
 
-        return {
+        types = {
             "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
+        if getattr(self, 'use_prompt', False):
+            types["prompt"] = NeuralType(('B', 'T', 'D'), LabelsType(), optional=True)
+        return types
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -730,7 +836,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+        prompt=None,
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -754,6 +865,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 of shape (B, D, T) that has undergone processing via some DALI preprocessor.
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
+            prompt: Optional tensor of shape (B, T, num_prompts) with one-hot language/task prompt.
+                When provided and use_prompt=True, it is concatenated with encoder output and projected
+                back to encoder dimension via prompt_kernel.
 
         Returns:
             A tuple of 2 elements -
@@ -779,6 +893,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        if self.use_prompt and prompt is not None:
+            encoded = self._apply_prompt(encoded, prompt)
+
         return encoded, encoded_len
 
 
@@ -787,7 +905,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len = batch
+        if self.use_prompt:
+            signal, signal_len, transcript, transcript_len, prompt = batch
+        else:
+            signal, signal_len, transcript, transcript_len = batch
+            prompt = None
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -798,7 +920,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Check if dual-mode training is enabled
         if self.dual_mode_training:
-            # raise NotImplementedError("Dual-mode training is not implemented yet")
             # Preprocessing (done once)
             if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
                 processed_signal, processed_signal_length = signal, signal_len
@@ -829,6 +950,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             
             # Restore original value
             self.encoder.unified_asr_prob = original_unified_asr_prob
+
+            # Apply prompt conditioning to both paths
+            if self.use_prompt and prompt is not None:
+                offline_encoded = self._apply_prompt(offline_encoded, prompt)
+                streaming_encoded = self._apply_prompt(streaming_encoded, prompt)
             
             del signal
             
@@ -988,6 +1114,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 
                 # Restore original value
                 self.encoder.unified_asr_prob = original_unified_asr_prob
+
+                # Apply prompt conditioning to both paths
+                if self.use_prompt and prompt is not None:
+                    offline_encoded = self._apply_prompt(offline_encoded, prompt)
+                    streaming_encoded = self._apply_prompt(streaming_encoded, prompt)
                 
                 del signal
                 
@@ -1066,9 +1197,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             else:
                 # STANDARD MODE PATH (single forward pass)
                 if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-                    encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+                    encoded, encoded_len = self.forward(
+                        processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+                    )
                 else:
-                    encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+                    encoded, encoded_len = self.forward(
+                        input_signal=signal, input_signal_length=signal_len, prompt=prompt
+                    )
                 del signal
                 
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
@@ -1099,11 +1234,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
 
         else:
-            # Original single-mode training (unchanged)
+            # Original single-mode training
             if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-                encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+                encoded, encoded_len = self.forward(
+                    processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+                )
             else:
-                encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+                encoded, encoded_len = self.forward(
+                    input_signal=signal, input_signal_length=signal_len, prompt=prompt
+                )
             del signal
 
             decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
@@ -1160,13 +1299,21 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len, sample_id = batch
+        if self.use_prompt:
+            signal, signal_len, transcript, transcript_len, prompt, sample_id = batch
+        else:
+            signal, signal_len, transcript, transcript_len, sample_id = batch
+            prompt = None
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+            encoded, encoded_len = self.forward(
+                processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+            )
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt=prompt
+            )
         del signal
 
         best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
@@ -1178,13 +1325,21 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return list(zip(sample_id, best_hyp_text))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len = batch
+        if self.use_prompt:
+            signal, signal_len, transcript, transcript_len, prompt = batch
+        else:
+            signal, signal_len, transcript, transcript_len = batch
+            prompt = None
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+            encoded, encoded_len = self.forward(
+                processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+            )
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt=prompt
+            )
         del signal
 
         tensorboard_logs = {}
@@ -1287,9 +1442,47 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+        audio, audio_lens = batch[0], batch[1]
+
+        if self.use_prompt:
+            target_lang = getattr(trcfg, 'target_lang', None)
+            if target_lang is not None:
+                # Build prompt dynamically: preprocess once, then use processed_signal for forward
+                processed_signal, processed_signal_length = self.preprocessor(input_signal=audio, length=audio_lens)
+                prompt = self._build_prompt_from_processed(processed_signal, target_lang, audio.device)
+                encoded, encoded_len = self.forward(
+                    processed_signal=processed_signal, processed_signal_length=processed_signal_length, prompt=prompt
+                )
+            elif len(batch) >= 5:
+                prompt = batch[4]
+                encoded, encoded_len = self.forward(input_signal=audio, input_signal_length=audio_lens, prompt=prompt)
+            else:
+                encoded, encoded_len = self.forward(input_signal=audio, input_signal_length=audio_lens)
+        else:
+            encoded, encoded_len = self.forward(input_signal=audio, input_signal_length=audio_lens)
+
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
+
+    def _build_prompt_from_processed(
+        self, processed_signal: torch.Tensor, target_lang: str, device: torch.device
+    ) -> torch.Tensor:
+        """Construct one-hot prompt tensor from already-preprocessed signal."""
+        prompt_id = self.prompt_dictionary.get(target_lang)
+        if prompt_id is None:
+            available = list(self.prompt_dictionary.keys())[:10]
+            raise ValueError(
+                f"Unknown target_lang='{target_lang}'. Available: {available}{'...' if len(self.prompt_dictionary) > 10 else ''}"
+            )
+
+        batch_size = processed_signal.shape[0]
+        time_length = processed_signal.shape[2]
+        subsampling_factor = self.cfg.get('subsampling_factor', 8)
+        hidden_length = math.ceil(time_length / subsampling_factor)
+
+        prompt = torch.zeros(batch_size, hidden_length, self.num_prompts, dtype=torch.float32, device=device)
+        prompt[:, :, prompt_id] = 1.0
+        return prompt
 
     def _transcribe_output_processing(
         self, outputs, trcfg: TranscribeConfig

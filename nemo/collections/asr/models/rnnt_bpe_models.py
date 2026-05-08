@@ -24,6 +24,7 @@ from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.data.audio_to_text_lhotse_prompt import LhotseSpeechToTextBpeDatasetWithPrompt
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
@@ -436,18 +437,30 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
+        
         if config.get("use_lhotse"):
-            return get_lhotse_dataloader_from_config(
-                config,
-                # During transcription, the model is initially loaded on the CPU.
-                # To ensure the correct global_rank and world_size are set,
-                # these values must be passed from the configuration.
-                global_rank=self.global_rank if not config.get("do_transcribe", False) else config.get("global_rank"),
-                world_size=self.world_size if not config.get("do_transcribe", False) else config.get("world_size"),
-                dataset=LhotseSpeechToTextBpeDataset(
+            if getattr(self, 'use_prompt', False):
+                # Inject prompt-related settings from model config into data config
+                if not config.get('prompt_dictionary'):
+                    with open_dict(config):
+                        config['prompt_dictionary'] = self.cfg.model_defaults.get('prompt_dictionary')
+                        config['num_prompts'] = self.cfg.model_defaults.get('num_prompts', 128)
+                        config['subsampling_factor'] = self.cfg.get('subsampling_factor', 8)
+                        config['window_stride'] = self.cfg.preprocessor.get('window_stride', 0.01)
+                dataset = LhotseSpeechToTextBpeDatasetWithPrompt(
+                    tokenizer=self.tokenizer,
+                    cfg=config,
+                )
+            else:
+                dataset = LhotseSpeechToTextBpeDataset(
                     tokenizer=self.tokenizer,
                     return_cuts=config.get("do_transcribe", False),
-                ),
+                )
+            return get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank if not config.get("do_transcribe", False) else config.get("global_rank"),
+                world_size=self.world_size if not config.get("do_transcribe", False) else config.get("world_size"),
+                dataset=dataset,
                 tokenizer=self.tokenizer,
             )
 
