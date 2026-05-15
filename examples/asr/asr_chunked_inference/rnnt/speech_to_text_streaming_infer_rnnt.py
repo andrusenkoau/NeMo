@@ -44,11 +44,16 @@ python speech_to_text_streaming_infer_rnnt.py \
     left_context_secs=10.0 \
     batch_size=32 \
     clean_groundtruth_text=False \
-    langid='en'
+    langid='en' \
+    target_lang='en'
 ```
+
+For models with prompt conditioning (lang ID), pass ``target_lang`` to guide the decoder.
+If the model does not support prompts, ``target_lang`` is silently ignored.
 """
 import copy
 import glob
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -161,6 +166,10 @@ class TranscriptionConfig:
 
     timestamps: bool = False  # output timestamps
 
+    # Prompt conditioning: target language for models with lang ID prompt (e.g. "en", "de").
+    # Ignored for models without prompt support.
+    target_lang: Optional[str] = None
+
     # Config for word / character error rate calculation
     calculate_wer: bool = True
     clean_groundtruth_text: bool = False
@@ -253,7 +262,6 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         # fix relative paths
         for record in records:
             record["audio_filepath"] = str(filepath_to_absolute(record["audio_filepath"], manifest_dir))
-        records = sorted(records, key=lambda x: x['duration'], reverse=True)
         set_duration = sum(float(record['duration']) for record in records)
     else:
         assert filepaths is not None
@@ -362,6 +370,26 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     asr_model.preprocessor.featurizer.pad_to = 0
     asr_model.eval()
 
+    # Prompt conditioning setup
+    use_prompt = getattr(asr_model, 'use_prompt', False)
+    prompt_id = None
+    if use_prompt and cfg.target_lang is not None:
+        prompt_dict = asr_model.prompt_dictionary
+        prompt_id = prompt_dict.get(cfg.target_lang)
+        if prompt_id is None:
+            prompt_id = prompt_dict.get("unk")
+        if prompt_id is None:
+            available = list(prompt_dict.keys())[:10]
+            raise ValueError(
+                f"Unknown target_lang='{cfg.target_lang}' and no 'unk' fallback in prompt_dictionary. "
+                f"Available: {available}{'...' if len(prompt_dict) > 10 else ''}"
+            )
+        logging.info(f"Prompt conditioning enabled: target_lang='{cfg.target_lang}' -> prompt_id={prompt_id}")
+    elif use_prompt and cfg.target_lang is None:
+        logging.warning(
+            "Model supports prompt conditioning but target_lang is not set. "
+            "Running without language prompt — may produce suboptimal results."
+        )
 
     timer = SimpleTimer()
     with torch.no_grad(), torch.inference_mode():
@@ -425,10 +453,21 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 )
 
                 # get encoder output using full buffer [left-chunk-right]
-                encoder_output, encoder_output_len = asr_model(
+                forward_kwargs = dict(
                     input_signal=buffer.samples,
                     input_signal_length=buffer.context_size_batch.total(),
                 )
+                if prompt_id is not None:
+                    input_time = buffer.samples.shape[1]
+                    hidden_length = math.ceil(input_time / (features_frame2audio_samples * encoder_subsampling_factor))
+                    prompt_tensor = torch.zeros(
+                        batch_size, hidden_length, asr_model.num_prompts,
+                        dtype=compute_dtype, device=device,
+                    )
+                    prompt_tensor[:, :, prompt_id] = 1.0
+                    forward_kwargs["prompt"] = prompt_tensor
+
+                encoder_output, encoder_output_len = asr_model(**forward_kwargs)
                 encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
                 # remove extra context from encoder_output (leave only frames corresponding to the chunk)
                 encoder_context = buffer.context_size.subsample(factor=encoder_frame2audio_samples)

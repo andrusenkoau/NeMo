@@ -206,6 +206,10 @@ class TranscriptionConfig:
 
     extract_nbest: bool = False  # Extract n-best hypotheses from the model
 
+    # Prompt conditioning: target language for models with lang ID prompt (e.g. "en", "de").
+    # Ignored for models without prompt support.
+    target_lang: Optional[str] = None
+
     calculate_rtfx: bool = False
     warmup_steps: int = 0  # by default - no warmup
     run_steps: int = 1  # by default - single run
@@ -420,11 +424,14 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                 timer.reset()
                 timer.start(device=device)
                 # call transcribe
-                transcriptions = asr_model.transcribe(
+                transcribe_kwargs = dict(
                     audio=filepaths,
                     override_config=override_cfg,
                     timestamps=cfg.timestamps,
                 )
+                if cfg.target_lang is not None and hasattr(asr_model, 'use_prompt') and asr_model.use_prompt:
+                    transcribe_kwargs["target_lang"] = cfg.target_lang
+                transcriptions = asr_model.transcribe(**transcribe_kwargs)
                 # stop timer, log time
                 timer.stop(device=device)
                 logging.info(f"Model time for iteration {run_step}: {timer.total_sec():.3f}")

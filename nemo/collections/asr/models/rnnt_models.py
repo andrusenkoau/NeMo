@@ -460,10 +460,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 target_lang=target_lang,
             )
         elif self.use_prompt and target_lang is not None and override_config is not None:
-            if not hasattr(override_config, 'target_lang'):
-                override_config = RNNTPromptTranscribeConfig(**override_config.__dict__, target_lang=target_lang)
-            else:
-                override_config.target_lang = target_lang
+            override_config.target_lang = target_lang
 
         return super().transcribe(
             audio=audio,
@@ -1196,13 +1193,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     tensorboard_logs.update({'training_batch_wer': scores.float() / words})
             else:
                 # STANDARD MODE PATH (single forward pass)
+                prompt_kwargs = {"prompt": prompt} if self.use_prompt and prompt is not None else {}
                 if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
                     encoded, encoded_len = self.forward(
-                        processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+                        processed_signal=signal, processed_signal_length=signal_len, **prompt_kwargs
                     )
                 else:
                     encoded, encoded_len = self.forward(
-                        input_signal=signal, input_signal_length=signal_len, prompt=prompt
+                        input_signal=signal, input_signal_length=signal_len, **prompt_kwargs
                     )
                 del signal
                 
@@ -1235,13 +1233,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         else:
             # Original single-mode training
+            prompt_kwargs = {"prompt": prompt} if self.use_prompt and prompt is not None else {}
             if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
                 encoded, encoded_len = self.forward(
-                    processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+                    processed_signal=signal, processed_signal_length=signal_len, **prompt_kwargs
                 )
             else:
                 encoded, encoded_len = self.forward(
-                    input_signal=signal, input_signal_length=signal_len, prompt=prompt
+                    input_signal=signal, input_signal_length=signal_len, **prompt_kwargs
                 )
             del signal
 
@@ -1306,13 +1305,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             prompt = None
 
         # forward() only performs encoder forward
+        prompt_kwargs = {"prompt": prompt} if self.use_prompt and prompt is not None else {}
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(
-                processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+                processed_signal=signal, processed_signal_length=signal_len, **prompt_kwargs
             )
         else:
             encoded, encoded_len = self.forward(
-                input_signal=signal, input_signal_length=signal_len, prompt=prompt
+                input_signal=signal, input_signal_length=signal_len, **prompt_kwargs
             )
         del signal
 
@@ -1332,13 +1332,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             prompt = None
 
         # forward() only performs encoder forward
+        prompt_kwargs = {"prompt": prompt} if self.use_prompt and prompt is not None else {}
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(
-                processed_signal=signal, processed_signal_length=signal_len, prompt=prompt
+                processed_signal=signal, processed_signal_length=signal_len, **prompt_kwargs
             )
         else:
             encoded, encoded_len = self.forward(
-                input_signal=signal, input_signal_length=signal_len, prompt=prompt
+                input_signal=signal, input_signal_length=signal_len, **prompt_kwargs
             )
         del signal
 
@@ -1483,7 +1484,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         subsampling_factor = self.cfg.get('subsampling_factor', 8)
         hidden_length = math.ceil(time_length / subsampling_factor)
 
-        prompt = torch.zeros(batch_size, hidden_length, self.num_prompts, dtype=torch.float32, device=device)
+        prompt = torch.zeros(batch_size, hidden_length, self.num_prompts, dtype=processed_signal.dtype, device=device)
         prompt[:, :, prompt_id] = 1.0
         return prompt
 
