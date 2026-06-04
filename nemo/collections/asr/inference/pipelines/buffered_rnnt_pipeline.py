@@ -74,7 +74,7 @@ class BufferedRNNTPipeline(BasePipeline):
         self.conf_func, self.confidence_aggregator = get_confidence_utils(cfg.confidence)
         self.init_endpointer()
         self.init_greedy_rnnt_decoder()
-        self.init_bpe_decoder()
+        self.init_bpe_decoder(cfg)
         self.init_decoding_computer()
         self.init_text_processor(cfg, itn_model)
         self.init_nmt_model(nmt_model)

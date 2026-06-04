@@ -71,7 +71,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
         self.init_context_manager()
         self.init_bufferer_for_cache_aware_streaming()
         self.conf_func, self.confidence_aggregator = get_confidence_utils(cfg.confidence)
-        self.init_bpe_decoder()
+        self.init_bpe_decoder(cfg)
         self.init_greedy_rnnt_decoder()
         self.init_endpointer()
         self.init_text_processor(cfg, itn_model)

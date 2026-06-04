@@ -121,6 +121,8 @@ enable_nmt: false                             # Whether to apply neural machine 
 asr_output_granularity: segment               # Output granularity: word or segment
 cache_dir: null                               # Directory to store cache (e.g., .far files)
 lang: null                                    # Language code for ASR model
+strip_lang_tags: false                        # Remove language-ID tags (e.g. <de-DE>) emitted by prompt-conditioned models from ASR output
+lang_tag_pattern: null                        # Optional regex for the language-ID tag; defaults to "\s*<[a-z]{2}-[A-Z]{2}>"
 return_tail_result: false                     # Whether to return the tail labels left in the right padded side of the buffer
 calculate_wer: true                           # Whether to calculate WER
 calculate_bleu: true                          # Whether to calculate BLEU score

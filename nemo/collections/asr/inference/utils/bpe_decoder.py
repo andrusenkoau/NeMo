@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import re
 from functools import lru_cache
 from typing import Callable
 
@@ -26,6 +27,9 @@ from nemo.collections.asr.inference.utils.constants import (
 )
 from nemo.collections.asr.inference.utils.text_segment import TextSegment, Word
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
+
+# Default regex describing a language-ID tag (e.g. "<de-DE>") emitted by prompt-conditioned models.
+DEFAULT_LANG_TAG_PATTERN = r'\s*<[a-z]{2}-[A-Z]{2}>'
 
 
 class BPEDecoder:
@@ -41,6 +45,8 @@ class BPEDecoder:
         asr_supported_puncts: set,
         word_boundary_tolerance: float,
         token_duration_in_secs: float,
+        strip_lang_tags: bool = False,
+        lang_tag_pattern: str | None = None,
     ):
         """
         Initialize the BPEDecoder.
@@ -51,12 +57,20 @@ class BPEDecoder:
             asr_supported_puncts (set): Set of supported punctuation symbols.
             word_boundary_tolerance (float): Word boundary tolerance for timestamp refinement.
             token_duration_in_secs (float): Token duration in seconds.
+            strip_lang_tags (bool): If True, remove language-ID tags (e.g. "<de-DE>") that
+                prompt-conditioned models emit in their output. Default is False.
+            lang_tag_pattern (str | None): Optional regex (as a string) describing the tag to
+                strip. Defaults to ``DEFAULT_LANG_TAG_PATTERN`` ("<xx-XX>"). Ignored when
+                ``strip_lang_tags`` is False.
         """
 
         self.vocabulary = vocabulary
         self.tokenizer = tokenizer
         self.confidence_aggregator = confidence_aggregator
         self.asr_supported_puncts = asr_supported_puncts
+        self.lang_tag_regex = None
+        if strip_lang_tags:
+            self.lang_tag_regex = re.compile(lang_tag_pattern if lang_tag_pattern else DEFAULT_LANG_TAG_PATTERN)
         self.punct_marks_with_underscore = asr_supported_puncts.union({SENTENCEPIECE_UNDERSCORE})
         self.word_boundary_tolerance = word_boundary_tolerance
         self.token_duration_in_secs = token_duration_in_secs
@@ -67,6 +81,18 @@ class BPEDecoder:
             token_id: (token in self.asr_supported_puncts, token in self.punct_marks_with_underscore)
             for token_id, token in enumerate(self.vocabulary)
         }
+
+    def strip_lang_tags(self, text: str) -> str:
+        """
+        Remove language-ID tags (e.g. "<de-DE>") from a decoded string when enabled.
+        Args:
+            text (str): Decoded text that may contain a trailing language-ID tag.
+        Returns:
+            str: Text with language-ID tags removed (no-op when stripping is disabled).
+        """
+        if self.lang_tag_regex is not None:
+            text = self.lang_tag_regex.sub('', text).strip()
+        return text
 
     @lru_cache(maxsize=10000)
     def cached_ids_to_text(self, tokens_slice: tuple[int]) -> str:
@@ -125,6 +151,7 @@ class BPEDecoder:
 
         # Get the segment text
         segment_text = self.tokenizer.ids_to_text(tokens).strip()
+        segment_text = self.strip_lang_tags(segment_text)
 
         # Refine the start and end timestamps of the text segment
         start, end = self.refine_text_segment_timestamp(tokens, timesteps)
@@ -177,8 +204,9 @@ class BPEDecoder:
             conf_slice = confidences[start_idx:end_idx]
 
             word_text = self.cached_ids_to_text(tuple(tokens_slice))
+            word_text = self.strip_lang_tags(word_text)
 
-            # Ignore empty text
+            # Ignore empty text (including words that were only a language-ID tag)
             if not word_text:
                 continue
 

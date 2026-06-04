@@ -352,8 +352,12 @@ class BasePipeline(PipelineInterface):
             else:
                 state.current_step_transcript = ""
 
-    def init_bpe_decoder(self) -> None:
-        """Initialize the BPE decoder"""
+    def init_bpe_decoder(self, cfg: DictConfig) -> None:
+        """
+        Initialize the BPE decoder.
+        Args:
+            cfg: (DictConfig) Configuration parameters.
+        """
         check_existance_of_required_attributes(
             self,
             [
@@ -373,6 +377,8 @@ class BasePipeline(PipelineInterface):
             asr_supported_puncts=self.asr_supported_puncts,
             word_boundary_tolerance=self.word_boundary_tolerance,
             token_duration_in_secs=self.model_stride_in_secs,
+            strip_lang_tags=cfg.get('strip_lang_tags', False),
+            lang_tag_pattern=cfg.get('lang_tag_pattern', None),
         )
 
     def init_text_processor(
