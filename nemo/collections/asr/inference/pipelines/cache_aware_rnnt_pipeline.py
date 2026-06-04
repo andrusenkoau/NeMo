@@ -149,6 +149,13 @@ class CacheAwareRNNTPipeline(BasePipeline):
 
         self.request_type = RequestType.from_str(cfg.streaming.request_type)
 
+        # Language prompt for prompt-conditioned models.
+        # `config_language_code` (from `cfg.lang`) is authoritative when set: it overrides any
+        # per-utterance language coming from the manifest. When None, the per-stream manifest value
+        # is used, falling back to "en-US".
+        self.config_language_code = cfg.get("lang", None)
+        self.default_language_code = self.config_language_code or "en-US"
+
     def init_greedy_rnnt_decoder(self) -> None:
         """Initialize the RNNT decoder."""
         check_existance_of_required_attributes(self, ['vocabulary', 'conf_func'])
@@ -190,7 +197,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
             default_target_language=self.nmt_model.target_language if self.nmt_enabled else None,
             default_stop_history_eou=self.stop_history_eou_in_milliseconds,
             default_asr_output_granularity=self.asr_output_granularity,
-            default_language_code="en-US" if self.prompt_enabled else None,
+            default_language_code=self.default_language_code if self.prompt_enabled else None,
         )
 
         eou_label_buffer_size = 0
@@ -203,9 +210,10 @@ class CacheAwareRNNTPipeline(BasePipeline):
         state.set_previous_hypothesis(None)
         state.set_options(new_options)
 
-        # Create per-stream prompt index for prompt-enabled models
+        # Create per-stream prompt index for prompt-enabled models.
+        # `cfg.lang` (config_language_code) takes precedence over the per-utterance manifest value.
         if self.prompt_enabled:
-            lang_code = getattr(new_options, "language_code", None)
+            lang_code = self.config_language_code or getattr(new_options, "language_code", None)
             if not isinstance(lang_code, str) or len(lang_code) == 0:
                 raise ValueError("Prompt-enabled model requires a valid language_code in request options.")
             prompt_idx = self._resolve_prompt_index(lang_code)

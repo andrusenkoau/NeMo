@@ -73,6 +73,27 @@ class CacheAwareRNNTInferenceWrapper(CacheAwareASRInferenceWrapper):
         """
         return self.asr_model.joint.vocabulary
 
+    def apply_prompt_to_encoded(self, encoded: Tensor, prompt_vectors: Tensor) -> Tensor:
+        """
+        Inject the per-stream language-ID prompt into the encoder output.
+
+        Mirrors the model's prompt mechanism (one-hot concatenation + projection via
+        `prompt_kernel`), but applies a per-stream prompt so batches with mixed languages
+        are supported.
+        Args:
+            encoded: (Tensor) encoder output of shape [B, D, T].
+            prompt_vectors: (Tensor) one-hot prompt vectors of shape [B, num_prompts].
+        Returns:
+            (Tensor) prompt-conditioned encoder output of shape [B, D, T].
+        """
+        encoded = encoded.transpose(1, 2)  # [B, D, T] -> [B, T, D]
+        batch_size, time_steps, _ = encoded.shape
+        # Expand per-stream prompt across time: [B, num_prompts] -> [B, T, num_prompts]
+        prompt = prompt_vectors.to(encoded.dtype).unsqueeze(1).expand(batch_size, time_steps, -1)
+        out_dtype = encoded.dtype
+        encoded = self.asr_model.prompt_kernel(torch.cat([encoded, prompt], dim=-1)).to(out_dtype)
+        return encoded.transpose(1, 2)  # [B, T, D] -> [B, D, T]
+
     def execute_step(
         self,
         processed_signal: Tensor,
@@ -115,6 +136,15 @@ class CacheAwareRNNTInferenceWrapper(CacheAwareASRInferenceWrapper):
             keep_all_outputs=keep_all_outputs,
             drop_extra_pre_encoded=drop_extra_pre_encoded,
         )
+
+        # Apply language-ID prompt conditioning for prompt-conditioned models.
+        # The pipeline bypasses `model.conformer_stream_step` (which would call the model's own
+        # `_apply_prompt_to_encoded`), so the prompt projection must be applied here. Without this,
+        # a prompt-conditioned model receives raw encoder output it was not trained on and produces
+        # empty/garbage transcriptions.
+        if prompt_vectors is not None:
+            encoded = self.apply_prompt_to_encoded(encoded, prompt_vectors)
+
         new_context = CacheAwareContext(
             cache_last_channel=cache_last_channel,
             cache_last_time=cache_last_time,
