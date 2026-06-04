@@ -30,7 +30,9 @@ from nemo.utils import logging
 
 EURO_LLM_INSTRUCT_SMALL = "utter-project/EuroLLM-1.7B-Instruct"
 EURO_LLM_INSTRUCT_LARGE = "utter-project/EuroLLM-9B-Instruct"
-SUPPORTED_TRANSLATION_MODELS = [EURO_LLM_INSTRUCT_SMALL, EURO_LLM_INSTRUCT_LARGE]
+QWEN_3_8B = "Qwen/Qwen3-8B"
+QWEN_3_4B = "Qwen/Qwen3-4B-Instruct-2507"
+SUPPORTED_TRANSLATION_MODELS = [EURO_LLM_INSTRUCT_SMALL, EURO_LLM_INSTRUCT_LARGE, QWEN_3_8B, QWEN_3_4B]
 
 
 class LLMTranslator:
@@ -145,7 +147,7 @@ class LLMTranslator:
         Raises:
             ValueError: if model is not supported for translation
         """
-        if model_name in [EURO_LLM_INSTRUCT_SMALL, EURO_LLM_INSTRUCT_LARGE]:
+        if model_name in [EURO_LLM_INSTRUCT_SMALL, EURO_LLM_INSTRUCT_LARGE, QWEN_3_8B, QWEN_3_4B]:
             return EuroLLMTranslatorPromptTemplate
 
         raise ValueError(

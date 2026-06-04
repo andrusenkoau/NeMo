@@ -132,6 +132,13 @@ class BufferedRNNTPipeline(BasePipeline):
         self.return_tail_result = cfg.return_tail_result
         self.tokens_to_move = self.punctuation_ids.union(self.language_token_ids)
 
+        # Language prompt for prompt-conditioned models.
+        # `config_language_code` (from `cfg.lang`) is authoritative when set: it overrides any
+        # per-utterance language coming from the manifest, so the prompt can be driven purely from
+        # the config. When it is None, the per-stream manifest value is used, falling back to "en-US".
+        self.config_language_code = cfg.get("lang", None)
+        self.default_language_code = self.config_language_code or "en-US"
+
         self.zero_encoded = self.init_zero_enc() if self.right_padding else None
 
     def init_endpointer(self) -> None:
@@ -198,9 +205,12 @@ class BufferedRNNTPipeline(BasePipeline):
         )
 
         if self.prompt_enabled:
-            # Use "en-US" as the default prompt for zero encoding
-            # This region is sliced out before decoding, so language choice doesn't matter
-            default_prompt_idx = self._resolve_prompt_index("en-US")
+            # The zero-encoding region is sliced out before decoding, so the language choice does not
+            # matter. Use the configured default language, falling back to any valid prompt index.
+            prompt_dict = self._prompt_config['prompt_dict']
+            default_prompt_idx = prompt_dict.get(self.default_language_code)
+            if default_prompt_idx is None:
+                default_prompt_idx = next(iter(prompt_dict.values()))
             prompt_indices = torch.tensor([default_prompt_idx], device=self.device, dtype=torch.long)
             prompt_vector = self._create_one_hot_prompts(prompt_indices)  # [1, num_prompts]
 
@@ -233,13 +243,14 @@ class BufferedRNNTPipeline(BasePipeline):
             default_target_language=self.nmt_model.target_language if self.nmt_enabled else None,
             default_stop_history_eou=self.stop_history_eou_in_milliseconds,
             default_asr_output_granularity=self.asr_output_granularity,
-            default_language_code="en-US" if self.prompt_enabled else None,
+            default_language_code=self.default_language_code if self.prompt_enabled else None,
         )
         state.set_options(new_options)
 
-        # Create per-stream prompt index for prompt-enabled models
+        # Create per-stream prompt index for prompt-enabled models.
+        # `cfg.lang` (config_language_code) takes precedence over the per-utterance manifest value.
         if self.prompt_enabled:
-            lang_code = getattr(new_options, "language_code", None)
+            lang_code = self.config_language_code or getattr(new_options, "language_code", None)
             if not isinstance(lang_code, str) or len(lang_code) == 0:
                 raise ValueError("Prompt-enabled model requires a valid language_code in request options.")
             prompt_idx = self._resolve_prompt_index(lang_code)

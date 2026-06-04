@@ -69,6 +69,12 @@ def prepare_audio_data(
             record["audio_filepath"] = filepath
         options = [
             ASRRequestOptions(
+                # Per-utterance language prompt for prompt-conditioned models. Only explicit prompt
+                # fields are honored; `target_lang` matches the training prompt_field convention.
+                # The generic `lang` key is intentionally NOT read here, since in NeMo manifests it
+                # usually denotes the spoken/source language, not the desired prompt target.
+                # Note: `cfg.lang`, when set, overrides these per-utterance values (see pipeline).
+                language_code=record.get("language_code", record.get("target_lang", None)),
                 biasing_cfg=(
                     BiasingRequestItemConfig(
                         **OmegaConf.to_container(

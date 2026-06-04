@@ -483,8 +483,13 @@ class BasePipeline(PipelineInterface):
         )
 
     def init_prompt_support(self) -> None:
-        """Initialize prompt support for multilingual models."""
-        self.prompt_enabled = hasattr(self.asr_model.asr_model, 'concat') and self.asr_model.asr_model.concat
+        """Initialize prompt support for multilingual / prompt-conditioned models."""
+        model = self.asr_model.asr_model
+        # Prompt-conditioned model classes expose the feature flag under different attribute names.
+        # Both variants inject a one-hot language prompt into the encoder output after the encoder:
+        #   - `concat`     : EncDecHybridRNNTCTCBPEModelWithPrompt
+        #   - `use_prompt` : EncDecRNNTModel / EncDecRNNTBPEModel (unified RNNT)
+        self.prompt_enabled = bool(getattr(model, 'concat', False) or getattr(model, 'use_prompt', False))
 
         if self.prompt_enabled:
             self._prompt_config = self._load_prompt_config()
