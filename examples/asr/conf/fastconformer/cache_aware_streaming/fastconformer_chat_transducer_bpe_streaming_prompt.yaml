@@ -1,0 +1,321 @@
+# Config for training a cache-aware streaming FastConformer with CHAT (Chunk-wise Attention Transducer) joint
+# AND language-prompt conditioning for multilingual ASR.
+#
+# CHAT replaces the standard additive joint with a cross-attention joint that attends over chunks of encoder output.
+# Reference: https://arxiv.org/abs/2602.24245
+#
+# Based on: fastconformer_chat_transducer_bpe_streaming.yaml
+# Key differences:
+#   - model is the standard EncDecRNNTBPEModel, which enables language-prompt conditioning
+#     automatically when model.model_defaults.initialize_prompt_feature is set
+#   - a 1-hot language prompt is concatenated to the encoder output and projected back to enc_hidden
+#   - datasets use Lhotse and emit the language prompt via LhotseSpeechToTextBpeDatasetWithPrompt
+#   - the language for each utterance is read from the manifest field given by `prompt_field` (default: target_lang)
+#
+# Manifest example (one JSON per line):
+#   {"audio_filepath":"...wav","duration":12.12,"text":"...","lang":"en-US","target_lang":"en-US"}
+
+name: "FastConformer-CHAT-Transducer-BPE-Streaming-Prompt"
+
+model:
+  sample_rate: 16000
+  compute_eval_loss: false
+  log_prediction: true
+  skip_nan_grad: false
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+
+    # ----- language prompt settings -----
+    # Enables fusing the 1-hot language prompt into the encoder output via the prompt_kernel MLP.
+    initialize_prompt_feature: true
+    # Size of the 1-hot prompt vector. Keep larger than the number of supported languages so
+    # new languages can be added without changing the model architecture.
+    num_prompts: 128
+    # Dictionary mapping language identifiers (as found in the manifest `prompt_field`) to prompt indices.
+    prompt_dictionary: {
+    'en-US': 0,
+    'en-GB': 1,
+    'es-ES': 2,
+    'es-US': 3,
+    'zh-CN': 4,
+    'zh-TW': 5,
+    'hi-IN': 6,
+    'ar-AR': 7,
+    'fr-FR': 8,
+    'de-DE': 9,
+    'ja-JP': 10,
+    'ru-RU': 11,
+    'pt-BR': 12,
+    'pt-PT': 13,
+    'ko-KR': 14,
+    'it-IT': 15,
+    'nl-NL': 16,
+    'pl-PL': 17,
+    'tr-TR': 18,
+    'uk-UA': 19,
+    'ro-RO': 20,
+    'el-GR': 21,
+    'cs-CZ': 22,
+    'hu-HU': 23,
+    'sv-SE': 24,
+    'da-DK': 25,
+    'fi-FI': 26,
+    'no-NO': 27,
+    'sk-SK': 28,
+    'hr-HR': 29,
+    'bg-BG': 30,
+    'lt-LT': 31,
+    'th-TH': 32,
+    'vi-VN': 33,
+    'id-ID': 34,
+    'ms-MY': 35,
+    'bn-IN': 36,
+    'ur-PK': 37,
+    'fa-IR': 38,
+    'ta-IN': 39,
+    'te-IN': 40,
+    'mr-IN': 41,
+    'gu-IN': 42,
+    'kn-IN': 43,
+    'ml-IN': 44,
+    'he-IL': 64,
+    'az-AZ': 66,
+    'ka-GE': 67,
+    'hy-AM': 68
+    # Add more languages here as needed (index must be < num_prompts).
+    }
+
+  train_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 20
+    min_duration: 0.1
+    # Lhotse is required for language-prompt support.
+    use_lhotse: true
+    # tarred datasets
+    is_tarred: false
+    tarred_audio_filepaths: null
+    shuffle_n: 2048
+    # bucketing params
+    bucketing_strategy: "synced_randomized"
+    bucketing_batch_size: null
+    # language prompt configs
+    prompt_field: target_lang
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+
+  validation_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+    use_lhotse: true
+    use_bucketing: false
+    # language prompt configs
+    prompt_field: target_lang
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+    use_lhotse: true
+    use_bucketing: false
+    # language prompt configs
+    prompt_field: target_lang
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+
+  tokenizer:
+    dir: ???
+    type: bpe
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "NA"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 80
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 17
+    d_model: 512
+    use_bias: True
+
+    # Sub-sampling parameters
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: true
+
+    # Feed forward module's params
+    ff_expansion_factor: 4
+
+    # Multi-headed Attention Module's params
+    self_attention_model: rel_pos
+    n_heads: 8
+
+    # Chunked attention context: chunk_size for CHAT = right_context + 1 = 14
+    # look-ahead(secs) = 13 * 8 * 0.01 = 1.04s
+    att_context_size: [70, 13]
+    att_context_style: chunked_limited
+    att_context_probs: null
+
+    xscaling: true
+    pos_emb_max_len: 5000
+
+    # Convolution module's params
+    conv_kernel_size: 9
+    conv_norm_type: 'layer_norm'
+    conv_context_size: causal
+
+    ### regularization
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 1
+      t_max: null
+      dropout: 0.2
+
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTAttJoint
+    log_softmax: null
+    preserve_memory: false
+
+    # chunk_size is auto-inferred from encoder att_context_size (right_context + 1).
+    # Uncomment to override:
+    # chunk_size: 14
+
+    # fuse_loss_wer is not yet supported for CHAT
+    fuse_loss_wer: false
+    fused_batch_size: null
+
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
+      dropout: 0.2
+
+  decoding:
+    strategy: "greedy_batch"
+
+    greedy:
+      max_symbols: 10
+
+    beam:
+      beam_size: 2
+      return_best_hypothesis: False
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  interctc:
+    loss_weights: []
+    apply_at_layers: []
+
+  loss:
+    loss_name: "default"
+    warprnnt_numba_kwargs:
+      fastemit_lambda: 5e-3
+      clamp: -1.0
+
+  optim:
+    name: adamw
+    lr: 5.0
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    sched:
+      name: NoamAnnealing
+      d_model: ${model.encoder.d_model}
+      warmup_steps: 10000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: 1000
+  max_steps: -1
+  val_check_interval: 1.0
+  accelerator: auto
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  precision: 32
+  log_every_n_steps: 10
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: False
+  logger: false
+  benchmark: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
