@@ -395,6 +395,57 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             torch.nn.Linear(proj_out_size * 2, proj_out_size),
         )
 
+    def _is_prompt_feature_enabled(self) -> bool:
+        """Whether language-prompt conditioning is enabled for this model."""
+        model_defaults = self.cfg.get('model_defaults', None)
+        return bool(model_defaults is not None and model_defaults.get('initialize_prompt_feature', False))
+
+    def _unpack_prompt_batch(self, batch):
+        """Unpack a (signal, signal_len, transcript, transcript_len, prompt) batch.
+
+        Raises a clear error if prompt conditioning is enabled but the batch does not include a
+        prompt (e.g. a non-Lhotse loader was used), instead of a cryptic tuple-unpack failure.
+        """
+        if len(batch) >= 5:
+            return batch[0], batch[1], batch[2], batch[3], batch[4]
+        raise ValueError(
+            "Language-prompt conditioning is enabled but the batch does not contain a prompt "
+            f"(got {len(batch)} elements). Ensure training/eval uses Lhotse data loading "
+            "(`use_lhotse: true`) so language prompts are generated for each batch."
+        )
+
+    def _make_prompt_dataset_config(self, config: Optional[Dict]) -> DictConfig:
+        """Return a dataset config that has everything ``LhotseSpeechToTextBpeDatasetWithPrompt`` needs.
+
+        Settings missing from the dataset config are filled in from ``model_defaults`` / ``encoder`` /
+        ``preprocessor`` so that enabling prompts only requires configuring ``model.model_defaults``.
+        """
+        prompt_config = config if isinstance(config, DictConfig) else OmegaConf.create(dict(config))
+        model_defaults = self.cfg.get('model_defaults', {}) or {}
+
+        with open_dict(prompt_config):
+            if prompt_config.get('prompt_dictionary') is None:
+                prompt_dictionary = model_defaults.get('prompt_dictionary')
+                prompt_config.prompt_dictionary = (
+                    OmegaConf.to_container(prompt_dictionary, resolve=True) if prompt_dictionary is not None else None
+                )
+            if prompt_config.get('num_prompts') is None:
+                prompt_config.num_prompts = model_defaults.get('num_prompts', 128)
+            if prompt_config.get('subsampling_factor') is None:
+                prompt_config.subsampling_factor = self.cfg.encoder.get('subsampling_factor', 8)
+            if prompt_config.get('sample_rate') is None:
+                prompt_config.sample_rate = self.cfg.preprocessor.get('sample_rate', 16000)
+            if prompt_config.get('window_stride') is None:
+                prompt_config.window_stride = self.cfg.preprocessor.get('window_stride', 0.01)
+
+        if prompt_config.get('prompt_dictionary') is None:
+            raise ValueError(
+                "Language-prompt conditioning is enabled (model.model_defaults.initialize_prompt_feature=true) "
+                "but no `prompt_dictionary` was found in model.model_defaults or the dataset config."
+            )
+
+        return prompt_config
+
     def change_vocabulary(
         self,
         new_tokenizer_dir: Union[str, DictConfig],
@@ -564,20 +615,27 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
+        # When language-prompt conditioning is enabled on the model, training/eval must produce
+        # prompts alongside each batch. This is driven by the model-level flag (the same source of
+        # truth as the step methods) so that enabling it in model_defaults is sufficient. Transcription
+        # is excluded here because it builds the prompt dynamically instead.
+        is_prompt_train_eval = self._is_prompt_feature_enabled() and not config.get("do_transcribe", False)
+        if is_prompt_train_eval and not config.get("use_lhotse"):
+            raise ValueError(
+                "Language-prompt conditioning (model.model_defaults.initialize_prompt_feature=true) requires "
+                "Lhotse data loading. Please set `use_lhotse: true` on the dataset config."
+            )
+
         if config.get("use_lhotse"):
-            # Use the prompt-aware dataset when the dataset config provides a prompt dictionary.
-            # This produces a 1-hot language prompt per encoder frame alongside the usual fields.
-            if config.get("prompt_dictionary") is not None:
+            if is_prompt_train_eval:
+                # Produces a 1-hot language prompt per encoder frame alongside the usual fields.
                 logging.info("Setting up Lhotse dataset with language-prompt support")
+                prompt_config = self._make_prompt_dataset_config(config)
                 return get_lhotse_dataloader_from_config(
-                    config,
-                    global_rank=(
-                        self.global_rank if not config.get("do_transcribe", False) else config.get("global_rank")
-                    ),
-                    world_size=(
-                        self.world_size if not config.get("do_transcribe", False) else config.get("world_size")
-                    ),
-                    dataset=LhotseSpeechToTextBpeDatasetWithPrompt(tokenizer=self.tokenizer, cfg=config),
+                    prompt_config,
+                    global_rank=self.global_rank,
+                    world_size=self.world_size,
+                    dataset=LhotseSpeechToTextBpeDatasetWithPrompt(tokenizer=self.tokenizer, cfg=prompt_config),
                     tokenizer=self.tokenizer,
                 )
             return get_lhotse_dataloader_from_config(
@@ -783,7 +841,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len, prompt = batch
+        signal, signal_len, transcript, transcript_len, prompt = self._unpack_prompt_batch(batch)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -884,7 +942,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         if not self.concat:
             return super().predict_step(batch, batch_idx, dataloader_idx=dataloader_idx)
 
-        signal, signal_len, transcript, transcript_len, prompt = batch
+        signal, signal_len, transcript, transcript_len, prompt = self._unpack_prompt_batch(batch)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -906,7 +964,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         if not self.concat:
             return super().validation_pass(batch, batch_idx, dataloader_idx=dataloader_idx)
 
-        signal, signal_len, transcript, transcript_len, prompt = batch
+        signal, signal_len, transcript, transcript_len, prompt = self._unpack_prompt_batch(batch)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
