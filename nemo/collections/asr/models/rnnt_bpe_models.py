@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import copy
-import math
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from lightning.pytorch import Trainer
@@ -24,36 +22,18 @@ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
-from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset, DALIOutputs
+from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.data.audio_to_text_lhotse_prompt import LhotseSpeechToTextBpeDatasetWithPrompt
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
-from nemo.collections.asr.parts.mixins import ASRBPEMixin, TranscribeConfig
+from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.core.classes.common import PretrainedModelInfo, typecheck
-from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import (
-    AcousticEncodedRepresentation,
-    AudioSignal,
-    LabelsType,
-    LengthsType,
-    NeuralType,
-    SpectrogramType,
-)
+from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
-
-
-@dataclass
-class RNNTBPEPromptTranscribeConfig(TranscribeConfig):
-    """Transcription config for RNNT BPE models with optional language-prompt conditioning."""
-
-    target_lang: str = "en-US"
-    prompt_field: str = "target_lang"
 
 
 class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
@@ -366,54 +346,6 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
 
-        # Optional language-prompt conditioning. Disabled by default so the model behaves
-        # exactly like a standard RNNT BPE model unless explicitly enabled in the config.
-        self.concat = False
-        model_defaults = self.cfg.get('model_defaults', None)
-        self.num_prompts = model_defaults.get('num_prompts', 128) if model_defaults else 128
-        if model_defaults is not None and model_defaults.get('initialize_prompt_feature', False):
-            self.initialize_prompt_feature()
-
-    def initialize_prompt_feature(self):
-        """Initialize the projection that fuses a 1-hot language prompt into the encoder output."""
-        if 'prompt_dictionary' not in self.cfg.model_defaults:
-            raise ValueError("No prompt_dictionary found in config under model.model_defaults.")
-
-        logging.info("RNNT BPE model: language-prompt conditioning enabled.")
-
-        # Enable concatenation mode
-        self.concat = True
-        self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
-
-        # Projection: [encoder_hidden + num_prompts] -> [encoder_hidden]
-        proj_in_size = self.num_prompts + self.cfg.model_defaults.enc_hidden
-        proj_out_size = self.cfg.model_defaults.enc_hidden
-
-        self.prompt_kernel = torch.nn.Sequential(
-            torch.nn.Linear(proj_in_size, proj_out_size * 2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(proj_out_size * 2, proj_out_size),
-        )
-
-    def _is_prompt_feature_enabled(self) -> bool:
-        """Whether language-prompt conditioning is enabled for this model."""
-        model_defaults = self.cfg.get('model_defaults', None)
-        return bool(model_defaults is not None and model_defaults.get('initialize_prompt_feature', False))
-
-    def _unpack_prompt_batch(self, batch):
-        """Unpack a (signal, signal_len, transcript, transcript_len, prompt) batch.
-
-        Raises a clear error if prompt conditioning is enabled but the batch does not include a
-        prompt (e.g. a non-Lhotse loader was used), instead of a cryptic tuple-unpack failure.
-        """
-        if len(batch) >= 5:
-            return batch[0], batch[1], batch[2], batch[3], batch[4]
-        raise ValueError(
-            "Language-prompt conditioning is enabled but the batch does not contain a prompt "
-            f"(got {len(batch)} elements). Ensure training/eval uses Lhotse data loading "
-            "(`use_lhotse: true`) so language prompts are generated for each batch."
-        )
-
     def _make_prompt_dataset_config(self, config: Optional[Dict]) -> DictConfig:
         """Return a dataset config that has everything ``LhotseSpeechToTextBpeDatasetWithPrompt`` needs.
 
@@ -621,9 +553,13 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         # is excluded here because it builds the prompt dynamically instead.
         is_prompt_train_eval = self._is_prompt_feature_enabled() and not config.get("do_transcribe", False)
         if is_prompt_train_eval and not config.get("use_lhotse"):
-            raise ValueError(
-                "Language-prompt conditioning (model.model_defaults.initialize_prompt_feature=true) requires "
-                "Lhotse data loading. Please set `use_lhotse: true` on the dataset config."
+            # Prompts are only produced by the Lhotse prompt dataset. Don't hard-fail here (e.g. a
+            # test_ds without use_lhotse would block model construction); just warn that this
+            # particular dataset won't carry language prompts.
+            logging.warning(
+                "Language-prompt conditioning is enabled (model.model_defaults.initialize_prompt_feature=true) "
+                "but this dataset config does not set `use_lhotse: true`. Language prompts will NOT be generated "
+                "for it; set `use_lhotse: true` on the dataset config to enable prompt conditioning."
             )
 
         if config.get("use_lhotse"):
@@ -746,332 +682,3 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
-
-    # ---------------------------------------------------------------------------------------------
-    # Language-prompt conditioning. All methods below fall back to the standard RNNT BPE behavior
-    # (via ``super()``) when prompt conditioning is disabled (``self.concat`` is False).
-    # ---------------------------------------------------------------------------------------------
-
-    @property
-    def input_types(self) -> Optional[Dict[str, NeuralType]]:
-        if hasattr(self.preprocessor, '_sample_rate'):
-            input_signal_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
-        else:
-            input_signal_eltype = AudioSignal()
-
-        return {
-            "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
-            "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
-            "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "prompt": NeuralType(('B', 'T', 'D'), LabelsType(), optional=True),
-        }
-
-    @property
-    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        return {
-            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-            "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-        }
-
-    @typecheck()
-    def forward(
-        self,
-        input_signal=None,
-        input_signal_length=None,
-        processed_signal=None,
-        processed_signal_length=None,
-        prompt=None,
-    ):
-        """Acoustic (encoder) forward, optionally conditioned on a language prompt.
-
-        When prompt conditioning is enabled and a prompt is provided, the 1-hot language prompt is
-        concatenated to the encoder output and projected back to the encoder hidden size before being
-        returned, so the (CHAT) joint network sees prompt-conditioned features. Otherwise this is
-        identical to the standard RNNT encoder forward.
-
-        Args:
-            input_signal: Raw audio of shape [B, T].
-            input_signal_length: Lengths of the audio sequences, shape [B].
-            processed_signal: Pre-processed features of shape [B, D, T].
-            processed_signal_length: Lengths of the processed sequences, shape [B].
-            prompt: 1-hot language prompt of shape [B, T, num_prompts] (only used when enabled).
-
-        Returns:
-            A tuple (encoded [B, D, T], encoded_len [B]).
-        """
-        has_input_signal = input_signal is not None and input_signal_length is not None
-        has_processed_signal = processed_signal is not None and processed_signal_length is not None
-        if (has_input_signal ^ has_processed_signal) is False:
-            raise ValueError(
-                f"{self} Arguments ``input_signal`` and ``input_signal_length`` are mutually exclusive "
-                " with ``processed_signal`` and ``processed_signal_len`` arguments."
-            )
-
-        if not has_processed_signal:
-            processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal,
-                length=input_signal_length,
-            )
-
-        # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-
-        if self.concat and prompt is not None:
-            encoded = torch.transpose(encoded, 1, 2)  # B * D * T -> B * T * D
-            if prompt.shape[1] > encoded.shape[1]:
-                prompt = prompt[:, : encoded.shape[1], :]
-            out_dtype = encoded.dtype
-
-            # Concatenate encoder states with the language prompt and project back to enc_hidden.
-            concat_enc_states = torch.cat([encoded, prompt], dim=-1)
-            encoded = self.prompt_kernel(concat_enc_states).to(out_dtype)
-            encoded = torch.transpose(encoded, 1, 2)  # B * T * D -> B * D * T
-
-        return encoded, encoded_len
-
-    def training_step(self, batch, batch_nb):
-        if not self.concat:
-            return super().training_step(batch, batch_nb)
-
-        # Reset access registry
-        if AccessMixin.is_access_enabled(self.model_guid):
-            AccessMixin.reset_registry(self)
-
-        signal, signal_len, transcript, transcript_len, prompt = self._unpack_prompt_batch(batch)
-
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
-        del signal
-
-        # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-
-        if hasattr(self, '_trainer') and self._trainer is not None:
-            log_every_n_steps = self._trainer.log_every_n_steps
-            sample_id = self._trainer.global_step
-        else:
-            log_every_n_steps = 1
-            sample_id = batch_nb
-
-        # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
-            # For CHAT, the joint chunks the encoder output; the loss must use the chunk count.
-            effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
-            loss_value = self.loss(
-                log_probs=joint,
-                targets=transcript,
-                input_lengths=effective_len,
-                target_lengths=target_length,
-            )
-
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if (sample_id + 1) % log_every_n_steps == 0:
-                self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
-                )
-                _, scores, words = self.wer.compute()
-                self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            if (sample_id + 1) % log_every_n_steps == 0:
-                compute_wer = True
-            else:
-                compute_wer = False
-
-            # Fused joint step
-            loss_value, wer, _, _ = self.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=decoder,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=transcript_len,
-                compute_wer=compute_wer,
-            )
-
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
-
-        # Log items
-        self.log_dict(tensorboard_logs)
-
-        # Preserve batch acoustic model T and language model U parameters if normalizing
-        if self._optim_normalize_joint_txu:
-            self._optim_normalize_txu = [encoded_len.max(), transcript_len.max()]
-
-        return {'loss': loss_value}
-
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        if not self.concat:
-            return super().predict_step(batch, batch_idx, dataloader_idx=dataloader_idx)
-
-        signal, signal_len, transcript, transcript_len, prompt = self._unpack_prompt_batch(batch)
-
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
-        del signal
-
-        best_hyp = self.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
-        )
-
-        batch_size = signal_len.shape[0]
-        sample_id = torch.arange(batch_idx * batch_size, (batch_idx + 1) * batch_size).cpu().detach().numpy()
-
-        return list(zip(sample_id, best_hyp))
-
-    def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        if not self.concat:
-            return super().validation_pass(batch, batch_idx, dataloader_idx=dataloader_idx)
-
-        signal, signal_len, transcript, transcript_len, prompt = self._unpack_prompt_batch(batch)
-
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
-        del signal
-
-        tensorboard_logs = {}
-
-        # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
-                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
-                effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
-                loss_value = self.loss(
-                    log_probs=joint,
-                    targets=transcript,
-                    input_lengths=effective_len,
-                    target_lengths=target_length,
-                )
-
-                tensorboard_logs['val_loss'] = loss_value
-
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            compute_wer = True
-
-            if self.compute_eval_loss:
-                decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
-            else:
-                decoded = None
-                target_len = transcript_len
-
-            # Fused joint step
-            loss_value, wer, wer_num, wer_denom = self.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=decoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=target_len,
-                compute_wer=compute_wer,
-            )
-
-            if loss_value is not None:
-                tensorboard_logs['val_loss'] = loss_value
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
-
-        self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
-
-        return tensorboard_logs
-
-    def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig) -> dict:
-        """Encoder forward for transcription, building (or reusing) the language prompt when enabled."""
-        if not self.concat:
-            return super()._transcribe_forward(batch, trcfg)
-
-        audio, audio_lens = batch[0], batch[1]
-
-        # Reuse a prompt supplied by the dataloader if present, otherwise build it dynamically.
-        prompt = batch[4] if len(batch) >= 5 else None
-
-        if prompt is None:
-            target_lang = getattr(trcfg, 'target_lang', 'en-US')
-            prompt_dict = self.cfg.model_defaults.get('prompt_dictionary')
-            num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
-
-            if not prompt_dict:
-                raise ValueError("Prompt dictionary is empty. Cannot create dynamic prompts.")
-            if target_lang not in prompt_dict:
-                available_keys = list(prompt_dict.keys())
-                raise ValueError(
-                    f"Unknown target language: '{target_lang}'. Available languages: "
-                    f"{available_keys[:10]}{'...' if len(available_keys) > 10 else ''}"
-                )
-
-            prompt_id = prompt_dict[target_lang]
-
-            processed_signal, processed_signal_length = self.preprocessor(input_signal=audio, length=audio_lens)
-            time_length = processed_signal.shape[2]
-            subsampling_factor = self.cfg.encoder.get('subsampling_factor', 8)
-            hidden_length = math.ceil(time_length / subsampling_factor)
-
-            prompt = torch.zeros(audio.shape[0], hidden_length, num_prompts, dtype=torch.float32, device=audio.device)
-            prompt[:, :, prompt_id] = 1.0
-
-            encoded, encoded_len = self.forward(
-                processed_signal=processed_signal, processed_signal_length=processed_signal_length, prompt=prompt
-            )
-        else:
-            encoded, encoded_len = self.forward(input_signal=audio, input_signal_length=audio_lens, prompt=prompt)
-
-        return dict(encoded=encoded, encoded_len=encoded_len)

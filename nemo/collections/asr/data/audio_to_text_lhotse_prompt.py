@@ -61,8 +61,29 @@ class LhotseSpeechToTextBpeDatasetWithPrompt(torch.utils.data.Dataset):
             # This ensures we have enough dimensions in our embedding space to add scale up without changing the model
             self.num_prompts = cfg.get('num_prompts', 128)
 
-        # Field to use for prompt key (default to 'language')
-        self.prompt_field = cfg.get('prompt_field', 'language')
+        # Field to use for prompt key (default to 'target_lang')
+        self.prompt_field = cfg.get('prompt_field', 'target_lang')
+
+        # Fallback prompt key used when an utterance has no language / prompt field set in the
+        # manifest (e.g. monolingual data without a `target_lang` field). Defaults to 'en'.
+        self.default_prompt_key = cfg.get('default_prompt_key', 'en')
+
+    def _resolve_prompt_key(self, supervision) -> str:
+        """Resolve the prompt key for a supervision, falling back to ``default_prompt_key``.
+
+        Looks up the configured ``prompt_field`` (e.g. ``target_lang``) on the supervision and its
+        custom fields, then the supervision ``language`` attribute, and finally the default key.
+        """
+        key = getattr(supervision, self.prompt_field, None)
+        if key is None:
+            custom = getattr(supervision, 'custom', None)
+            if custom:
+                key = custom.get(self.prompt_field)
+        if key is None:
+            key = supervision.language
+        if key is None:
+            key = self.default_prompt_key
+        return key
 
     def _get_prompt_index(self, prompt_key: str) -> int:
         """
@@ -89,10 +110,10 @@ class LhotseSpeechToTextBpeDatasetWithPrompt(torch.utils.data.Dataset):
         # Initialize prompt target matrix
         mask = np.zeros((num_prompts, encoder_hidden_len))
 
-        # Get prompt index - default to language if prompt not specified
-        # revise supervisions to include prompt key
-        # prompt_key = getattr(cut.supervisions[0].custom_fields, cut.supervisions[0].language)cut.supervisions[0].custom_fields,
-        prompt_id = self._get_prompt_index(cut.supervisions[0].language)
+        # Resolve the prompt key from the configured prompt_field / language, with a default
+        # fallback for utterances that don't specify one.
+        prompt_key = self._resolve_prompt_key(cut.supervisions[0])
+        prompt_id = self._get_prompt_index(prompt_key)
 
         # Set the corresponding prompt ID to 1 for all time steps
         mask[prompt_id, :] = 1

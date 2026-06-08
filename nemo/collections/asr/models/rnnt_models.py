@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import copy
+import math
 import os
+from dataclasses import dataclass
 from math import ceil
 from typing import Any, Dict, List, Optional, Union
 
@@ -46,12 +48,35 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import (
+    AcousticEncodedRepresentation,
+    AudioSignal,
+    LabelsType,
+    LengthsType,
+    NeuralType,
+    SpectrogramType,
+)
 from nemo.utils import logging
 
 
+@dataclass
+class RNNTPromptTranscribeConfig(TranscribeConfig):
+    """Transcription config for RNNT models with optional language-prompt conditioning."""
+
+    target_lang: str = "en-US"
+    prompt_field: str = "target_lang"
+
+
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
-    """Base class for encoder decoder RNNT-based models."""
+    """Base class for encoder decoder RNNT-based models.
+
+    Optionally supports language-prompt conditioning: when
+    ``model.model_defaults.initialize_prompt_feature`` is set, a 1-hot language vector is
+    concatenated to the encoder output and projected back to the encoder hidden size by a small
+    MLP (``prompt_kernel``) before the joint network. This is compatible with the CHAT
+    (``RNNTAttJoint``) joint, whose chunking happens after the prompt is fused. When disabled (the
+    default) the model behaves exactly like a standard RNNT model.
+    """
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         # Get global rank and total number of GPU workers for IterableDataset partitioning, if applicable
@@ -140,6 +165,40 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
+
+        # Optional language-prompt conditioning. Disabled by default so the model behaves exactly
+        # like a standard RNNT model unless explicitly enabled in the config.
+        self.concat = False
+        model_defaults = self.cfg.get('model_defaults', None)
+        self.num_prompts = model_defaults.get('num_prompts', 128) if model_defaults else 128
+        if model_defaults is not None and model_defaults.get('initialize_prompt_feature', False):
+            self.initialize_prompt_feature()
+
+    def initialize_prompt_feature(self):
+        """Initialize the projection that fuses a 1-hot language prompt into the encoder output."""
+        if 'prompt_dictionary' not in self.cfg.model_defaults:
+            raise ValueError("No prompt_dictionary found in config under model.model_defaults.")
+
+        logging.info("RNNT model: language-prompt conditioning enabled.")
+
+        # Enable concatenation mode
+        self.concat = True
+        self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
+
+        # Projection: [encoder_hidden + num_prompts] -> [encoder_hidden]
+        proj_in_size = self.num_prompts + self.cfg.model_defaults.enc_hidden
+        proj_out_size = self.cfg.model_defaults.enc_hidden
+
+        self.prompt_kernel = torch.nn.Sequential(
+            torch.nn.Linear(proj_in_size, proj_out_size * 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(proj_out_size * 2, proj_out_size),
+        )
+
+    def _is_prompt_feature_enabled(self) -> bool:
+        """Whether language-prompt conditioning is enabled for this model."""
+        model_defaults = self.cfg.get('model_defaults', None)
+        return bool(model_defaults is not None and model_defaults.get('initialize_prompt_feature', False))
 
     def _infer_chat_chunk_size(self) -> int:
         """
@@ -692,6 +751,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "prompt": NeuralType(('B', 'T', 'D'), LabelsType(), optional=True),
         }
 
     @property
@@ -703,7 +763,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+        prompt=None,
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -727,6 +792,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 of shape (B, D, T) that has undergone processing via some DALI preprocessor.
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
+            prompt: Optional 1-hot language prompt of shape [B, T, num_prompts]. When language-prompt
+                conditioning is enabled, it is fused into the encoder output before the joint network.
 
         Returns:
             A tuple of 2 elements -
@@ -752,6 +819,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        if self.concat and prompt is not None:
+            encoded = torch.transpose(encoded, 1, 2)  # B * D * T -> B * T * D
+            # The dataset estimates the prompt time length from the raw sample count, which can be
+            # off by a frame from the encoder's actual output length. Align the prompt to the encoder
+            # time dimension: truncate if longer, or pad by repeating the (constant) prompt if shorter.
+            target_t = encoded.shape[1]
+            if prompt.shape[1] > target_t:
+                prompt = prompt[:, :target_t, :]
+            elif prompt.shape[1] < target_t:
+                pad_len = target_t - prompt.shape[1]
+                last_frame = prompt[:, -1:, :].expand(-1, pad_len, -1)
+                prompt = torch.cat([prompt, last_frame], dim=1)
+            out_dtype = encoded.dtype
+
+            # Concatenate encoder states with the language prompt and project back to enc_hidden.
+            concat_enc_states = torch.cat([encoded, prompt], dim=-1)
+            encoded = self.prompt_kernel(concat_enc_states).to(out_dtype)
+            encoded = torch.transpose(encoded, 1, 2)  # B * T * D -> B * D * T
+
         return encoded, encoded_len
 
     # PTL-specific methods
@@ -760,13 +847,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len = batch
+        # With language-prompt conditioning, batches carry an extra 1-hot prompt tensor.
+        if self.concat:
+            signal, signal_len, transcript, transcript_len, prompt = batch
+        else:
+            signal, signal_len, transcript, transcript_len = batch
+            prompt = None
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -857,13 +949,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return {'loss': loss_value}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len, sample_id = batch
+        # With language-prompt conditioning, batches carry a 1-hot prompt instead of a sample_id.
+        if self.concat:
+            signal, signal_len, transcript, transcript_len, prompt = batch
+            batch_size = signal_len.shape[0]
+            sample_id = torch.arange(batch_idx * batch_size, (batch_idx + 1) * batch_size)
+        else:
+            signal, signal_len, transcript, transcript_len, sample_id = batch
+            prompt = None
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
         del signal
 
         best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
@@ -875,13 +974,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return list(zip(sample_id, best_hyp_text))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len = batch
+        # With language-prompt conditioning, batches carry an extra 1-hot prompt tensor.
+        if self.concat:
+            signal, signal_len, transcript, transcript_len, prompt = batch
+        else:
+            signal, signal_len, transcript, transcript_len = batch
+            prompt = None
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
         del signal
 
         tensorboard_logs = {}
@@ -987,9 +1091,46 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-        output = dict(encoded=encoded, encoded_len=encoded_len)
-        return output
+        if not self.concat:
+            encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+            return dict(encoded=encoded, encoded_len=encoded_len)
+
+        # Language-prompt conditioning: reuse a prompt from the dataloader if present, otherwise
+        # build a 1-hot prompt for the requested target language.
+        audio, audio_lens = batch[0], batch[1]
+        prompt = batch[4] if len(batch) >= 5 else None
+
+        if prompt is None:
+            target_lang = getattr(trcfg, 'target_lang', 'en-US')
+            prompt_dict = self.cfg.model_defaults.get('prompt_dictionary')
+            num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
+
+            if not prompt_dict:
+                raise ValueError("Prompt dictionary is empty. Cannot create dynamic prompts.")
+            if target_lang not in prompt_dict:
+                available_keys = list(prompt_dict.keys())
+                raise ValueError(
+                    f"Unknown target language: '{target_lang}'. Available languages: "
+                    f"{available_keys[:10]}{'...' if len(available_keys) > 10 else ''}"
+                )
+
+            prompt_id = prompt_dict[target_lang]
+
+            processed_signal, processed_signal_length = self.preprocessor(input_signal=audio, length=audio_lens)
+            time_length = processed_signal.shape[2]
+            subsampling_factor = self.cfg.encoder.get('subsampling_factor', 8)
+            hidden_length = math.ceil(time_length / subsampling_factor)
+
+            prompt = torch.zeros(audio.shape[0], hidden_length, num_prompts, dtype=torch.float32, device=audio.device)
+            prompt[:, :, prompt_id] = 1.0
+
+            encoded, encoded_len = self.forward(
+                processed_signal=processed_signal, processed_signal_length=processed_signal_length, prompt=prompt
+            )
+        else:
+            encoded, encoded_len = self.forward(input_signal=audio, input_signal_length=audio_lens, prompt=prompt)
+
+        return dict(encoded=encoded, encoded_len=encoded_len)
 
     def _transcribe_output_processing(
         self, outputs, trcfg: TranscribeConfig
