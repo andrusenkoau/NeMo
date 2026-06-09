@@ -1832,6 +1832,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
             "transcripts": NeuralType(('B', 'T'), LabelsType(), optional=True),
             "transcript_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
             "compute_wer": NeuralType(optional=True),
+            "lang_ids": NeuralType(tuple('B'), LabelsType(), optional=True),
         }
 
     @property
