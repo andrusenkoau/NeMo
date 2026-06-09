@@ -40,6 +40,16 @@ python speech_to_text_cache_aware_streaming_infer.py \
     amp=true \
     debug_mode=true
 
+## To compute BLEU (e.g. for AST / speech translation):
+
+python speech_to_text_cache_aware_streaming_infer.py \
+    model_path=asr_model.nemo \
+    dataset_manifest=manifest_file.json \
+    output_path=predictions.json \
+    calculate_bleu=true \
+    gt_text_attr_name=text \
+    target_lang=en
+
 ## It is also possible to use phrase boosting or external LM with cache-aware models:
 
 python speech_to_text_cache_aware_streaming_infer.py \
@@ -112,6 +122,7 @@ from omegaconf import OmegaConf
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
+from nemo.collections.asr.parts.utils.eval_utils import cal_write_text_metric, cal_write_wer
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
@@ -133,7 +144,7 @@ class TranscriptionConfig:
     audio_type: str = "wav"  # type of audio file if audio_dir passed
     audio_file: Optional[str] = None  # Path to an audio file to perform streaming
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
-    output_path: Optional[str] = None  # Path to output file when manifest is used as input
+    output_path: Optional[str] = None  # Path to the output prediction manifest (.json)
 
     # General configs
     batch_size: int = 32
@@ -179,12 +190,26 @@ class TranscriptionConfig:
     # Selects the decoder for Hybrid ASR models which has both the CTC and RNNT decoder.
     decoder_type: Optional[str] = None  # Literal["ctc", "rnnt"]
 
-    # Config for word / character error rate calculation
-    # calculate_wer: bool = True
-    # clean_groundtruth_text: bool = False
-    # langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
-    # use_cer: bool = False
+    # Config for word / character error rate and text metric calculation
+    calculate_wer: bool = True
+    calculate_bleu: bool = False  # for AST / translation evaluation
+    clean_groundtruth_text: bool = False
+    ignore_capitalization: bool = True
+    ignore_punctuation: bool = True
+    langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
+    use_cer: bool = False
+    gt_text_attr_name: str = "text"  # ground-truth field in manifest (use "answer" for AST manifests)
     debug_mode: bool = False  # Whether to print more detail in the output.
+
+    # Language-ID prompt for prompt-conditioned models (e.g. EncDecRNNTBPEModelWithPrompt).
+    # Set to a language key from the model's prompt_dictionary (e.g. "en-US", "auto").
+    # Ignored for models without prompt support.
+    target_lang: Optional[str] = None
+    # whether to strip the language tags from the transcriptions
+    # Ignored for model without prompt support
+    strip_lang_tags: bool = False
+    # Optional regex describing the language tag to strip. Defaults to "<xx-XX>". (r'\s*<[a-z]{2}-[A-Z]{2}>')
+    lang_tag_pattern: Optional[str] = None
 
 
 def extract_transcriptions(hyps):
@@ -207,6 +232,18 @@ def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
         return 0
     else:
         return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
+
+
+def _validate_output_path(output_path: Optional[str]) -> Optional[str]:
+    """Return ``output_path`` after checking it is not an existing directory."""
+    if not output_path:
+        return None
+    if os.path.isdir(output_path):
+        raise IsADirectoryError(
+            f"Cannot write predictions to '{output_path}': path exists as a directory. "
+            "Remove that directory (e.g. `rm -rf ...`) or pass a different `output_path`."
+        )
+    return output_path
 
 
 def perform_streaming(
@@ -363,6 +400,14 @@ def main(cfg: TranscriptionConfig):
         else:
             asr_model.change_decoding_strategy(cfg.ctc_decoding)
 
+    # Set language-ID prompt for prompt-conditioned models
+    if hasattr(asr_model, 'set_inference_prompt'):
+        lang = cfg.target_lang if cfg.target_lang is not None else "auto"
+        asr_model.set_inference_prompt(lang)
+        # Lang-tag stripping only applies to prompt models that emit language tags in the text.
+        if hasattr(asr_model, 'decoding') and hasattr(asr_model.decoding, 'set_strip_lang_tags'):
+            asr_model.decoding.set_strip_lang_tags(cfg.strip_lang_tags, lang_tag_pattern=cfg.lang_tag_pattern)
+
     asr_model = asr_model.to(device=device, dtype=compute_dtype)
     asr_model.eval()
 
@@ -438,8 +483,9 @@ def main(cfg: TranscriptionConfig):
             start_time = time.time()
             for sample_idx, sample in enumerate(samples):
                 _ = streaming_buffer.append_audio_file(sample['audio_filepath'], stream_id=-1)
-                if "text" in sample:
-                    all_refs_text.append(sample["text"])
+                gt_text = sample.get(cfg.gt_text_attr_name) or sample.get("text")
+                if gt_text is not None:
+                    all_refs_text.append(gt_text)
                 logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
 
                 if (sample_idx + 1) % batch_size == 0 or sample_idx == len(samples) - 1:
@@ -470,19 +516,47 @@ def main(cfg: TranscriptionConfig):
         logging.info(f"The whole streaming process took: {round(end_time - start_time, 2)}s")
 
         # stores the results including the transcriptions of the streaming inference in a json file
-        if cfg.output_path is not None and len(all_refs_text) == len(all_streaming_tran):
-            fname = "streaming_out_" + os.path.splitext(os.path.basename(model_name))[0] + f"_{dataset_title}.json"
-
-            hyp_json = os.path.join(cfg.output_path, fname)
-            os.makedirs(cfg.output_path, exist_ok=True)
+        hyp_json = _validate_output_path(cfg.output_path)
+        if hyp_json is not None and len(all_streaming_tran) > 0:
+            os.makedirs(os.path.dirname(hyp_json) or ".", exist_ok=True)
             with open(hyp_json, "w") as out_f:
                 for i, hyp in enumerate(all_streaming_tran):
-                    record = {
-                        "pred_text": hyp,
-                        "text": all_refs_text[i],
-                        "wer": round(word_error_rate(hypotheses=[hyp], references=[all_refs_text[i]]) * 100, 2),
-                    }
-                    out_f.write(json.dumps(record) + '\n')
+                    record = dict(samples[i])
+                    record["pred_text"] = hyp
+                    gt_text = record.get(cfg.gt_text_attr_name) or record.get("text")
+                    if gt_text is not None:
+                        record["wer"] = round(
+                            word_error_rate(hypotheses=[hyp], references=[gt_text]) * 100, 2
+                        )
+                    out_f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            logging.info(f"Finished writing predictions to {hyp_json}!")
+
+            if cfg.calculate_wer:
+                output_manifest_w_wer, total_res, _ = cal_write_wer(
+                    pred_manifest=hyp_json,
+                    pred_text_attr_name="pred_text",
+                    gt_text_attr_name=cfg.gt_text_attr_name,
+                    clean_groundtruth_text=cfg.clean_groundtruth_text,
+                    langid=cfg.langid,
+                    use_cer=cfg.use_cer,
+                    ignore_capitalization=cfg.ignore_capitalization,
+                    ignore_punctuation=cfg.ignore_punctuation,
+                    output_filename=None,
+                )
+                if output_manifest_w_wer:
+                    logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
+                    logging.info(f"{total_res}")
+
+            if cfg.calculate_bleu:
+                output_manifest_w_bleu, total_res, _ = cal_write_text_metric(
+                    pred_manifest=hyp_json,
+                    pred_text_attr_name="pred_text",
+                    gt_text_attr_name=cfg.gt_text_attr_name,
+                    metric="bleu",
+                )
+                if output_manifest_w_bleu:
+                    logging.info(f"Writing prediction and BLEU score of each sample to {output_manifest_w_bleu}!")
+                    logging.info(f"{total_res}")
 
 
 if __name__ == '__main__':

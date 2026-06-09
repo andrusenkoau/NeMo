@@ -1954,7 +1954,55 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Optional target-language conditioning for AST / multilingual decoding.
+        # Enabled via ``setup_lang_conditioning`` (called from the model when prompts are on)
+        # or by setting ``jointnet.num_languages`` in the config.
+        self._inference_lang_id = None
+        self.lang_embed = None
+        self.num_languages = 0
+        num_languages = jointnet.get('num_languages', 0)
+        if num_languages > 0:
+            self.setup_lang_conditioning(num_languages)
+
+    def lang_conditioning_enabled(self) -> bool:
+        """Whether target-language embeddings are active on decoder queries."""
+        return self.lang_embed is not None
+
+    def setup_lang_conditioning(self, num_languages: int):
+        """Enable target-language conditioning by biasing decoder queries before cross-attention."""
+        if num_languages <= 0:
+            return
+        if self.lang_conditioning_enabled() and self.num_languages == num_languages:
+            return
+
+        self.num_languages = num_languages
+        self.lang_embed = torch.nn.Embedding(num_languages, self.joint_hidden)
+        self._inference_lang_id = None
+        logging.info(f"RNNTAttJoint: target-language conditioning enabled ({num_languages} languages).")
+
+    def set_inference_lang_id(self, lang_id: Optional[int]):
+        """Set the language id used during decoding when ``lang_ids`` is not passed explicitly."""
+        self._inference_lang_id = lang_id
+
+    def _resolve_lang_ids(self, g: torch.Tensor, lang_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if not self.lang_conditioning_enabled():
+            return None
+        if lang_ids is not None:
+            return lang_ids
+        if self._inference_lang_id is None:
+            return None
+        return g.new_full((g.size(0),), self._inference_lang_id, dtype=torch.long)
+
+    def _apply_lang_to_decoder(self, g: torch.Tensor, lang_ids: Optional[torch.Tensor]) -> torch.Tensor:
+        """Add a target-language embedding to projected decoder states before cross-attention."""
+        lang_ids = self._resolve_lang_ids(g, lang_ids)
+        if lang_ids is None:
+            return g
+        return g + self.lang_embed(lang_ids).unsqueeze(1)
+
+    def joint(
+        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None, lang_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Override the base joint() to handle chunking internally.
 
@@ -1969,9 +2017,13 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         if f_len is not None and f_len.dim() == 1 and self.chunk_size > 0:
             chunked, chunk_lengths = chunk_concat_audio(f, f_len, self.chunk_size)
             self.num_chunks_per_utterance = (chunk_lengths != 0).sum(dim=1)
-            return self.joint_after_projection(self.project_encoder(chunked), self.project_prednet(g), chunk_lengths)
+            return self.joint_after_projection(
+                self.project_encoder(chunked), self.project_prednet(g), chunk_lengths, lang_ids=lang_ids
+            )
         self.num_chunks_per_utterance = None
-        return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g), f_len)
+        return self.joint_after_projection(
+            self.project_encoder(f), self.project_prednet(g), f_len, lang_ids=lang_ids
+        )
 
     def chunk_encoder_for_decoding(
         self, encoded: torch.Tensor, encoded_len: torch.Tensor
@@ -2096,6 +2148,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         transcripts: Optional[torch.Tensor] = None,
         transcript_lengths: Optional[torch.Tensor] = None,
         compute_wer: bool = False,
+        lang_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
@@ -2111,7 +2164,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
                     "decoder_outputs can only be None for fused step!"
                 )
 
-            out = self.joint(encoder_outputs, decoder_outputs, encoder_lengths)  # [B, T, U, V + 1]
+            out = self.joint(encoder_outputs, decoder_outputs, encoder_lengths, lang_ids=lang_ids)  # [B, T, U, V + 1]
             return out
 
         else:
@@ -2147,6 +2200,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
 
                 sub_enc_lens = encoder_lengths[begin:end]
                 sub_transcript_lens = transcript_lengths[begin:end]
+                sub_lang_ids = lang_ids[begin:end] if lang_ids is not None else None
 
                 # Sub transcripts does not need the full padding of the entire batch
                 # Therefore reduce the decoder time steps to match
@@ -2168,7 +2222,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
                         sub_dec = sub_dec.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
 
                     # Perform joint => [sub-batch, T', U', V + 1]
-                    sub_joint = self.joint(sub_enc, sub_dec)
+                    sub_joint = self.joint(sub_enc, sub_dec, lang_ids=sub_lang_ids)
 
                     del sub_dec
 
@@ -2278,7 +2332,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         return self.pred(prednet_output)
 
     def joint_after_projection(
-        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None
+        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None, lang_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         r"""
         Compute the joint step of the network after projection.
@@ -2305,10 +2359,14 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         Args:
             f: Output of the Encoder model. A torch.Tensor of shape [B, T, H1]
             g: Output of the Decoder model. A torch.Tensor of shape [B, U, H2]
+            f_len: Optional chunk frame lengths for CHAT cross-attention masking.
+            lang_ids: Optional language indices of shape [B] for target-language conditioning.
 
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
+
+        g = self._apply_lang_to_decoder(g, lang_ids)
 
         B, T, D = f.shape
         f = torch.reshape(f, [B, T, -1, self.joint_hidden])

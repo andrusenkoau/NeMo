@@ -661,6 +661,12 @@ class ASRModuleMixin(ASRAdapterModelMixin):
             bypass_pre_encode=bypass_pre_encode,
         )
 
+        # Prompt-conditioned models (e.g. CHAT with language-prompt) fuse a language 1-hot into the
+        # encoder output inside forward(). The streaming path bypasses forward(), so apply the same
+        # fusion here using the prompt selected via set_inference_prompt().
+        if getattr(self, "concat", False) and hasattr(self, "_fuse_prompt_into_encoded"):
+            encoded = self._fuse_prompt_into_encoded(encoded)
+
         if isinstance(self, asr_models.EncDecCTCModel) or (
             isinstance(self, asr_models.EncDecHybridRNNTCTCModel) and self.cur_decoder == "ctc"
         ):
