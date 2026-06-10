@@ -82,6 +82,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             "targets": NeuralType(('B', 'T'), LabelsType()),
             "target_length": NeuralType(tuple('B'), LengthsType()),
             "states": [NeuralType(('B', 'T'), LabelsType(), optional=True)],
+            "lang_ids": NeuralType(tuple('B'), LabelsType(), optional=True),
         }
 
     @property
@@ -144,7 +145,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         self._rnnt_export = False
 
     @typecheck()
-    def forward(self, targets, target_length, states=None):
+    def forward(self, targets, target_length, states=None, lang_ids=None):
         # y: (B, U)
         y = rnn.label_collate(targets)
 
@@ -166,6 +167,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         state: Optional[torch.Tensor] = None,
         add_sos: bool = True,
         batch_size: Optional[int] = None,
+        lang_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Stateful prediction of scores and state for a tokenset.
@@ -614,7 +616,8 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         return {
             "targets": NeuralType(('B', 'T'), LabelsType()),
             "target_length": NeuralType(tuple('B'), LengthsType()),
-            "states": [NeuralType(('D', 'B', 'D'), ElementType(), optional=True)],  # must always be last
+            "states": [NeuralType(('D', 'B', 'D'), ElementType(), optional=True)],
+            "lang_ids": NeuralType(tuple('B'), LabelsType(), optional=True),
         }
 
     @property
@@ -683,9 +686,16 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             rnn_hidden_size=prednet.get("rnn_hidden_size", -1),
         )
         self._rnnt_export = False
+        self._inference_lang_id = None
+        self.lang_embed = None
+        self.num_languages = 0
+
+        num_languages = prednet.get('num_languages', 0)
+        if num_languages > 0:
+            self.setup_lang_conditioning(num_languages)
 
     @typecheck()
-    def forward(self, targets, target_length, states=None):
+    def forward(self, targets, target_length, states=None, lang_ids=None):
         # y: (B, U)
         y = rnn.label_collate(targets)
 
@@ -696,10 +706,55 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         else:
             add_sos = True
 
-        g, states = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
+        g, states = self.predict(y, state=states, add_sos=add_sos, lang_ids=lang_ids)  # (B, U, D)
         g = g.transpose(1, 2)  # (B, D, U)
 
         return g, target_length, states
+
+    def lang_conditioning_enabled(self) -> bool:
+        """Whether target-language embeddings are active in the prediction network."""
+        return self.lang_embed is not None
+
+    def setup_lang_conditioning(self, num_languages: int):
+        """Enable persistent target-language conditioning for prediction-network inputs."""
+        if num_languages <= 0:
+            return
+        if self.lang_conditioning_enabled() and self.num_languages == num_languages:
+            return
+
+        self.num_languages = num_languages
+        self.lang_embed = torch.nn.Embedding(num_languages, self.pred_hidden)
+        self._inference_lang_id = None
+        logging.info(f"RNNTDecoder: target-language conditioning enabled ({num_languages} languages).")
+
+    def set_inference_lang_id(self, lang_id: Optional[int]):
+        """Set the language id used during decoding when ``lang_ids`` is not passed explicitly."""
+        self._inference_lang_id = lang_id
+
+    def _resolve_lang_ids(
+        self, batch_size: int, device: torch.device, lang_ids: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if not self.lang_conditioning_enabled():
+            return None
+        if lang_ids is not None:
+            if not isinstance(lang_ids, torch.Tensor):
+                lang_ids = torch.tensor(lang_ids, device=device, dtype=torch.long)
+            else:
+                lang_ids = lang_ids.to(device=device, dtype=torch.long)
+            if lang_ids.dim() == 0:
+                lang_ids = lang_ids.expand(batch_size)
+            return lang_ids
+        if self._inference_lang_id is None:
+            return None
+        return torch.full((batch_size,), self._inference_lang_id, device=device, dtype=torch.long)
+
+    def _get_lang_embedding(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype, lang_ids: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        lang_ids = self._resolve_lang_ids(batch_size, device, lang_ids)
+        if lang_ids is None:
+            return None
+        return self.lang_embed(lang_ids).to(dtype=dtype).unsqueeze(1)
 
     def predict(
         self,
@@ -707,6 +762,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         state: Optional[List[torch.Tensor]] = None,
         add_sos: bool = True,
         batch_size: Optional[int] = None,
+        lang_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Stateful prediction of scores and state for a (possibly null) tokenset.
@@ -785,10 +841,15 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
             y = torch.zeros((B, 1, self.pred_hidden), device=device, dtype=dtype)
 
-        # Prepend blank "start of sequence" symbol (zero tensor)
+        B = y.size(0)
+        lang_emb = self._get_lang_embedding(B, y.device, y.dtype, lang_ids)
+        if lang_emb is not None:
+            y = y + lang_emb
+
+        # Prepend start-of-sequence. With language conditioning, SOS is the language embedding.
         if add_sos:
             B, U, H = y.shape
-            start = torch.zeros((B, 1, H), device=y.device, dtype=y.dtype)
+            start = lang_emb if lang_emb is not None else torch.zeros((B, 1, H), device=y.device, dtype=y.dtype)
             y = torch.cat([start, y], dim=1).contiguous()  # (B, U + 1, H)
         else:
             start = None  # makes del call later easier

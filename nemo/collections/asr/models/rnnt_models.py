@@ -200,6 +200,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         if hasattr(self.joint, 'setup_lang_conditioning') and not self.joint.lang_conditioning_enabled():
             self.joint.setup_lang_conditioning(self.num_prompts)
+        if (
+            self.cfg.model_defaults.get('initialize_decoder_prompt_feature', False)
+            and hasattr(self.decoder, 'setup_lang_conditioning')
+            and not self.decoder.lang_conditioning_enabled()
+        ):
+            self.decoder.setup_lang_conditioning(self.num_prompts)
 
     @staticmethod
     def _prompt_to_lang_ids(prompt: torch.Tensor) -> torch.Tensor:
@@ -222,7 +228,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             lang: A language key present in ``model_defaults.prompt_dictionary``. ``None``/``"auto"``
                 clears the inference prompt (no conditioning is applied).
         """
-        if not getattr(self, 'concat', False):
+        has_lang_conditioning = any(
+            hasattr(module, 'set_inference_lang_id')
+            and (
+                not hasattr(module, 'lang_conditioning_enabled') or module.lang_conditioning_enabled()
+            )
+            for module in (getattr(self, 'decoder', None), getattr(self, 'joint', None))
+        )
+        if not getattr(self, 'concat', False) and not has_lang_conditioning:
             logging.warning("set_inference_prompt called but this model has no language-prompt conditioning; ignoring.")
             return
 
@@ -230,6 +243,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self._inference_prompt_id = None
             if hasattr(self.joint, 'set_inference_lang_id'):
                 self.joint.set_inference_lang_id(None)
+            if hasattr(self.decoder, 'set_inference_lang_id'):
+                self.decoder.set_inference_lang_id(None)
             logging.warning(
                 "No target language provided for a prompt-conditioned model; encoder output will not be "
                 "conditioned, which may produce poor/empty transcriptions. Pass `target_lang=<lang>`."
@@ -249,6 +264,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self._inference_prompt_id = int(prompt_dict[lang])
         if hasattr(self.joint, 'set_inference_lang_id'):
             self.joint.set_inference_lang_id(self._inference_prompt_id)
+        if hasattr(self.decoder, 'set_inference_lang_id'):
+            self.decoder.set_inference_lang_id(self._inference_prompt_id)
         logging.info(f"Inference language prompt set to '{lang}' (id={self._inference_prompt_id}).")
 
     def _fuse_prompt_into_encoded(self, encoded: torch.Tensor) -> torch.Tensor:
@@ -932,9 +949,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, prompt=prompt)
         del signal
 
-        # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
         lang_ids = self._prompt_to_lang_ids(prompt) if prompt is not None else None
+        # During training, loss must be computed, so decoder forward is necessary.
+        # Language ids keep the prediction network target-language aware at every token step.
+        decoder, target_length, states = self.decoder(
+            targets=transcript, target_length=transcript_len, lang_ids=lang_ids
+        )
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -1069,7 +1089,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
-                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+                decoder, target_length, states = self.decoder(
+                    targets=transcript, target_length=transcript_len, lang_ids=lang_ids
+                )
                 joint = self.joint(
                     encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len, lang_ids=lang_ids
                 )
@@ -1101,7 +1123,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             compute_wer = True
 
             if self.compute_eval_loss:
-                decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+                decoded, target_len, states = self.decoder(
+                    targets=transcript, target_length=transcript_len, lang_ids=lang_ids
+                )
             else:
                 decoded = None
                 target_len = transcript_len
@@ -1196,6 +1220,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             prompt_id = prompt_dict[target_lang]
             if hasattr(self.joint, 'set_inference_lang_id'):
                 self.joint.set_inference_lang_id(int(prompt_id))
+            if hasattr(self.decoder, 'set_inference_lang_id'):
+                self.decoder.set_inference_lang_id(int(prompt_id))
 
             processed_signal, processed_signal_length = self.preprocessor(input_signal=audio, length=audio_lens)
             time_length = processed_signal.shape[2]
@@ -1209,10 +1235,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length, prompt=prompt
             )
         else:
-            if hasattr(self.joint, 'set_inference_lang_id') and prompt is not None:
+            if prompt is not None:
                 lang_ids = self._prompt_to_lang_ids(prompt)
                 if lang_ids.unique().numel() == 1:
-                    self.joint.set_inference_lang_id(int(lang_ids[0].item()))
+                    prompt_id = int(lang_ids[0].item())
+                    if hasattr(self.joint, 'set_inference_lang_id'):
+                        self.joint.set_inference_lang_id(prompt_id)
+                    if hasattr(self.decoder, 'set_inference_lang_id'):
+                        self.decoder.set_inference_lang_id(prompt_id)
             encoded, encoded_len = self.forward(input_signal=audio, input_signal_length=audio_lens, prompt=prompt)
 
         return dict(encoded=encoded, encoded_len=encoded_len)

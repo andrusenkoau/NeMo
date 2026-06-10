@@ -9,6 +9,7 @@
 #   - model is the standard EncDecRNNTBPEModel, which enables language-prompt conditioning
 #     automatically when model.model_defaults.initialize_prompt_feature is set
 #   - a 1-hot language prompt is concatenated to the encoder output and projected back to enc_hidden
+#   - the same target-language id conditions the CHAT joint; decoder prompting is available as an option
 #   - datasets use Lhotse and emit the language prompt via LhotseSpeechToTextBpeDatasetWithPrompt
 #   - the language for each utterance is read from the manifest field given by `prompt_field` (default: target_lang)
 #
@@ -31,6 +32,9 @@ model:
     # ----- language prompt settings -----
     # Enables fusing the 1-hot language prompt into the encoder output via the prompt_kernel MLP.
     initialize_prompt_feature: true
+    # Optional: also condition the RNNT prediction network with the target-language id.
+    # Keep false to reproduce the previous encoder+joint prompting setup.
+    initialize_decoder_prompt_feature: false
     # Size of the 1-hot prompt vector. Keep larger than the number of supported languages so
     # new languages can be added without changing the model architecture.
     num_prompts: 128
@@ -224,6 +228,9 @@ model:
       pred_rnn_layers: 1
       t_max: null
       dropout: 0.2
+      # Optional: enables decoder language conditioning directly from config.
+      # Prefer model.model_defaults.initialize_decoder_prompt_feature for this prompt config.
+      # num_languages: ${model.model_defaults.num_prompts}
 
   joint:
     _target_: nemo.collections.asr.modules.RNNTAttJoint
