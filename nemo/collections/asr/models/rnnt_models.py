@@ -252,6 +252,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # logging.warning(f"prompt: {prompt}")
         
         encoded_t = encoded.transpose(1, 2)  # B*D*T -> B*T*D
+        prompt = prompt.to(dtype=encoded_t.dtype)
         if prompt.shape[1] > encoded_t.shape[1]:
             prompt = prompt[:, : encoded_t.shape[1], :]
         elif prompt.shape[1] < encoded_t.shape[1]:

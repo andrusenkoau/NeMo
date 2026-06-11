@@ -603,6 +603,7 @@ class ASRModuleMixin(ASRAdapterModelMixin):
         return_transcription: bool = True,
         return_log_probs: bool = False,
         bypass_pre_encode: bool = False,
+        prompt: Tensor = None,
     ):
         """
         It simulates a forward step with caching for streaming purposes.
@@ -619,6 +620,7 @@ class ASRModuleMixin(ASRAdapterModelMixin):
             drop_extra_pre_encoded: number of steps to drop from the beginning of the outputs after the downsampling module. This can be used if extra paddings are added on the left side of the input.
             return_transcription: whether to decode and return the transcriptions. It can not get disabled for Transducer models.
             return_log_probs: whether to return the log probs, only valid for ctc model
+            prompt: optional prompt tensor for prompt-conditioned models.
 
         Returns:
             greedy_predictions: the greedy predictions from the decoder
@@ -660,6 +662,11 @@ class ASRModuleMixin(ASRAdapterModelMixin):
             drop_extra_pre_encoded=drop_extra_pre_encoded,
             bypass_pre_encode=bypass_pre_encode,
         )
+
+        if getattr(self, "use_prompt", False) and prompt is not None:
+            if not hasattr(self, "_apply_prompt"):
+                raise NotImplementedError("Prompt-conditioned streaming requires the model to implement _apply_prompt().")
+            encoded = self._apply_prompt(encoded, prompt)
 
         if isinstance(self, asr_models.EncDecCTCModel) or (
             isinstance(self, asr_models.EncDecHybridRNNTCTCModel) and self.cur_decoder == "ctc"
