@@ -246,8 +246,8 @@ def compute_fscore(
                     else:
                         item_ref.append((word, idx - 1))
                 if len(item_ref) == ngram_order:
-                    phrase_ref = " ".join([item[0] for item in item_ref])
-                    phrase_hyp = " ".join([ali[item[1]][1] for item in item_ref])
+                    phrase_ref = " ".join([wr[0] for wr in item_ref])
+                    phrase_hyp = " ".join([ali[wr[1]][1] for wr in item_ref])
                     if phrase_ref in sample_kw_set:
                         key_words_stat[phrase_ref][1] += 1  # add to gt
                         if phrase_ref == phrase_hyp:
@@ -267,8 +267,8 @@ def compute_fscore(
                     else:
                         item_hyp.append((word, idx - 1))
                 if len(item_hyp) == ngram_order:
-                    phrase_hyp = " ".join([item[0] for item in item_hyp])
-                    phrase_ref = " ".join([ali[item[1]][0] for item in item_hyp])
+                    phrase_hyp = " ".join([wh[0] for wh in item_hyp])
+                    phrase_ref = " ".join([ali[wh[1]][0] for wh in item_hyp])
                     if phrase_hyp in sample_kw_set and phrase_hyp != phrase_ref:
                         key_words_stat[phrase_hyp][2] += 1  # add to fp
 
@@ -280,21 +280,19 @@ def compute_fscore(
     recall = tp / (gt + 1e-8)
     fscore = 2 * (precision * recall) / (precision + recall + 1e-8)
 
-    active_words = [x for x in key_words_stat if key_words_stat[x][1] > 0 or key_words_stat[x][2] > 0]
     if print_stats:
+        active_words = [x for x in key_words_stat if key_words_stat[x][1] > 0 or key_words_stat[x][2] > 0]
+        max_len = max(len(x) for x in active_words) if active_words else 0
         logging.info("=" * 60)
         logging.info("Per words statistic (word: correct/totall | false positive):\n")
-    max_len = max(len(x) for x in active_words) if active_words else 0
-    for word in all_key_words_list:
-        if key_words_stat[word][1] > 0 or key_words_stat[word][2] > 0:
-            false_positive = ""
-            if key_words_stat[word][2] > 0:
-                false_positive = key_words_stat[word][2]
-            if print_stats:
+        for word in all_key_words_list:
+            if key_words_stat[word][1] > 0 or key_words_stat[word][2] > 0:
+                false_positive = ""
+                if key_words_stat[word][2] > 0:
+                    false_positive = key_words_stat[word][2]
                 logging.info(
                     f"{word:>{max_len}}: {key_words_stat[word][0]:3}/{key_words_stat[word][1]:<3} |{false_positive:>3}"
                 )
-    if print_stats:
         logging.info("=" * 60)
         logging.info("=" * 60)
         logging.info(f"Precision: {precision:.4f} ({tp}/{tp + fp}) fp:{fp}")
