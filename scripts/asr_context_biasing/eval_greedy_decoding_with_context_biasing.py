@@ -255,7 +255,9 @@ def decoding_step(
                     'wer': f"{wer_dist/len(target_split_w):.4f}",
                 }
                 if per_sample_phrases:
-                    item['context_words'] = ",".join(per_sample_phrases[batch_idx])
+                    item['context_words'] = ",".join(
+                        p.split("_")[0] for p in per_sample_phrases[batch_idx]
+                    )
                 print(json.dumps(item), file=out_manifest)
         out_manifest.close()
 
@@ -336,7 +338,9 @@ def decoding_step(
                         'alignment': f"{alignment}",
                     }
                     if per_sample_phrases:
-                        item['context_words'] = ",".join(per_sample_phrases[sample_idx + beams_idx])
+                        item['context_words'] = ",".join(
+                            p.split("_")[0] for p in per_sample_phrases[sample_idx + beams_idx]
+                        )
                     print(json.dumps(item), file=out_manifest)
 
             sample_idx += len(probs_batch)
@@ -518,8 +522,14 @@ def main(cfg: EvalContextBiasingConfig):
             if phrases and cfg.apply_context_biasing:
                 sample_transcripts = []
                 for phrase in phrases:
-                    word_tokenization = [ws_tokenizer.text_to_ids(phrase.lower())]
-                    sample_transcripts.append([phrase, word_tokenization])
+                    parts = phrase.split(cfg.spelling_separator)
+                    word = parts[0]
+                    if len(parts) > 1:
+                        spellings = parts[1:]
+                    else:
+                        spellings = [word.lower()]
+                    word_tokenization = [ws_tokenizer.text_to_ids(s) for s in spellings]
+                    sample_transcripts.append([word, word_tokenization])
                 graph = context_biasing.ContextGraphCTC(blank_id=blank_idx)
                 graph.add_to_graph(sample_transcripts)
                 context_graph.append(graph)

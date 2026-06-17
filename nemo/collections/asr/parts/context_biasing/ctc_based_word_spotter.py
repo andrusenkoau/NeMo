@@ -110,40 +110,37 @@ def find_best_hyps(spotted_words: List[WSHyp], intersection_threshold: int = 10)
     If hypotheses intersection is greater than intersection_threshold,
     then the function leaves only the best hypothesis according to the score.
 
+    Approach: sort by score (descending), greedily accept the best-scoring hyp first,
+    then skip any subsequent hyp that overlaps with an already-accepted one.
+
     Args:
         spotted_words: list of spotter hypotheses WSHyp
         intersection_threshold: minimal intersection threshold (in percentages)
 
     Returns:
-        list of best hyps without intersection
+        list of best hyps without intersection, sorted by start_frame
     """
+    if not spotted_words:
+        return []
 
-    hyp_intervals_dict = {}
-    for hyp in spotted_words:
+    sorted_hyps = sorted(spotted_words, key=lambda h: h.score, reverse=True)
+    accepted = []
+    accepted_intervals = []
+
+    for hyp in sorted_hyps:
         hyp_interval = set(range(hyp.start_frame, hyp.end_frame + 1))
-        h_interval_name = f"{hyp.start_frame}_{hyp.end_frame}"
-        insert_new_hyp = True
-
-        # check hyp intersection with all the elements in hyp_intervals_dict
-        for h_interval_key in hyp_intervals_dict:
-            # get left and right interval values
-            l, r = int(h_interval_key.split("_")[0]), int(h_interval_key.split("_")[1])
-            current_dict_interval = set(range(l, r + 1))
-            intersection_part = 100 / len(current_dict_interval) * len(hyp_interval & current_dict_interval)
-            # in case of intersection:
+        overlaps = False
+        for acc_interval in accepted_intervals:
+            intersection_part = 100 / len(acc_interval) * len(hyp_interval & acc_interval)
             if intersection_part >= intersection_threshold:
-                if hyp.score > hyp_intervals_dict[h_interval_key].score:
-                    hyp_intervals_dict.pop(h_interval_key)
-                    insert_new_hyp = True
-                    break
-                else:
-                    insert_new_hyp = False
-        if insert_new_hyp:
-            hyp_intervals_dict[h_interval_name] = hyp
+                overlaps = True
+                break
+        if not overlaps:
+            accepted.append(hyp)
+            accepted_intervals.append(hyp_interval)
 
-    best_hyp_list = [hyp_intervals_dict[h_interval_key] for h_interval_key in hyp_intervals_dict]
-
-    return best_hyp_list
+    accepted.sort(key=lambda h: h.start_frame)
+    return accepted
 
 
 def get_ctc_word_alignment(
@@ -169,14 +166,14 @@ def get_ctc_word_alignment(
     token_alignment = []
     prev_idx = None
     for i, idx in enumerate(alignment_ctc):
-        token_logprob = 0
         if idx != blank_idx:
             token = asr_model.tokenizer.ids_to_tokens([int(idx)])[0]
             if idx == prev_idx:
-                prev_repited_token = token_alignment.pop()
-                token_logprob += prev_repited_token[2]
-            token_logprob += logprob[i, idx].item()
-            token_alignment.append((token, i, token_logprob))
+                prev_repeated_token = token_alignment.pop()
+                token_logprob = prev_repeated_token[2] + logprob[i, idx].item()
+                token_alignment.append((token, prev_repeated_token[1], token_logprob))
+            else:
+                token_alignment.append((token, i, logprob[i, idx].item()))
         prev_idx = idx
 
     # get word level alignment
@@ -186,7 +183,7 @@ def get_ctc_word_alignment(
     l, r, score = None, None, None
     for item in token_alignment:
         if not word:
-            if word.startswith(begin_of_word):
+            if item[0].startswith(begin_of_word):
                 word = item[0][1:]
             else:
                 word = item[0][:]
@@ -232,6 +229,7 @@ def filter_wb_hyps(best_hyp_list: List[WSHyp], word_alignment: List[tuple]) -> L
     if not word_alignment:
         return best_hyp_list
 
+    best_hyp_list = sorted(best_hyp_list, key=lambda h: h.start_frame)
     best_hyp_list_filtered = []
     current_word_in_ali = 0
     for hyp in best_hyp_list:
@@ -273,7 +271,7 @@ def run_word_spotter(
     ctc_ali_token_weight: float = 0.5,
     keyword_threshold: float = -5.0,
     blank_threshold: float = 0.8,
-    non_blank_threshold: float = 0.001,
+    non_blank_threshold: float = 0.000001,
 ):
     """
     CTC-based Word Spotter for recognition of words from context biasing graph (paper link)
@@ -324,7 +322,7 @@ def run_word_spotter(
                     current_score = token.score + logprobs[frame][int(transition_state)].item() + cb_weight
                 else:
                     current_score = token.score + logprobs[frame][int(transition_state)].item()
-                if not best_score:
+                if best_score is None:
                     best_score = current_score
                 else:
                     if current_score < best_score - beam_threshold:
@@ -342,7 +340,7 @@ def run_word_spotter(
                     )
                     # check case when the current state is the last in the branch (only one self-loop transition)
                     if len(new_token.state.next) == 1:
-                        if current_score is best_score:
+                        if current_score == best_score:
                             best_score = None
                         continue
                 next_tokens.append(new_token)
