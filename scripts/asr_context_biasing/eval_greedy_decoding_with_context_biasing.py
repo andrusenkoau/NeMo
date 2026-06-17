@@ -14,8 +14,10 @@
 #
 
 """
-# This script evaluates CTC and Transducer (RNNT) models (only Hybrid Transducer-CTC in case of Transducer) in context biasing mode
-# by applying CTC-based Word Spotter (paper link) 
+# This script evaluates CTC and Transducer (RNNT) models in context biasing mode
+# by applying CTC-based Word Spotter (paper link).
+# Supports: (1) Hybrid Transducer-CTC model, (2) pure CTC model,
+# (3) separate CTC + RNNT models (CTC for word spotting, RNNT for decoding).
 
 # Config Help
 
@@ -25,8 +27,9 @@ python eval_greedy_decoding_with_context_biasing.py --cfg job
 
 # USAGE
 
+# Hybrid model (single model with CTC and RNNT heads):
 python eval_greedy_decoding_with_context_biasing.py \
-            nemo_model_file=<path to the .nemo file of the model> \
+            nemo_model_file=<path to the hybrid .nemo model> \
             input_manifest=<path to the evaluation JSON manifest file \
             preds_output_folder=<folder to store the predictions> \
             decoder_type=<type of model decoder [ctc or rnnt]> \
@@ -36,6 +39,13 @@ python eval_greedy_decoding_with_context_biasing.py \
             beam_threshold=[<list of the beam thresholds, separated with commas>] \
             context_score=[<list of the context scores, separated with commas>] \
             ctc_ali_token_weight=[<list of the ctc alignment token weights, separated with commas>] \
+            ...
+
+# Separate CTC + RNNT models:
+python eval_greedy_decoding_with_context_biasing.py \
+            nemo_model_file=<path to the RNNT .nemo model> \
+            ctc_nemo_model_file=<path to the CTC .nemo model for word spotting> \
+            decoder_type=rnnt \
             ...
 
 # Description of context biasing graph:
@@ -79,7 +89,7 @@ from sklearn.model_selection import ParameterGrid
 from tqdm.auto import tqdm
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.models import EncDecCTCModelBPE, EncDecHybridRNNTCTCModel
+from nemo.collections.asr.models import EncDecCTCModelBPE, EncDecHybridRNNTCTCModel, EncDecRNNTBPEModel
 from nemo.collections.asr.parts import context_biasing
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -91,8 +101,10 @@ class EvalContextBiasingConfig:
     Evaluate CTC and Transducer (RNNT) ASR models in greedy decoding with context biasing.
     """
 
-    # # The path of the '.nemo' file of the ASR model or the name of a pretrained model (ngc / huggingface)
+    # The path of the '.nemo' file of the ASR model or the name of a pretrained model (ngc / huggingface)
     nemo_model_file: str = MISSING
+    # Optional separate CTC model for word spotting (when using a non-hybrid RNNT model)
+    ctc_nemo_model_file: Optional[str] = None
 
     # File paths
     input_manifest: str = MISSING  # The manifest file of the evaluation set
@@ -108,8 +120,11 @@ class EvalContextBiasingConfig:
 
     # Context-Biasing params
     apply_context_biasing: bool = False  # True in case of context biasing
-    context_file: str = MISSING  # text file with context biasing words and their spellings
+    context_file: Optional[str] = None  # text file with context biasing words and their spellings
     spelling_separator: str = "_"  # separator between word and its spellings in context biasing file
+    # Per-stream context biasing: each sample has its own keyword list from the manifest
+    use_per_stream_context: bool = False
+    context_field: str = "biasing_request.boosting_model_cfg.key_phrases_list"  # manifest field with per-sample phrases
     beam_threshold: list[float] = field(default_factory=lambda: [5.0])  # beam pruning threshold for ctc-ws decoding
     context_score: list[float] = field(default_factory=lambda: [3.0])  # per token weight for context biasing words
     ctc_ali_token_weight: list[float] = field(
@@ -134,10 +149,14 @@ def decoding_step(
     preds_output_manifest: str,
     beam_batch_size: int = 128,
     progress_bar: bool = True,
-    context_graph: context_biasing.ContextGraphCTC = None,
+    context_graph=None,
     blank_idx: int = 0,
     hp: Optional[Dict] = None,
+    ctc_model: nemo_asr.models.ASRModel = None,
+    per_sample_phrases: list[list[str]] = None,
 ) -> tuple[float, float]:
+
+    ws_model = ctc_model if ctc_model is not None else asr_model
 
     # run CTC-based Word Spotter:
     if cfg.apply_context_biasing:
@@ -145,10 +164,14 @@ def decoding_step(
         for idx, logits in tqdm(
             enumerate(ctc_logprobs), desc=f"Eval CTC-based Word Spotter...", ncols=120, total=len(ctc_logprobs)
         ):
+            sample_graph = context_graph[idx] if isinstance(context_graph, list) else context_graph
+            if sample_graph is None:
+                ws_results[audio_file_paths[idx]] = []
+                continue
             ws_results[audio_file_paths[idx]] = context_biasing.run_word_spotter(
                 logits,
-                context_graph,
-                asr_model,
+                sample_graph,
+                ws_model,
                 blank_idx=blank_idx,
                 beam_threshold=hp['beam_threshold'],
                 cb_weight=hp['context_score'],
@@ -231,6 +254,8 @@ def decoding_step(
                     'pred_text': pred_text,
                     'wer': f"{wer_dist/len(target_split_w):.4f}",
                 }
+                if per_sample_phrases:
+                    item['context_words'] = ",".join(per_sample_phrases[batch_idx])
                 print(json.dumps(item), file=out_manifest)
         out_manifest.close()
 
@@ -310,6 +335,8 @@ def decoding_step(
                         'wer': f"{wer_dist_tosave/len(target_split_w):.3f}",
                         'alignment': f"{alignment}",
                     }
+                    if per_sample_phrases:
+                        item['context_words'] = ",".join(per_sample_phrases[sample_idx + beams_idx])
                     print(json.dumps(item), file=out_manifest)
 
             sample_idx += len(probs_batch)
@@ -324,29 +351,46 @@ def main(cfg: EvalContextBiasingConfig):
         cfg = OmegaConf.structured(cfg)
 
     assert os.path.isfile(cfg.input_manifest), f"input_manifest {cfg.input_manifest} does not exist"
-    assert cfg.context_file, "context_file must be provided for f-score computation"
-    assert os.path.isfile(cfg.context_file), f"context_file {cfg.context_file} does not exist"
     assert cfg.decoder_type in ["ctc", "rnnt"], "decoder_type must be ctc or rnnt"
     assert cfg.preds_output_folder, "preds_output_folder must be provided"
     assert os.path.isdir(cfg.preds_output_folder), f"preds_output_folder {cfg.preds_output_folder} does not exist"
+    if not cfg.use_per_stream_context:
+        assert cfg.context_file, "context_file must be provided (or use use_per_stream_context=true)"
+        assert os.path.isfile(cfg.context_file), f"context_file {cfg.context_file} does not exist"
+
+    def _load_model(model_path):
+        if model_path.endswith('.nemo'):
+            return nemo_asr.models.ASRModel.restore_from(model_path, map_location=torch.device(cfg.device))
+        else:
+            logging.warning(
+                f"{model_path} does not end with .nemo, therefore trying to load a pretrained model with this name."
+            )
+            return nemo_asr.models.ASRModel.from_pretrained(model_path, map_location=torch.device(cfg.device))
 
     # load nemo asr model
-    if cfg.nemo_model_file.endswith('.nemo'):
-        asr_model = nemo_asr.models.ASRModel.restore_from(cfg.nemo_model_file, map_location=torch.device(cfg.device))
+    asr_model = _load_model(cfg.nemo_model_file)
+
+    # load separate CTC model for word spotting if provided
+    ctc_model = None
+    if cfg.ctc_nemo_model_file:
+        assert cfg.decoder_type == "rnnt", "ctc_nemo_model_file is only supported with decoder_type=rnnt"
+        ctc_model = _load_model(cfg.ctc_nemo_model_file)
+        if not isinstance(ctc_model, (EncDecCTCModelBPE, EncDecHybridRNNTCTCModel)):
+            raise ValueError("CTC model (ctc_nemo_model_file) must be EncDecCTCModelBPE or EncDecHybridRNNTCTCModel")
+        if not isinstance(asr_model, (EncDecRNNTBPEModel, EncDecHybridRNNTCTCModel)):
+            raise ValueError(
+                "When using separate CTC model, the main model (nemo_model_file) must be an RNNT model"
+            )
     else:
-        logging.warning(
-            "nemo_model_file does not end with .nemo, therefore trying to load a pretrained model with this name."
-        )
-        asr_model = nemo_asr.models.ASRModel.from_pretrained(
-            cfg.nemo_model_file, map_location=torch.device(cfg.device)
-        )
-    if not isinstance(asr_model, (EncDecCTCModelBPE, EncDecHybridRNNTCTCModel)):
-        raise ValueError("ASR model must be CTC BPE or Hybrid Transducer-CTC")
+        if not isinstance(asr_model, (EncDecCTCModelBPE, EncDecHybridRNNTCTCModel)):
+            raise ValueError("ASR model must be CTC BPE or Hybrid Transducer-CTC")
 
     # load nemo manifest
     target_transcripts = []
     durations = []
+    per_sample_phrases = []
     manifest_dir = Path(cfg.input_manifest).parent
+    field_path = cfg.context_field.split(".") if cfg.use_per_stream_context else None
     with open(cfg.input_manifest, 'r', encoding='utf_8') as manifest_file:
         audio_file_paths = []
         for line in tqdm(manifest_file, desc=f"Reading Manifest {cfg.input_manifest} ...", ncols=120):
@@ -357,68 +401,141 @@ def main(cfg: EvalContextBiasingConfig):
             target_transcripts.append(data['text'])
             durations.append(data['duration'])
             audio_file_paths.append(str(audio_file.absolute()))
+            if field_path is not None:
+                val = data
+                for key in field_path:
+                    val = val.get(key, []) if isinstance(val, dict) else []
+                if isinstance(val, str):
+                    phrases = [p.strip() for p in val.split(",") if p.strip()]
+                elif isinstance(val, list):
+                    phrases = [str(p).strip() for p in val if str(p).strip()]
+                else:
+                    phrases = []
+                per_sample_phrases.append(phrases)
+
+    def _run_encoder_with_dataloader(model, audio_file_paths, desc="Getting encoder outputs..."):
+        """Run model's encoder via a temporary dataloader, return per-sample encoder outputs and lengths."""
+        outputs = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
+                for audio_file in audio_file_paths:
+                    entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
+                    fp.write(json.dumps(entry) + '\n')
+            config = {
+                'paths2audio_files': audio_file_paths,
+                'batch_size': cfg.acoustic_batch_size,
+                'temp_dir': tmpdir,
+                'num_workers': cfg.num_workers,
+                'channel_selector': None,
+                'augmentor': None,
+            }
+            temporary_datalayer = model._setup_transcribe_dataloader(config)
+            dev = next(model.parameters()).device
+            for test_batch in tqdm(temporary_datalayer, desc=desc, disable=False):
+                encoded, encoded_len = model.forward(
+                    input_signal=test_batch[0].to(dev), input_signal_length=test_batch[1].to(dev)
+                )
+                for idx in range(encoded.shape[0]):
+                    outputs.append((encoded[idx, :, : encoded_len[idx]], encoded_len[idx]))
+        return outputs
 
     # manual calculation of encoder_embeddings
-    with torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp):
-        with torch.no_grad():
-            asr_model.eval()
-            asr_model.encoder.freeze()
-            device = next(asr_model.parameters()).device
-            encoder_outputs = []
-            ctc_logprobs = []
-            if isinstance(asr_model, EncDecCTCModelBPE):
-                # in case of EncDecCTCModelBPE
+    encoder_outputs = []
+    ctc_logprobs = []
+
+    if ctc_model is not None:
+        # Two-model mode: separate CTC model for word spotting + RNNT model for decoding
+        logging.info("Using separate CTC model for word spotting")
+
+        # CTC model: get CTC logprobs
+        with torch.amp.autocast(ctc_model.device.type, enabled=cfg.use_amp):
+            with torch.no_grad():
+                ctc_model.eval()
+                ctc_model.encoder.freeze()
+                if isinstance(ctc_model, EncDecCTCModelBPE):
+                    hyp_results = ctc_model.transcribe(
+                        audio_file_paths, batch_size=cfg.acoustic_batch_size, return_hypotheses=True
+                    )
+                    ctc_logprobs = [hyp.alignments.cpu().numpy() for hyp in hyp_results]
+                    blank_idx = ctc_model.decoding.blank_id
+                else:
+                    ctc_enc_outputs = _run_encoder_with_dataloader(
+                        ctc_model, audio_file_paths, desc="Getting CTC encoder and decoder outputs..."
+                    )
+                    for encoded_no_pad, _ in ctc_enc_outputs:
+                        ctc_dec_output = ctc_model.ctc_decoder(encoder_output=encoded_no_pad.unsqueeze(0)).cpu()
+                        ctc_logprobs.append(ctc_dec_output.squeeze(0).numpy())
+                    blank_idx = ctc_model.decoder.blank_idx
+
+        # RNNT model: get encoder outputs
+        with torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp):
+            with torch.no_grad():
+                asr_model.eval()
+                asr_model.encoder.freeze()
+                device = next(asr_model.parameters()).device
+                rnnt_enc_outputs = _run_encoder_with_dataloader(
+                    asr_model, audio_file_paths, desc="Getting RNNT encoder outputs..."
+                )
+                encoder_outputs = [enc for enc, _ in rnnt_enc_outputs]
+
+    elif isinstance(asr_model, EncDecCTCModelBPE):
+        # Single CTC model
+        with torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp):
+            with torch.no_grad():
+                asr_model.eval()
+                asr_model.encoder.freeze()
                 hyp_results = asr_model.transcribe(
                     audio_file_paths, batch_size=cfg.acoustic_batch_size, return_hypotheses=True
                 )
                 ctc_logprobs = [hyp.alignments.cpu().numpy() for hyp in hyp_results]
                 blank_idx = asr_model.decoding.blank_id
-            else:
-                # in case of EncDecHybridRNNTCTCModel
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
-                        for audio_file in audio_file_paths:
-                            entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
-                            fp.write(json.dumps(entry) + '\n')
-                    config = {
-                        'paths2audio_files': audio_file_paths,
-                        'batch_size': cfg.acoustic_batch_size,
-                        'temp_dir': tmpdir,
-                        'num_workers': cfg.num_workers,
-                        'channel_selector': None,
-                        'augmentor': None,
-                    }
-                    temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
 
-                    for test_batch in tqdm(
-                        temporary_datalayer, desc="Getting encoder and CTC decoder outputs...", disable=False
-                    ):
-                        encoded, encoded_len = asr_model.forward(
-                            input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
-                        )
-                        ctc_dec_outputs = asr_model.ctc_decoder(encoder_output=encoded).cpu()
-                        # dump encoder embeddings per file
-                        for idx in range(encoded.shape[0]):
-                            encoded_no_pad = encoded[idx, :, : encoded_len[idx]]
-                            ctc_dec_outputs_no_pad = ctc_dec_outputs[idx, : encoded_len[idx]]
-                            encoder_outputs.append(encoded_no_pad)
-                            ctc_logprobs.append(ctc_dec_outputs_no_pad.cpu().numpy())
-                    blank_idx = asr_model.decoder.blank_idx
-
-    # load context biasing words
-    context_transcripts = []
-    for line in open(cfg.context_file).readlines():
-        item = line.strip().lower().split(cfg.spelling_separator)
-        word = item[0]
-        word_tokenization = [asr_model.tokenizer.text_to_ids(x) for x in item[1:]]
-        context_transcripts.append([word, word_tokenization])
-    context_words = [item[0] for item in context_transcripts]
-    # build context graph:
-    if cfg.apply_context_biasing:
-        context_graph = context_biasing.ContextGraphCTC(blank_id=blank_idx)
-        context_graph.add_to_graph(context_transcripts)
     else:
-        context_graph = None
+        # Single hybrid model (EncDecHybridRNNTCTCModel)
+        with torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp):
+            with torch.no_grad():
+                asr_model.eval()
+                asr_model.encoder.freeze()
+                device = next(asr_model.parameters()).device
+                enc_ctc_outputs = _run_encoder_with_dataloader(
+                    asr_model, audio_file_paths, desc="Getting encoder and CTC decoder outputs..."
+                )
+                for encoded_no_pad, _ in enc_ctc_outputs:
+                    ctc_dec_output = asr_model.ctc_decoder(encoder_output=encoded_no_pad.unsqueeze(0)).cpu()
+                    encoder_outputs.append(encoded_no_pad)
+                    ctc_logprobs.append(ctc_dec_output.squeeze(0).numpy())
+                blank_idx = asr_model.decoder.blank_idx
+
+    # load context biasing words (use CTC model's tokenizer for context graph)
+    ws_tokenizer = ctc_model.tokenizer if ctc_model is not None else asr_model.tokenizer
+    context_words = None
+    context_graph = None
+
+    if cfg.use_per_stream_context:
+        # per-stream mode: build a separate context graph per sample
+        context_graph = []
+        for phrases in per_sample_phrases:
+            if phrases and cfg.apply_context_biasing:
+                sample_transcripts = []
+                for phrase in phrases:
+                    word_tokenization = [ws_tokenizer.text_to_ids(phrase.lower())]
+                    sample_transcripts.append([phrase, word_tokenization])
+                graph = context_biasing.ContextGraphCTC(blank_id=blank_idx)
+                graph.add_to_graph(sample_transcripts)
+                context_graph.append(graph)
+            else:
+                context_graph.append(None)
+    else:
+        context_transcripts = []
+        for line in open(cfg.context_file).readlines():
+            item = line.strip().lower().split(cfg.spelling_separator)
+            word = item[0]
+            word_tokenization = [ws_tokenizer.text_to_ids(x) for x in item[1:]]
+            context_transcripts.append([word, word_tokenization])
+        context_words = [item[0] for item in context_transcripts]
+        if cfg.apply_context_biasing:
+            context_graph = context_biasing.ContextGraphCTC(blank_id=blank_idx)
+            context_graph.add_to_graph(context_transcripts)
 
     # sort encoder_outputs according to length:
     if cfg.decoder_type == "rnnt" and cfg.sort_logits:
@@ -428,17 +545,27 @@ def main(cfg: EvalContextBiasingConfig):
         audio_file_paths_sorted = []
         durations_sorted = []
         ctc_logprobs_sorted = []
+        per_sample_phrases_sorted = []
+        context_graph_sorted = []
         for pair in encoder_outputs_with_indeces:
             encoder_outputs_sorted.append(pair[1])
             target_transcripts_sorted.append(target_transcripts[pair[0]])
             audio_file_paths_sorted.append(audio_file_paths[pair[0]])
             durations_sorted.append(durations[pair[0]])
             ctc_logprobs_sorted.append(ctc_logprobs[pair[0]])
+            if per_sample_phrases:
+                per_sample_phrases_sorted.append(per_sample_phrases[pair[0]])
+            if isinstance(context_graph, list):
+                context_graph_sorted.append(context_graph[pair[0]])
         encoder_outputs = encoder_outputs_sorted
         target_transcripts = target_transcripts_sorted
         audio_file_paths = audio_file_paths_sorted
         durations = durations_sorted
         ctc_logprobs = ctc_logprobs_sorted
+        if per_sample_phrases:
+            per_sample_phrases = per_sample_phrases_sorted
+        if isinstance(context_graph, list):
+            context_graph = context_graph_sorted
 
     # setup search parameters grid
     params = {
@@ -455,6 +582,8 @@ def main(cfg: EvalContextBiasingConfig):
     logging.info(f"======================================================================")
 
     asr_model = asr_model.to('cpu')
+    if ctc_model is not None:
+        ctc_model = ctc_model.to('cpu')
     best_wer = 1e6
 
     # run decoding step for each hyper parameter set
@@ -475,10 +604,15 @@ def main(cfg: EvalContextBiasingConfig):
             ctc_logprobs=ctc_logprobs,
             blank_idx=blank_idx,
             hp=hp,
+            ctc_model=ctc_model,
+            per_sample_phrases=per_sample_phrases if cfg.use_per_stream_context else None,
         )
 
         # compute fscore
-        fscore_stats = context_biasing.compute_fscore(preds_output_manifest, context_words)
+        if cfg.use_per_stream_context:
+            fscore_stats = context_biasing.compute_fscore(preds_output_manifest, key_words_field="context_words")
+        else:
+            fscore_stats = context_biasing.compute_fscore(preds_output_manifest, key_words_list=context_words)
 
         # find the best wer value
         if candidate_wer < best_wer:
