@@ -46,7 +46,7 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, LabelsType, NeuralType, SpectrogramType
 from nemo.utils import logging
 
 
@@ -59,6 +59,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.world_size = 1
         if trainer is not None:
             self.world_size = trainer.world_size
+
+        # Must be set before super().__init__() because ModelPT triggers setup_training_data
+        # which calls _setup_dataloader_from_config that checks this flag.
+        self.use_prompt = cfg.get('model_defaults', {}).get('initialize_prompt_feature', False)
 
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -137,6 +141,58 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
+
+        # Setup prompt conditioning (lang ID injection post-encoder)
+        self.use_prompt = self.cfg.model_defaults.get('initialize_prompt_feature', False)
+        if self.use_prompt:
+            self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
+            prompt_dict = self.cfg.model_defaults.get('prompt_dictionary', None)
+            if prompt_dict is None:
+                raise ValueError("prompt_dictionary must be provided in model_defaults when initialize_prompt_feature=True")
+            self.prompt_dictionary = prompt_dict
+
+            enc_hidden = self.cfg.model_defaults.enc_hidden
+            self.prompt_kernel = torch.nn.Sequential(
+                torch.nn.Linear(self.num_prompts + enc_hidden, enc_hidden * 2),
+                torch.nn.ReLU(),
+                torch.nn.Linear(enc_hidden * 2, enc_hidden),
+            )
+            logging.info(
+                f"Prompt conditioning enabled: num_prompts={self.num_prompts}, "
+                f"languages={list(self.prompt_dictionary.keys())}"
+            )
+
+
+    def _apply_prompt(self, encoded: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
+        """
+        Apply prompt conditioning to encoder output via concatenation + projection.
+
+        Args:
+            encoded: Encoder output of shape (B, D, T).
+            prompt: One-hot prompt tensor of shape (B, T, num_prompts).
+
+        Returns:
+            Prompt-conditioned encoder output of shape (B, D, T).
+        """
+        # logging.warning(f"encoded shape: {encoded.shape}, prompt shape: {prompt.shape}")
+        # logging.warning(f"prompt: {prompt}")
+        
+        encoded_t = encoded.transpose(1, 2)  # B*D*T -> B*T*D
+        if prompt.shape[1] > encoded_t.shape[1]:
+            prompt = prompt[:, : encoded_t.shape[1], :]
+        elif prompt.shape[1] < encoded_t.shape[1]:
+            pad = torch.zeros(
+                prompt.shape[0],
+                encoded_t.shape[1] - prompt.shape[1],
+                prompt.shape[2],
+                device=prompt.device,
+                dtype=prompt.dtype,
+            )
+            prompt = torch.cat([prompt, pad], dim=1)
+        out_dtype = encoded_t.dtype
+        concat_states = torch.cat([encoded_t, prompt], dim=-1)
+        encoded_t = self.prompt_kernel(concat_states).to(out_dtype)
+        return encoded_t.transpose(1, 2)  # B*T*D -> B*D*T
 
     def setup_optim_normalization(self):
         """
@@ -649,12 +705,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             input_signal_eltype = AudioSignal()
 
-        return {
+        types = {
             "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
+        if getattr(self, 'use_prompt', False):
+            types["prompt"] = NeuralType(('B', 'T', 'D'), LabelsType(), optional=True)
+        return types
+
+        # return {
+        #     "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
+        #     "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+        #     "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
+        #     "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+        # }
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -665,7 +731,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+        prompt=None,
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -689,6 +760,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 of shape (B, D, T) that has undergone processing via some DALI preprocessor.
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
+            prompt: Optional tensor of shape (B, T, num_prompts) with one-hot language/task prompt.
+                When provided and use_prompt=True, it is concatenated with encoder output and projected
+                back to encoder dimension via prompt_kernel.
 
         Returns:
             A tuple of 2 elements -
@@ -714,6 +788,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        if self.use_prompt and prompt is not None:
+            encoded = self._apply_prompt(encoded, prompt)
+
         return encoded, encoded_len
 
     # PTL-specific methods

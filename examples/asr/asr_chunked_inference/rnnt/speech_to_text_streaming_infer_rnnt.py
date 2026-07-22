@@ -71,6 +71,7 @@ import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import math
 
 from nemo.collections.asr.models import EncDecHybridRNNTCTCModel, EncDecRNNTModel
 from nemo.collections.asr.parts.context_biasing.biasing_multi_model import BiasingRequestItemConfig
@@ -141,6 +142,10 @@ class TranscriptionConfig:
     att_context_size_as_chunk: bool = (
         True  # whether to use the att_context_size as chunk size (important for extra-low latency)
     )
+
+    # Prompt conditioning: target language for models with lang ID prompt (e.g. "en", "de").
+    # Ignored for models without prompt support.
+    target_lang: Optional[str] = None
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
     # device anyway, and do inference on CPU only if CUDA device is not found.
@@ -393,6 +398,27 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         in_order=True,
     )
 
+    # Prompt conditioning setup
+    use_prompt = getattr(asr_model, 'use_prompt', False)
+    prompt_id = None
+    if use_prompt and cfg.target_lang is not None:
+        prompt_dict = asr_model.prompt_dictionary
+        prompt_id = prompt_dict.get(cfg.target_lang)
+        if prompt_id is None:
+            prompt_id = prompt_dict.get("unk")
+        if prompt_id is None:
+            available = list(prompt_dict.keys())[:10]
+            raise ValueError(
+                f"Unknown target_lang='{cfg.target_lang}' and no 'unk' fallback in prompt_dictionary. "
+                f"Available: {available}{'...' if len(prompt_dict) > 10 else ''}"
+            )
+        logging.info(f"Prompt conditioning enabled: target_lang='{cfg.target_lang}' -> prompt_id={prompt_id}")
+    elif use_prompt and cfg.target_lang is None:
+        logging.warning(
+            "Model supports prompt conditioning but target_lang is not set. "
+            "Running without language prompt — may produce suboptimal results."
+        )
+
     timer = SimpleTimer()
     with torch.no_grad(), torch.inference_mode():
         all_hyps = []
@@ -460,11 +486,29 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     is_last_chunk_batch=is_last_chunk_batch,
                 )
 
+                # # get encoder output using full buffer [left-chunk-right]
+                # encoder_output, encoder_output_len = asr_model(
+                #     input_signal=buffer.samples,
+                #     input_signal_length=buffer.context_size_batch.total(),
+                # )
+
                 # get encoder output using full buffer [left-chunk-right]
-                encoder_output, encoder_output_len = asr_model(
+                forward_kwargs = dict(
                     input_signal=buffer.samples,
                     input_signal_length=buffer.context_size_batch.total(),
                 )
+                if prompt_id is not None:
+                    input_time = buffer.samples.shape[1]
+                    hidden_length = math.ceil(input_time / (features_frame2audio_samples * encoder_subsampling_factor))
+                    prompt_tensor = torch.zeros(
+                        batch_size, hidden_length, asr_model.num_prompts,
+                        dtype=compute_dtype, device=device,
+                    )
+                    prompt_tensor[:, :, prompt_id] = 1.0
+                    forward_kwargs["prompt"] = prompt_tensor
+
+                encoder_output, encoder_output_len = asr_model(**forward_kwargs)
+
                 encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
                 # remove extra context from encoder_output (leave only frames corresponding to the chunk)
                 encoder_context = buffer.context_size.subsample(factor=encoder_frame2audio_samples)
