@@ -149,8 +149,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
 
-        # Setup prompt conditioning (lang ID injection post-encoder)
-        self.use_prompt = self.cfg.model_defaults.get('initialize_prompt_feature', False)
+        # Setup prompt conditioning (lang ID injection post-encoder).
+        # `self.use_prompt` is already set before super().__init__() (see above); reuse it here.
         if self.use_prompt:
             self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
             prompt_dict = self.cfg.model_defaults.get('prompt_dictionary', None)
@@ -210,8 +210,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         Returns:
             Prompt-conditioned encoder output of shape (B, D, T).
         """
-        # logging.warning(f"encoded shape: {encoded.shape}, prompt shape: {prompt.shape}")
-        # logging.warning(f"prompt: {prompt}")
 
         encoded_t = encoded.transpose(1, 2)  # B*D*T -> B*T*D
         if prompt.shape[1] > encoded_t.shape[1]:
@@ -750,13 +748,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if getattr(self, 'use_prompt', False):
             types["prompt"] = NeuralType(('B', 'T', 'D'), LabelsType(), optional=True)
         return types
-
-        # return {
-        #     "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
-        #     "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-        #     "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
-        #     "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-        # }
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
