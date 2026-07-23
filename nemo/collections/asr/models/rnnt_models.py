@@ -163,6 +163,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             )
 
 
+    def create_onehot_prompt(
+        self,
+        batch_size: int,
+        time_steps: int,
+        prompt_id: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Create a one-hot language/task prompt tensor for prompt conditioning.
+
+        Shared by offline (``_transcribe_forward``) and streaming inference so the prompt tensor
+        is built identically in both paths.
+
+        Args:
+            batch_size: Number of utterances in the batch.
+            time_steps: Number of encoder time frames the prompt should span. ``_apply_prompt``
+                truncates/zero-pads to the encoder output length, so an upper bound is acceptable.
+            prompt_id: Index (into ``num_prompts``) of the active prompt, e.g. from ``_resolve_prompt_id``.
+            dtype: Dtype of the returned tensor (match the encoder output / compute dtype).
+            device: Device of the returned tensor.
+
+        Returns:
+            One-hot prompt tensor of shape ``(batch_size, time_steps, num_prompts)``.
+        """
+        prompt = torch.zeros(batch_size, time_steps, self.num_prompts, dtype=dtype, device=device)
+        prompt[:, :, prompt_id] = 1.0
+        return prompt
+
     def _apply_prompt(self, encoded: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
         """
         Apply prompt conditioning to encoder output via concatenation + projection.
@@ -1020,8 +1048,59 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     """ Transcription related methods """
 
+    def _resolve_prompt_id(self, target_lang: Optional[str]) -> Optional[int]:
+        """Resolve a language/task prompt string to its prompt index.
+
+        For prompt-conditioned ("unified") models the prompt projection is part of the trained
+        forward pass and must always be applied, so a prompt is always returned. When
+        ``target_lang`` is not provided (or is unknown) the model's language-agnostic ``unk``
+        prompt is used (looked up in ``prompt_dictionary``), with a warning.
+
+        Returns None only for models that were not trained with prompt conditioning.
+        """
+        if not getattr(self, 'use_prompt', False):
+            return None
+
+        prompt_dict = self.prompt_dictionary
+
+        if target_lang is not None and target_lang in prompt_dict:
+            return prompt_dict[target_lang]
+
+        # Fallback: use the model's language-agnostic "unk" prompt.
+        if target_lang is None:
+            logging.warning(
+                "No `target_lang` provided for prompt-conditioned model; falling back to the 'unk' "
+                "prompt. Pass `target_lang=<lang>` (e.g. target_lang=en_US) to force a specific language."
+            )
+        else:
+            logging.warning(
+                f"Unknown target_lang='{target_lang}' (available: {list(prompt_dict.keys())[:10]}"
+                f"{'...' if len(prompt_dict) > 10 else ''}); falling back to the 'unk' prompt."
+            )
+
+        unk_id = prompt_dict.get('unk')
+        if unk_id is None:
+            raise ValueError(
+                "No 'unk' entry found in the model's prompt_dictionary to use as a fallback prompt. "
+                f"Please pass an explicit `target_lang`. Available: {list(prompt_dict.keys())[:10]}"
+                f"{'...' if len(prompt_dict) > 10 else ''}"
+            )
+        return unk_id
+
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+
+        # Prompt conditioning (unified models): inject the language/task prompt into the encoder
+        # output, mirroring what the streaming inference script does manually.
+        if getattr(self, 'use_prompt', False):
+            prompt_id = self._resolve_prompt_id(getattr(trcfg, 'target_lang', None))
+            if prompt_id is not None:
+                batch_size, _, time_steps = encoded.shape  # encoded is [B, D, T]
+                prompt = self.create_onehot_prompt(
+                    batch_size, time_steps, prompt_id, dtype=encoded.dtype, device=encoded.device
+                )
+                encoded = self._apply_prompt(encoded, prompt)
+
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
 

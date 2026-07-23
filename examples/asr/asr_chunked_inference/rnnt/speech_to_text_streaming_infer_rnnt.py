@@ -20,6 +20,15 @@ Also, this is a demonstration of the algorithm that can be used for streaming in
 This is especially useful for models such as Conformers, which have quadratic time and memory scaling with
 audio duration.
 
+Supported models:
+- Standard (offline) RNNT / Hybrid RNNT-CTC models: transcribed here in a buffered/streaming fashion.
+- Unified (offline/streaming) models, in both variants:
+  - without prompt conditioning: run as-is, no extra arguments needed.
+  - with language-prompt conditioning (multilingual models): additionally inject a per-run language/task prompt into the encoder
+    output. Pass the target language via `target_lang` (a key from the model's `prompt_dictionary`, e.g.
+    "en"). If the model is prompt-conditioned and `target_lang` is omitted (or unknown), the
+    language-agnostic "unk" prompt is used. `target_lang` is ignored by models without prompt conditioning.
+
 The difference between streaming and buffered inference is the chunk size (or the latency of inference).
 Buffered inference will use large chunk sizes (5-10 seconds) + some additional right for context.
 Streaming inference will use small chunk sizes (0.1 to 0.25 seconds) + some additional right buffer for context.
@@ -30,7 +39,7 @@ Recommended settings:
 - long file transcription: in most cases 10-10-5 (10s left, 10s chunk, 5s right) will give results similar to offline
 - streaming with 4s latency: 10-2-2 is usually similar or better than 10-0.16-3.84 and significantly faster
 
-Example usage:
+Example usage (standard model):
 
 ```shell
 python speech_to_text_streaming_infer_rnnt.py \
@@ -44,7 +53,7 @@ python speech_to_text_streaming_infer_rnnt.py \
     left_context_secs=10.0 \
     batch_size=32 \
     clean_groundtruth_text=False \
-    langid='en'
+    target_lang='en'    # for multilingual (prompt-conditioned) models; also used for groundtruth cleaning
 ```
 """
 import copy
@@ -143,8 +152,11 @@ class TranscriptionConfig:
         True  # whether to use the att_context_size as chunk size (important for extra-low latency)
     )
 
-    # Prompt conditioning: target language for models with lang ID prompt (e.g. "en", "de").
-    # Ignored for models without prompt support.
+    # Target language, used for two things:
+    #   1. Prompt conditioning for prompt-aware ("unified") models: a key from the model's
+    #      `prompt_dictionary` (e.g. "en-US"). Ignored by models without prompt support.
+    #   2. Groundtruth cleaning (convert_num_to_words) during WER computation when
+    #      `clean_groundtruth_text=True`. The base code is derived from it (e.g. "en" from "en-US").
     target_lang: Optional[str] = None
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
@@ -178,7 +190,6 @@ class TranscriptionConfig:
     # Config for word / character error rate calculation
     calculate_wer: bool = True
     clean_groundtruth_text: bool = False
-    langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
 
     calculate_rtfx: bool = False
@@ -398,25 +409,20 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         in_order=True,
     )
 
-    # Prompt conditioning setup
+    # Prompt conditioning setup (shared resolution logic with offline transcription).
     use_prompt = getattr(asr_model, 'use_prompt', False)
-    prompt_id = None
-    if use_prompt and cfg.target_lang is not None:
-        prompt_dict = asr_model.prompt_dictionary
-        prompt_id = prompt_dict.get(cfg.target_lang)
-        if prompt_id is None:
-            prompt_id = prompt_dict.get("unk")
-        if prompt_id is None:
-            available = list(prompt_dict.keys())[:10]
-            raise ValueError(
-                f"Unknown target_lang='{cfg.target_lang}' and no 'unk' fallback in prompt_dictionary. "
-                f"Available: {available}{'...' if len(prompt_dict) > 10 else ''}"
-            )
+    prompt_id = asr_model._resolve_prompt_id(cfg.target_lang) if use_prompt else None
+    if prompt_id is not None:
         logging.info(f"Prompt conditioning enabled: target_lang='{cfg.target_lang}' -> prompt_id={prompt_id}")
-    elif use_prompt and cfg.target_lang is None:
-        logging.warning(
-            "Model supports prompt conditioning but target_lang is not set. "
-            "Running without language prompt — may produce suboptimal results."
+
+    # Precompute the one-hot prompt once: it is constant across chunks/batches
+    prompt_full = None
+    if prompt_id is not None:
+        max_hidden_length = math.ceil(
+            context_samples.total() / (features_frame2audio_samples * encoder_subsampling_factor)
+        )
+        prompt_full = asr_model.create_onehot_prompt(
+            cfg.batch_size, max_hidden_length, prompt_id, dtype=compute_dtype, device=map_location
         )
 
     timer = SimpleTimer()
@@ -485,27 +491,14 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     is_last_chunk=is_last_chunk,
                     is_last_chunk_batch=is_last_chunk_batch,
                 )
-
-                # # get encoder output using full buffer [left-chunk-right]
-                # encoder_output, encoder_output_len = asr_model(
-                #     input_signal=buffer.samples,
-                #     input_signal_length=buffer.context_size_batch.total(),
-                # )
-
                 # get encoder output using full buffer [left-chunk-right]
                 forward_kwargs = dict(
                     input_signal=buffer.samples,
                     input_signal_length=buffer.context_size_batch.total(),
                 )
-                if prompt_id is not None:
-                    input_time = buffer.samples.shape[1]
-                    hidden_length = math.ceil(input_time / (features_frame2audio_samples * encoder_subsampling_factor))
-                    prompt_tensor = torch.zeros(
-                        batch_size, hidden_length, asr_model.num_prompts,
-                        dtype=compute_dtype, device=device,
-                    )
-                    prompt_tensor[:, :, prompt_id] = 1.0
-                    forward_kwargs["prompt"] = prompt_tensor
+                if prompt_full is not None:
+                    # slice the precomputed prompt to the current batch size (view, no allocation)
+                    forward_kwargs["prompt"] = prompt_full[:batch_size]
 
                 encoder_output, encoder_output_len = asr_model(**forward_kwargs)
 
@@ -651,11 +644,13 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         logging.info(f"RTFx: {rtfx:.2f}")
 
     if cfg.calculate_wer:
+        # Derive the base language code for groundtruth cleaning (e.g. "en" from "en-US"); default "en".
+        cleaning_langid = cfg.target_lang.split('-')[0].split('_')[0].lower() if cfg.target_lang else "en"
         output_manifest_w_wer, total_res, _ = cal_write_wer(
             pred_manifest=output_filename,
             pred_text_attr_name=pred_text_attr_name,
             clean_groundtruth_text=cfg.clean_groundtruth_text,
-            langid=cfg.langid,
+            langid=cleaning_langid,
             use_cer=cfg.use_cer,
             output_filename=None,
             ignore_punctuation=True,
