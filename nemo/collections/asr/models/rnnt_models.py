@@ -46,7 +46,14 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, LabelsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import (
+    AcousticEncodedRepresentation,
+    AudioSignal,
+    LabelsType,
+    LengthsType,
+    NeuralType,
+    SpectrogramType,
+)
 from nemo.utils import logging
 
 
@@ -148,7 +155,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
             prompt_dict = self.cfg.model_defaults.get('prompt_dictionary', None)
             if prompt_dict is None:
-                raise ValueError("prompt_dictionary must be provided in model_defaults when initialize_prompt_feature=True")
+                raise ValueError(
+                    "prompt_dictionary must be provided in model_defaults when initialize_prompt_feature=True"
+                )
             self.prompt_dictionary = prompt_dict
 
             enc_hidden = self.cfg.model_defaults.enc_hidden
@@ -161,7 +170,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 f"Prompt conditioning enabled: num_prompts={self.num_prompts}, "
                 f"languages={list(self.prompt_dictionary.keys())}"
             )
-
 
     def create_onehot_prompt(
         self,
@@ -204,7 +212,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         """
         # logging.warning(f"encoded shape: {encoded.shape}, prompt shape: {prompt.shape}")
         # logging.warning(f"prompt: {prompt}")
-        
+
         encoded_t = encoded.transpose(1, 2)  # B*D*T -> B*T*D
         if prompt.shape[1] > encoded_t.shape[1]:
             prompt = prompt[:, : encoded_t.shape[1], :]
