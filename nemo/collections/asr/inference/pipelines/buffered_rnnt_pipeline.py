@@ -80,6 +80,24 @@ class BufferedRNNTPipeline(BasePipeline):
         self.init_nmt_model(nmt_model)
         super().__init__()
 
+    def init_prompt_support(self) -> None:
+        """Initialize prompt support for prompt-conditioned models (buffered RNN-T only).
+
+        In addition to the base ``concat`` attribute (prompt-streaming models), the buffered
+        RNN-T pipeline also supports unified RNN-T models exposing ``use_prompt``. Both accept
+        one-hot prompt vectors through the encoder ``prompt`` argument.
+        """
+        model = self.asr_model.asr_model
+        self.prompt_enabled = bool(getattr(model, 'concat', False) or getattr(model, 'use_prompt', False))
+
+        # Default prompt language used when the user does not pass `lang`. Unified RNN-T models
+        # (`use_prompt`) fall back to the language-agnostic "unk" prompt; prompt-streaming
+        # (`concat`) models keep the historical "en-US" default.
+        self._default_prompt_language_code = None
+        if self.prompt_enabled:
+            self._prompt_config = self._load_prompt_config()
+            self._default_prompt_language_code = "unk" if getattr(model, 'use_prompt', False) else "en-US"
+
     def init_parameters(self, cfg: DictConfig) -> None:
         """
         Initialize the configuration parameters.
@@ -130,6 +148,8 @@ class BufferedRNNTPipeline(BasePipeline):
         self.residue_tokens_at_end = cfg.endpointing.residue_tokens_at_end
         self.word_boundary_tolerance = cfg.streaming.word_boundary_tolerance
         self.return_tail_result = cfg.return_tail_result
+        # Default language code used to select the prompt for prompt-conditioned (unified ML) models.
+        self.default_language_code = cfg.get('lang', None)
         self.tokens_to_move = self.punctuation_ids.union(self.language_token_ids)
 
         self.zero_encoded = self.init_zero_enc() if self.right_padding else None
@@ -233,7 +253,9 @@ class BufferedRNNTPipeline(BasePipeline):
             default_target_language=self.nmt_model.target_language if self.nmt_enabled else None,
             default_stop_history_eou=self.stop_history_eou_in_milliseconds,
             default_asr_output_granularity=self.asr_output_granularity,
-            default_language_code="en-US" if self.prompt_enabled else None,
+            default_language_code=(
+                (self.default_language_code or self._default_prompt_language_code) if self.prompt_enabled else None
+            ),
         )
         state.set_options(new_options)
 
