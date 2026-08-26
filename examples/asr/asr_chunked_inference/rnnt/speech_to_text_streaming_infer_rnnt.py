@@ -74,8 +74,6 @@ if "expandable_segments" not in alloc_conf:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 
 
-import math
-
 import librosa
 import lightning.pytorch as pl
 import torch
@@ -411,19 +409,14 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     )
 
     # Prompt conditioning setup (shared resolution logic with offline transcription).
-    use_prompt = getattr(asr_model, 'use_prompt', False)
-    prompt_id = asr_model._resolve_prompt_id(cfg.target_lang) if use_prompt else None
-    if prompt_id is not None:
-        logging.info(f"Prompt conditioning enabled: target_lang='{cfg.target_lang}' -> prompt_id={prompt_id}")
-
-    # Precompute the one-hot prompt once: it is constant across chunks/batches
+    # The prompt is constant across chunks and batches, so build it once; the model broadcasts it
+    # across the encoder time dimension.
     prompt_full = None
-    if prompt_id is not None:
-        max_hidden_length = math.ceil(
-            context_samples.total() / (features_frame2audio_samples * encoder_subsampling_factor)
-        )
+    if asr_model.use_prompt:
+        prompt_id = asr_model.resolve_prompt_id(cfg.target_lang)
+        logging.info(f"Prompt conditioning enabled: target_lang='{cfg.target_lang}' -> prompt_id={prompt_id}")
         prompt_full = asr_model.create_onehot_prompt(
-            cfg.batch_size, max_hidden_length, prompt_id, dtype=compute_dtype, device=map_location
+            cfg.batch_size, prompt_id, dtype=compute_dtype, device=map_location
         )
 
     timer = SimpleTimer()

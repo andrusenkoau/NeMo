@@ -34,6 +34,7 @@ from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
     ASRModuleMixin,
     ASRTranscriptionMixin,
+    LangPromptMixin,
     TranscribeConfig,
     TranscriptionReturnType,
 )
@@ -57,7 +58,7 @@ from nemo.core.neural_types import (
 from nemo.utils import logging
 
 
-class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
+class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin, LangPromptMixin):
     """Base class for encoder decoder RNNT-based models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -66,10 +67,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.world_size = 1
         if trainer is not None:
             self.world_size = trainer.world_size
-
-        # Must be set before super().__init__() because ModelPT triggers setup_training_data
-        # which calls _setup_dataloader_from_config that checks this flag.
-        self.use_prompt = cfg.get('model_defaults', {}).get('initialize_prompt_feature', False)
 
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -149,84 +146,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
 
-        # Setup prompt conditioning (lang ID injection post-encoder).
-        # `self.use_prompt` is already set before super().__init__() (see above); reuse it here.
-        if self.use_prompt:
-            self.num_prompts = self.cfg.model_defaults.get('num_prompts', 128)
-            prompt_dict = self.cfg.model_defaults.get('prompt_dictionary', None)
-            if prompt_dict is None:
-                raise ValueError(
-                    "prompt_dictionary must be provided in model_defaults when initialize_prompt_feature=True"
-                )
-            self.prompt_dictionary = prompt_dict
-
-            enc_hidden = self.cfg.model_defaults.enc_hidden
-            self.prompt_kernel = torch.nn.Sequential(
-                torch.nn.Linear(self.num_prompts + enc_hidden, enc_hidden * 2),
-                torch.nn.ReLU(),
-                torch.nn.Linear(enc_hidden * 2, enc_hidden),
-            )
-            logging.info(
-                f"Prompt conditioning enabled: num_prompts={self.num_prompts}, "
-                f"languages={list(self.prompt_dictionary.keys())}"
-            )
-
-    def create_onehot_prompt(
-        self,
-        batch_size: int,
-        time_steps: int,
-        prompt_id: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Create a one-hot language/task prompt tensor for prompt conditioning.
-
-        Shared by offline (``_transcribe_forward``) and streaming inference so the prompt tensor
-        is built identically in both paths.
-
-        Args:
-            batch_size: Number of utterances in the batch.
-            time_steps: Number of encoder time frames the prompt should span. ``_apply_prompt``
-                truncates/zero-pads to the encoder output length, so an upper bound is acceptable.
-            prompt_id: Index (into ``num_prompts``) of the active prompt, e.g. from ``_resolve_prompt_id``.
-            dtype: Dtype of the returned tensor (match the encoder output / compute dtype).
-            device: Device of the returned tensor.
-
-        Returns:
-            One-hot prompt tensor of shape ``(batch_size, time_steps, num_prompts)``.
-        """
-        prompt = torch.zeros(batch_size, time_steps, self.num_prompts, dtype=dtype, device=device)
-        prompt[:, :, prompt_id] = 1.0
-        return prompt
-
-    def _apply_prompt(self, encoded: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
-        """
-        Apply prompt conditioning to encoder output via concatenation + projection.
-
-        Args:
-            encoded: Encoder output of shape (B, D, T).
-            prompt: One-hot prompt tensor of shape (B, T, num_prompts).
-
-        Returns:
-            Prompt-conditioned encoder output of shape (B, D, T).
-        """
-
-        encoded_t = encoded.transpose(1, 2)  # B*D*T -> B*T*D
-        if prompt.shape[1] > encoded_t.shape[1]:
-            prompt = prompt[:, : encoded_t.shape[1], :]
-        elif prompt.shape[1] < encoded_t.shape[1]:
-            pad = torch.zeros(
-                prompt.shape[0],
-                encoded_t.shape[1] - prompt.shape[1],
-                prompt.shape[2],
-                device=prompt.device,
-                dtype=prompt.dtype,
-            )
-            prompt = torch.cat([prompt, pad], dim=1)
-        out_dtype = encoded_t.dtype
-        concat_states = torch.cat([encoded_t, prompt], dim=-1)
-        encoded_t = self.prompt_kernel(concat_states).to(out_dtype)
-        return encoded_t.transpose(1, 2)  # B*T*D -> B*D*T
+        # Setup language/task prompt conditioning (from LangPromptMixin); no-op unless the model
+        # config enables it.
+        self.setup_lang_prompt()
 
     def setup_optim_normalization(self):
         """
@@ -340,6 +262,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         augmentor: DictConfig = None,
         verbose: bool = True,
         timestamps: Optional[bool] = None,
+        target_lang: Optional[str] = None,
         override_config: Optional[TranscribeConfig] = None,
     ) -> TranscriptionReturnType:
         """
@@ -369,6 +292,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             timestamps: Optional(Bool): timestamps will be returned if set to True as part of hypothesis object
                 (output.timestep['segment']/output.timestep['word']). Refer to `Hypothesis` class for more details.
                 Default is None and would retain the previous state set by using self.change_decoding_strategy().
+            target_lang: Optional(str) language/task prompt for prompt-conditioned ("unified") models, e.g.
+                `"en-US"`; must be a key of the model's `prompt_dictionary`. Defaults to the model's
+                language-agnostic `"unk"` prompt. Ignored by models without prompt conditioning.
             override_config: (Optional[TranscribeConfig]) override transcription config pre-defined by the user.
                 **Note**: All other arguments in the function will be ignored if override_config is passed.
                 You should call this argument as `model.transcribe(audio, override_config=TranscribeConfig(...))`.
@@ -417,6 +343,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             override_config=override_config,
             # Additional arguments
             partial_hypothesis=partial_hypothesis,
+            target_lang=target_lang,
         )
 
     def change_vocabulary(self, new_vocabulary: List[str], decoding_cfg: Optional[DictConfig] = None):
@@ -745,8 +672,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
-        if getattr(self, 'use_prompt', False):
-            types["prompt"] = NeuralType(('B', 'T', 'D'), LabelsType(), optional=True)
+        if self.use_prompt:
+            types["prompt"] = NeuralType(('B', 'D'), LabelsType(), optional=True)
         return types
 
     @property
@@ -787,9 +714,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 of shape (B, D, T) that has undergone processing via some DALI preprocessor.
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
-            prompt: Optional tensor of shape (B, T, num_prompts) with one-hot language/task prompt.
-                When provided and use_prompt=True, it is concatenated with encoder output and projected
-                back to encoder dimension via prompt_kernel.
+            prompt: Optional one-hot language/task prompt of shape (B, num_prompts), broadcast across
+                time. Only accepted by models trained with prompt conditioning; see
+                :class:`~nemo.collections.asr.parts.mixins.lang_prompt.LangPromptMixin`.
 
         Returns:
             A tuple of 2 elements -
@@ -816,8 +743,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
-        if self.use_prompt and prompt is not None:
-            encoded = self._apply_prompt(encoded, prompt)
+        if prompt is not None:
+            encoded = self.apply_lang_prompt(encoded, prompt)
 
         return encoded, encoded_len
 
@@ -1047,58 +974,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     """ Transcription related methods """
 
-    def _resolve_prompt_id(self, target_lang: Optional[str]) -> Optional[int]:
-        """Resolve a language/task prompt string to its prompt index.
-
-        For prompt-conditioned ("unified") models the prompt projection is part of the trained
-        forward pass and must always be applied, so a prompt is always returned. When
-        ``target_lang`` is not provided (or is unknown) the model's language-agnostic ``unk``
-        prompt is used (looked up in ``prompt_dictionary``), with a warning.
-
-        Returns None only for models that were not trained with prompt conditioning.
-        """
-        if not getattr(self, 'use_prompt', False):
-            return None
-
-        prompt_dict = self.prompt_dictionary
-
-        if target_lang is not None and target_lang in prompt_dict:
-            return prompt_dict[target_lang]
-
-        # Fallback: use the model's language-agnostic "unk" prompt.
-        if target_lang is None:
-            logging.warning(
-                "No `target_lang` provided for prompt-conditioned model; falling back to the 'unk' "
-                "prompt. Pass `target_lang=<lang>` (e.g. target_lang=en_US) to force a specific language."
-            )
-        else:
-            logging.warning(
-                f"Unknown target_lang='{target_lang}' (available: {list(prompt_dict.keys())[:10]}"
-                f"{'...' if len(prompt_dict) > 10 else ''}); falling back to the 'unk' prompt."
-            )
-
-        unk_id = prompt_dict.get('unk')
-        if unk_id is None:
-            raise ValueError(
-                "No 'unk' entry found in the model's prompt_dictionary to use as a fallback prompt. "
-                f"Please pass an explicit `target_lang`. Available: {list(prompt_dict.keys())[:10]}"
-                f"{'...' if len(prompt_dict) > 10 else ''}"
-            )
-        return unk_id
-
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-
-        # Prompt conditioning (unified models): inject the language/task prompt into the encoder
-        # output, mirroring what the streaming inference script does manually.
-        if getattr(self, 'use_prompt', False):
-            prompt_id = self._resolve_prompt_id(getattr(trcfg, 'target_lang', None))
-            if prompt_id is not None:
-                batch_size, _, time_steps = encoded.shape  # encoded is [B, D, T]
-                prompt = self.create_onehot_prompt(
-                    batch_size, time_steps, prompt_id, dtype=encoded.dtype, device=encoded.device
-                )
-                encoded = self._apply_prompt(encoded, prompt)
+        encoded = self.apply_lang_prompt_for_transcribe(encoded, getattr(trcfg, 'target_lang', None))
 
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output

@@ -339,6 +339,15 @@ class CacheAwareRNNTInferenceWrapper(CacheAwareASRInferenceWrapper):
         upstream prompt scheme ever changes shape, instead of silently mis-conditioning the encoder.
         """
         model = self.asr_model
+        if getattr(model, "use_prompt", False):
+            raise ValueError(
+                "This prompt-conditioned model is not supported by cache-aware streaming: it was not trained "
+                "under pure streaming conditions, and the cache-aware path would skip its prompt projection "
+                "entirely. Use chunked inference with per-chunk context recomputation instead — "
+                "examples/asr/asr_streaming_inference/asr_streaming_infer.py with conf/buffered_rnnt.yaml, or "
+                "examples/asr/asr_chunked_inference/rnnt/speech_to_text_streaming_infer_rnnt.py."
+            )
+
         if not getattr(model, "concat", False):
             return
 

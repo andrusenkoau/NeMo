@@ -79,8 +79,9 @@ class RNNTInferenceWrapper(ASRInferenceWrapper):
         Args:
             processed_signal: (Tensor) processed signal. Shape is torch.Size([B, C, T]).
             processed_signal_length: (Tensor) processed signal length. Shape is torch.Size([B]).
-            prompt_vectors: (Tensor | None) Optional prompt vectors for multilingual models.
-                Shape can be torch.Size([B, num_prompts]) or torch.Size([B, T_enc, num_prompts]) if already expanded.
+            prompt_vectors: (Tensor | None) Optional prompt vectors for multilingual models. Shape is
+                torch.Size([B, num_prompts]) for unified models, which broadcast across encoder
+                frames, or torch.Size([B, T_enc, num_prompts]) for prompt-streaming models.
         Returns:
             (tuple[Tensor, Tensor]) encoder output and encoder output length of shape torch.Size([B, T, D]), torch.Size([B]).
         """
@@ -129,7 +130,12 @@ class RNNTInferenceWrapper(ASRInferenceWrapper):
     ) -> tuple[Tensor, Tensor]:
         """
         Convenience wrapper for prompt-enabled encoding.
-        Expands prompt vectors across the time dimension before calling encode.
+
+        Unified models (``use_prompt``) broadcast the prompt across the encoder time dimension
+        themselves, so the prompt is forwarded as-is. Prompt-streaming models (``concat``) expect a
+        pre-expanded [B, T_enc, num_prompts] tensor, so the time dimension is estimated from the
+        feature length for them — note that this estimate is off by one whenever the feature length
+        is not a multiple of the subsampling factor.
         Args:
             processed_signal: (Tensor) processed signal. Shape is torch.Size([B, C, T]).
             processed_signal_length: (Tensor) processed signal length. Shape is torch.Size([B]).
@@ -137,9 +143,10 @@ class RNNTInferenceWrapper(ASRInferenceWrapper):
         Returns:
             (tuple[Tensor, Tensor]) encoder output and encoder output length.
         """
-        encoder_time_steps = processed_signal.shape[2] // self.get_subsampling_factor()
-        # Expand prompts: [B, num_prompts] -> [B, T_enc, num_prompts]
-        prompt_vectors = prompt_vectors.unsqueeze(1).expand(-1, encoder_time_steps, -1)
+        if not getattr(self.asr_model, 'use_prompt', False):
+            encoder_time_steps = processed_signal.shape[2] // self.get_subsampling_factor()
+            prompt_vectors = prompt_vectors.unsqueeze(1).expand(-1, encoder_time_steps, -1)
+
         return self.encode(
             processed_signal=processed_signal,
             processed_signal_length=processed_signal_length,
