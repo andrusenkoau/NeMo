@@ -25,7 +25,7 @@ Supported models:
 - Unified (offline/streaming) models, in both variants:
   - without prompt conditioning: run as-is, no extra arguments needed.
   - with language-prompt conditioning (multilingual models): additionally inject a per-run language/task prompt into the encoder
-    output. Pass the target language via `target_lang` (a key from the model's `prompt_dictionary`, e.g.
+    output. Pass the target language via `target_lang` (a key from the model's `lang_id_prompt_dictionary`, e.g.
     "en"). If the model is prompt-conditioned and `target_lang` is omitted (or unknown), the
     language-agnostic "unk" prompt is used. `target_lang` is ignored by models without prompt conditioning.
 
@@ -153,7 +153,7 @@ class TranscriptionConfig:
 
     # Target language, used for two things:
     #   1. Prompt conditioning for prompt-aware ("unified") models: a key from the model's
-    #      `prompt_dictionary` (e.g. "en-US"). Ignored by models without prompt support.
+    #      `lang_id_prompt_dictionary` (e.g. "en-US"). Ignored by models without prompt support.
     #   2. Groundtruth cleaning (convert_num_to_words) during WER computation when
     #      `clean_groundtruth_text=True`. The base code is derived from it (e.g. "en" from "en-US").
     target_lang: Optional[str] = None
@@ -412,10 +412,10 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     # The prompt is constant across chunks and batches, so build it once; the model broadcasts it
     # across the encoder time dimension.
     prompt_full = None
-    if asr_model.use_prompt:
-        prompt_id = asr_model.resolve_prompt_id(cfg.target_lang)
+    if asr_model.use_lang_id_prompt:
+        prompt_id = asr_model.resolve_lang_id_prompt(cfg.target_lang)
         logging.info(f"Prompt conditioning enabled: target_lang='{cfg.target_lang}' -> prompt_id={prompt_id}")
-        prompt_full = asr_model.create_onehot_prompt(
+        prompt_full = asr_model.create_lang_id_prompt(
             cfg.batch_size, prompt_id, dtype=compute_dtype, device=map_location
         )
 
@@ -492,7 +492,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 )
                 if prompt_full is not None:
                     # slice the precomputed prompt to the current batch size (view, no allocation)
-                    forward_kwargs["prompt"] = prompt_full[:batch_size]
+                    forward_kwargs["lang_id_prompt"] = prompt_full[:batch_size]
 
                 encoder_output, encoder_output_len = asr_model(**forward_kwargs)
 

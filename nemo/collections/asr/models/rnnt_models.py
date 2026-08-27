@@ -34,7 +34,6 @@ from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
     ASRModuleMixin,
     ASRTranscriptionMixin,
-    LangPromptMixin,
     TranscribeConfig,
     TranscriptionReturnType,
 )
@@ -58,7 +57,7 @@ from nemo.core.neural_types import (
 from nemo.utils import logging
 
 
-class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin, LangPromptMixin):
+class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -146,9 +145,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
 
-        # Setup language/task prompt conditioning (from LangPromptMixin); no-op unless the model
+        # Setup language-ID prompt conditioning (from LangIdPromptMixin); no-op unless the model
         # config enables it.
-        self.setup_lang_prompt()
+        self.setup_lang_id_prompt()
 
     def setup_optim_normalization(self):
         """
@@ -292,9 +291,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             timestamps: Optional(Bool): timestamps will be returned if set to True as part of hypothesis object
                 (output.timestep['segment']/output.timestep['word']). Refer to `Hypothesis` class for more details.
                 Default is None and would retain the previous state set by using self.change_decoding_strategy().
-            target_lang: Optional(str) language/task prompt for prompt-conditioned ("unified") models, e.g.
-                `"en-US"`; must be a key of the model's `prompt_dictionary`. Defaults to the model's
-                language-agnostic `"unk"` prompt. Ignored by models without prompt conditioning.
+            target_lang: Optional(str) language-ID prompt for prompt-conditioned ("unified") models, e.g.
+                `"en-US"`; must be a key of the model's `lang_id_prompt_dictionary`. Defaults to the
+                model's language-agnostic `"unk"` prompt. Ignored by models without prompt conditioning.
             override_config: (Optional[TranscribeConfig]) override transcription config pre-defined by the user.
                 **Note**: All other arguments in the function will be ignored if override_config is passed.
                 You should call this argument as `model.transcribe(audio, override_config=TranscribeConfig(...))`.
@@ -672,8 +671,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
-        if self.use_prompt:
-            types["prompt"] = NeuralType(('B', 'D'), LabelsType(), optional=True)
+        if self.use_lang_id_prompt:
+            types["lang_id_prompt"] = NeuralType(('B', 'D'), LabelsType(), optional=True)
         return types
 
     @property
@@ -690,7 +689,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         input_signal_length=None,
         processed_signal=None,
         processed_signal_length=None,
-        prompt=None,
+        lang_id_prompt=None,
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -714,9 +713,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 of shape (B, D, T) that has undergone processing via some DALI preprocessor.
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
-            prompt: Optional one-hot language/task prompt of shape (B, num_prompts), broadcast across
-                time. Only accepted by models trained with prompt conditioning; see
-                :class:`~nemo.collections.asr.parts.mixins.lang_prompt.LangPromptMixin`.
+            lang_id_prompt: Optional one-hot language-ID prompt of shape (B, num_lang_id_prompts),
+                broadcast across time. Only accepted by models trained with language-ID prompt
+                conditioning; see
+                :class:`~nemo.collections.asr.parts.utils.lang_id_prompt.LangIdPromptMixin`.
 
         Returns:
             A tuple of 2 elements -
@@ -743,8 +743,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
-        if prompt is not None:
-            encoded = self.apply_lang_prompt(encoded, prompt)
+        if lang_id_prompt is not None:
+            encoded = self.apply_lang_id_prompt(encoded, lang_id_prompt)
 
         return encoded, encoded_len
 
@@ -976,7 +976,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-        encoded = self.apply_lang_prompt_for_transcribe(encoded, getattr(trcfg, 'target_lang', None))
+        encoded = self.apply_lang_id_prompt_for_transcribe(encoded, getattr(trcfg, 'target_lang', None))
 
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output

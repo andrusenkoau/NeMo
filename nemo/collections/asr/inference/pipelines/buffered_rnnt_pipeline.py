@@ -81,22 +81,15 @@ class BufferedRNNTPipeline(BasePipeline):
         super().__init__()
 
     def init_prompt_support(self) -> None:
-        """Initialize prompt support for prompt-conditioned models (buffered RNN-T only).
+        """Initialize prompt support, plus the default language for prompt-conditioned models."""
+        super().init_prompt_support()
 
-        In addition to the base ``concat`` attribute (prompt-streaming models), the buffered
-        RNN-T pipeline also supports unified RNN-T models exposing ``use_prompt``. Both accept
-        one-hot prompt vectors through the encoder ``prompt`` argument.
-        """
-        model = self.asr_model.asr_model
-        self.prompt_enabled = bool(getattr(model, 'concat', False) or getattr(model, 'use_prompt', False))
-
-        # Default prompt language used when the user does not pass `lang`. Unified RNN-T models
-        # (`use_prompt`) fall back to the language-agnostic "unk" prompt; prompt-streaming
-        # (`concat`) models keep the historical "en-US" default.
+        # Default prompt language used when the user does not pass `lang`. Unified models fall back
+        # to their language-agnostic "unk" prompt; prompt-streaming (`concat`) models keep the
+        # historical "en-US" default.
         self._default_prompt_language_code = None
         if self.prompt_enabled:
-            self._prompt_config = self._load_prompt_config()
-            self._default_prompt_language_code = "unk" if getattr(model, 'use_prompt', False) else "en-US"
+            self._default_prompt_language_code = "unk" if self.asr_model.asr_model.use_lang_id_prompt else "en-US"
 
     def init_parameters(self, cfg: DictConfig) -> None:
         """

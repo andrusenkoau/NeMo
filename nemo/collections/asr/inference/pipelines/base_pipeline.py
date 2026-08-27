@@ -487,7 +487,8 @@ class BasePipeline(PipelineInterface):
 
     def init_prompt_support(self) -> None:
         """Initialize prompt support for multilingual models."""
-        self.prompt_enabled = hasattr(self.asr_model.asr_model, 'concat') and self.asr_model.asr_model.concat
+        model = self.asr_model.asr_model
+        self.prompt_enabled = bool(model.use_lang_id_prompt or getattr(model, 'concat', False))
 
         if self.prompt_enabled:
             self._prompt_config = self._load_prompt_config()
@@ -495,9 +496,20 @@ class BasePipeline(PipelineInterface):
     def _load_prompt_config(self) -> dict:
         """
         Load prompt configuration from model.
+
+        Covers both prompt schemes: unified models expose their vocabulary as attributes, while
+        prompt-streaming (``concat``) models are read from the model config.
         Returns:
             (dict) Prompt configuration containing num_prompts, prompt_dict, and compute_dtype.
         """
+        model = self.asr_model.asr_model
+        if model.use_lang_id_prompt:
+            return {
+                'num_prompts': model.num_lang_id_prompts,
+                'prompt_dict': model.lang_id_prompt_dictionary,
+                'compute_dtype': getattr(model, 'dtype', torch.float32),
+            }
+
         cfg = self.asr_model.asr_model.cfg
         if cfg and hasattr(cfg, 'model_defaults'):
             model_defaults = cfg.model_defaults
