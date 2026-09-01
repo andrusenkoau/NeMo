@@ -34,7 +34,9 @@ requires_numba = pytest.mark.skipif(
 )
 
 
-def build_model(prompt_enabled: bool, prompt_dictionary=PROMPT_DICTIONARY, extra_defaults=None) -> EncDecRNNTModel:
+def build_model(
+    prompt_enabled: bool, prompt_dictionary=PROMPT_DICTIONARY, extra_defaults=None, trainer=None
+) -> EncDecRNNTModel:
     """Build a tiny RNNT model, optionally with language-ID prompt conditioning enabled."""
     model_defaults = {'enc_hidden': ENC_HIDDEN, 'pred_hidden': 32}
     if prompt_enabled:
@@ -95,7 +97,7 @@ def build_model(prompt_enabled: bool, prompt_dictionary=PROMPT_DICTIONARY, extra
             'loss': DictConfig({'loss_name': 'default'}),
         }
     )
-    return EncDecRNNTModel(cfg=cfg)
+    return EncDecRNNTModel(cfg=cfg, trainer=trainer)
 
 
 @pytest.fixture()
@@ -128,11 +130,16 @@ class TestLangIdPromptSetup:
         assert 'lang_id_prompt' in prompt_model.input_types
 
     @pytest.mark.unit
-    def test_flag_is_readable_on_any_asr_model_without_getattr(self):
-        """The flag lives on ``ASRModel``, so callers can branch on it for any ASR model."""
+    def test_flag_is_readable_on_any_rnnt_model_without_getattr(self):
+        """The flag lives on ``EncDecRNNTModel``, so RNN-T call sites can branch without a guard.
+
+        It deliberately does not reach ``ASRModel``: that class is imported too early to see
+        ``parts.mixins``, which imports ``nemo.collections.asr.models`` in turn.
+        """
         from nemo.collections.asr.models.asr_model import ASRModel
 
-        assert ASRModel.use_lang_id_prompt is False
+        assert EncDecRNNTModel.use_lang_id_prompt is False
+        assert not hasattr(ASRModel, 'use_lang_id_prompt')
 
     @pytest.mark.unit
     def test_prompt_kernel_weights_are_in_state_dict(self, prompt_model):
@@ -145,24 +152,43 @@ class TestLangIdPromptSetup:
             build_model(prompt_enabled=True, prompt_dictionary={})
 
     @pytest.mark.unit
-    @pytest.mark.parametrize(
-        'legacy_key,expected_rename',
-        [
-            ('initialize_prompt_feature', 'initialize_lang_id_prompt'),
-            ('num_prompts', 'num_lang_id_prompts'),
-            ('prompt_dictionary', 'lang_id_prompt_dictionary'),
-        ],
-    )
-    def test_legacy_config_keys_are_rejected(self, legacy_key, expected_rename):
-        """A checkpoint using the pre-rename keys must fail loudly, not load unconditioned.
+    @pytest.mark.parametrize('other_scheme_key', ['initialize_prompt_feature', 'num_prompts', 'prompt_dictionary'])
+    def test_prompt_streaming_config_keys_are_left_alone(self, other_scheme_key):
+        """``PromptStreamingMixin``'s keys are a live namespace, not a legacy one.
 
-        The legacy names are silently ignored by the current code, which would produce a model that
-        looks healthy but decodes without the language conditioning it was trained with.
+        They appear in the shipped ``fastconformer_*_prompt.yaml`` configs, so a model instantiated
+        from such a config through a class without that mixin must still load rather than fail on
+        keys it simply does not use.
         """
-        legacy_value = PROMPT_DICTIONARY if legacy_key == 'prompt_dictionary' else True
+        value = PROMPT_DICTIONARY if other_scheme_key == 'prompt_dictionary' else True
 
-        with pytest.raises(ValueError, match=expected_rename):
-            build_model(prompt_enabled=False, extra_defaults={legacy_key: legacy_value})
+        model = build_model(prompt_enabled=False, extra_defaults={other_scheme_key: value})
+
+        assert model.use_lang_id_prompt is False
+
+
+@requires_numba
+class TestInferenceOnly:
+    """The projection is trainable but no training step conditions on it, so training must refuse.
+
+    Left unguarded, DDP fails on an unused parameter and a manual loop trains (and scores WER)
+    without the language conditioning the model was built for.
+    """
+
+    @pytest.mark.unit
+    def test_enabling_prompts_with_a_trainer_attached_raises(self):
+        trainer = pytest.importorskip('lightning.pytorch').Trainer(accelerator='cpu', devices=1, logger=False)
+
+        with pytest.raises(ValueError, match='inference-only'):
+            build_model(prompt_enabled=True, trainer=trainer)
+
+    @pytest.mark.unit
+    def test_models_without_prompts_are_unaffected(self):
+        trainer = pytest.importorskip('lightning.pytorch').Trainer(accelerator='cpu', devices=1, logger=False)
+
+        model = build_model(prompt_enabled=False, trainer=trainer)
+
+        assert model.use_lang_id_prompt is False
 
 
 @requires_numba
@@ -174,19 +200,45 @@ class TestResolveLangIdPrompt:
 
     @pytest.mark.unit
     @pytest.mark.parametrize('target_lang', [None, 'kl-KL'])
-    def test_falls_back_to_unk(self, prompt_model, target_lang):
+    def test_falls_back_to_the_default_language(self, prompt_model, target_lang):
         assert prompt_model.resolve_lang_id_prompt(target_lang) == PROMPT_DICTIONARY['unk']
 
     @pytest.mark.unit
-    def test_missing_unk_raises(self):
-        model = build_model(prompt_enabled=True, prompt_dictionary={'en-US': 0})
-        with pytest.raises(ValueError, match="No 'unk' entry"):
+    def test_raises_when_no_candidate_default_exists(self):
+        model = build_model(prompt_enabled=True, prompt_dictionary={'fr-FR': 0})
+        with pytest.raises(ValueError, match='Cannot pick a default'):
             model.resolve_lang_id_prompt(None)
 
     @pytest.mark.unit
     def test_raises_for_non_prompt_model(self, plain_model):
         with pytest.raises(ValueError, match='not trained with language-ID prompt'):
             plain_model.resolve_lang_id_prompt('en-US')
+
+
+@requires_numba
+class TestDefaultLangIdPrompt:
+    """The model advertises its own language-agnostic prompt, so no call site hardcodes one."""
+
+    @pytest.mark.unit
+    def test_prefers_the_most_language_agnostic_key(self, prompt_model):
+        assert prompt_model.default_lang_id_prompt == 'unk'
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        'dictionary, expected',
+        [
+            ({'en-US': 0, 'auto': 1, 'unk': 2}, 'unk'),
+            ({'en-US': 0, 'auto': 1}, 'auto'),
+            ({'en-US': 0, 'de-DE': 1}, 'en-US'),
+            ({'de-DE': 0}, None),
+        ],
+    )
+    def test_falls_through_the_preference_order(self, dictionary, expected):
+        assert build_model(prompt_enabled=True, prompt_dictionary=dictionary).default_lang_id_prompt == expected
+
+    @pytest.mark.unit
+    def test_is_none_without_prompt_support(self, plain_model):
+        assert plain_model.default_lang_id_prompt is None
 
 
 @requires_numba
@@ -297,43 +349,32 @@ class TestApplyLangIdPrompt:
 
 
 @requires_numba
-class TestStreamingHook:
-    """``conformer_stream_step`` conditions through ``_apply_prompt_to_encoded``.
+class TestCacheAwareSurfaceIsNotClaimed:
+    """The mixin must not answer the cache-aware feature probes, on any model.
 
-    The unified checkpoint is not trained for cache-aware streaming, but the hook must be wired
-    correctly so a model trained that way works without further changes — and, more importantly, so
-    the cache-aware path never silently drops a prompt the model was trained with.
+    ``speech_to_text_cache_aware_streaming_infer.py`` feature-detects prompt support. Because the
+    mixin sits on ``ASRModel``, anything it defines is defined for every ASR model — so claiming
+    ``set_inference_prompt`` made that probe true everywhere and broke the script for plain models.
+    Cache-aware streaming belongs to ``PromptStreamingMixin``, whose models are trained for it.
     """
 
     @pytest.mark.unit
-    def test_hook_is_a_noop_before_a_language_is_selected(self, prompt_model):
-        encoded = torch.randn(2, ENC_HIDDEN, 9)
-        assert prompt_model._apply_prompt_to_encoded(encoded) is encoded
+    @pytest.mark.parametrize('attribute', ['set_inference_prompt', 'concat'])
+    def test_probes_stay_false_for_a_plain_model(self, plain_model, attribute):
+        assert not hasattr(plain_model, attribute)
 
     @pytest.mark.unit
-    def test_hook_applies_the_selected_language(self, prompt_model):
-        encoded = torch.randn(2, ENC_HIDDEN, 9)
-        prompt_model.set_inference_prompt('de-DE')
-
-        out = prompt_model._apply_prompt_to_encoded(encoded)
-        expected = prompt_model.apply_lang_id_prompt(
-            encoded, prompt_model.create_lang_id_prompt(2, 3, torch.float32, encoded.device)
-        )
-
-        assert torch.allclose(out, expected)
+    @pytest.mark.parametrize('attribute', ['set_inference_prompt', 'concat'])
+    def test_probes_stay_false_for_a_unified_model(self, prompt_model, attribute):
+        assert not hasattr(prompt_model, attribute)
 
     @pytest.mark.unit
-    def test_hook_is_a_noop_for_models_without_prompts(self, plain_model):
-        encoded = torch.randn(2, ENC_HIDDEN, 9)
-        assert plain_model._apply_prompt_to_encoded(encoded) is encoded
-
-    @pytest.mark.unit
-    def test_hook_overrides_the_base_no_op(self, prompt_model):
-        """``ASRModuleMixin`` defines the hook as a no-op; the mixin must win in the MRO."""
-        from nemo.collections.asr.parts.utils.lang_id_prompt import LangIdPromptMixin
+    def test_the_stream_step_hook_is_left_as_the_base_no_op(self, prompt_model):
+        """``ASRModuleMixin``'s no-op must remain the implementation the MRO finds."""
+        from nemo.collections.asr.parts.mixins.mixins import ASRModuleMixin
 
         owner = next(c for c in type(prompt_model).__mro__ if '_apply_prompt_to_encoded' in c.__dict__)
-        assert owner is LangIdPromptMixin
+        assert owner is ASRModuleMixin
 
     @pytest.mark.unit
     def test_prompt_streaming_models_keep_their_own_hook(self):
@@ -343,16 +384,6 @@ class TestStreamingHook:
 
         owner = next(c for c in EncDecRNNTBPEModelWithPrompt.__mro__ if '_apply_prompt_to_encoded' in c.__dict__)
         assert owner is PromptStreamingMixin
-
-    @pytest.mark.unit
-    def test_unknown_language_is_rejected(self, prompt_model):
-        with pytest.raises(ValueError, match='Unknown target language'):
-            prompt_model.set_inference_prompt('zz-ZZ')
-
-    @pytest.mark.unit
-    def test_set_inference_prompt_rejected_without_prompt_support(self, plain_model):
-        with pytest.raises(ValueError, match='not trained with language-ID prompt'):
-            plain_model.set_inference_prompt('en-US')
 
 
 @requires_numba
@@ -516,3 +547,41 @@ class TestCacheAwareDelegation:
         )
 
         CacheAwareRNNTInferenceWrapper._validate_prompt_support(SimpleNamespace(asr_model=prompt_model))
+
+
+@requires_numba
+class TestPipelineDefaultLanguage:
+    """Streaming pipelines take their default language from the model, not from a literal.
+
+    The buffered and cache-aware pipelines used to hardcode different defaults, so the same
+    checkpoint was conditioned on a different language depending on which pipeline ran it.
+    """
+
+    @staticmethod
+    def _resolve(model, prompt_dict=None):
+        from nemo.collections.asr.inference.pipelines.base_pipeline import BasePipeline
+
+        stub = SimpleNamespace(
+            asr_model=SimpleNamespace(asr_model=model),
+            _prompt_config={'prompt_dict': prompt_dict if prompt_dict is not None else {'en-US': 0}},
+        )
+        return BasePipeline._resolve_default_language_code(stub)
+
+    @pytest.mark.unit
+    def test_unified_model_uses_its_advertised_default(self, prompt_model):
+        assert self._resolve(prompt_model) == prompt_model.default_lang_id_prompt == 'unk'
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        'prompt_dict, expected', [({'en-US': 0, 'auto': 1}, 'auto'), ({'en-US': 0}, 'en-US'), ({'de-DE': 0}, None)]
+    )
+    def test_prompt_streaming_model_prefers_its_auto_prompt(self, plain_model, prompt_dict, expected):
+        """``concat`` models are matched against their own vocabulary, preferring ``auto``."""
+        plain_model.concat = True
+        assert self._resolve(plain_model, prompt_dict) == expected
+
+    @pytest.mark.unit
+    def test_returns_none_without_prompt_support(self):
+        from nemo.collections.asr.inference.pipelines.base_pipeline import BasePipeline
+
+        assert BasePipeline._resolve_default_language_code(SimpleNamespace(_prompt_config=None)) is None

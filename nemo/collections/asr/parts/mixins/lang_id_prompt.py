@@ -21,15 +21,6 @@ from nemo.utils import logging
 
 __all__ = ['LangIdPromptMixin']
 
-# Legacy config keys used by the first unified checkpoints, before the language-ID prompt fields were
-# given names that distinguish them from other kinds of prompt. Detected only to produce an
-# actionable error, since the two vocabularies would otherwise silently disable conditioning.
-_LEGACY_CONFIG_KEYS = {
-    'initialize_prompt_feature': 'initialize_lang_id_prompt',
-    'num_prompts': 'num_lang_id_prompts',
-    'prompt_dictionary': 'lang_id_prompt_dictionary',
-}
-
 
 class LangIdPromptMixin:
     """Language-ID prompt conditioning for encoder-decoder ASR models ("unified" models).
@@ -37,6 +28,10 @@ class LangIdPromptMixin:
     A one-hot language/task vector is concatenated to every encoder output frame and projected back
     to the encoder dimension, letting the decoder condition on the requested language. The mixin owns
     the projection module, the prompt vocabulary, and the prompt tensor construction.
+
+    Inference only. The projection is part of the trained forward pass but no training entry point
+    conditions on it, so :meth:`setup_lang_id_prompt` refuses to enable conditioning when a trainer
+    is attached. Training support arrives with the dedicated unified model class.
 
     Host models need to call :meth:`setup_lang_id_prompt` during ``__init__``. Conditioning is then
     applied through whichever entry point suits the inference mode:
@@ -47,8 +42,9 @@ class LangIdPromptMixin:
     - :meth:`apply_lang_id_prompt_for_transcribe` — resolves a language name and applies it to a
       whole batch. A no-op for models without prompt conditioning, so transcription paths can call
       it unconditionally.
-    - :meth:`set_inference_prompt` followed by ``conformer_stream_step`` — conditions on one language
-      held as model state, via the :meth:`_apply_prompt_to_encoded` hook.
+
+    Cache-aware streaming through ``conformer_stream_step`` is not supported: that path belongs to
+    ``PromptStreamingMixin``, whose models are trained for it.
 
     Enabled by the following model config, which must be present in the checkpoint:
 
@@ -64,19 +60,26 @@ class LangIdPromptMixin:
     entirely unaffected.
     """
 
-    # Plain class-level defaults so any ASR model can be interrogated without a `getattr` guard and
+    # Plain class-level defaults so any host model can be interrogated without a `getattr` guard and
     # before (or without) calling ``setup_lang_id_prompt``. ``lang_id_prompt_kernel`` is
     # intentionally NOT declared here: it is an ``nn.Module`` and a class attribute would shadow
     # ``nn.Module.__getattr__``'s lookup into ``_modules`` once the real module is registered.
     use_lang_id_prompt: bool = False
     num_lang_id_prompts: Optional[int] = None
     lang_id_prompt_dictionary: Optional[Dict[str, int]] = None
-    _inference_lang_id_prompt_index: Optional[int] = None
+
+    # Keys tried in order when no language is requested, most language-agnostic first. Only keys the
+    # checkpoint actually defines are considered, so a model with a narrower vocabulary still works.
+    DEFAULT_LANG_ID_PROMPT_PREFERENCE = ('unk', 'auto', 'en-US')
 
     def setup_lang_id_prompt(self) -> None:
         """Build the prompt projection if the model config asks for it, otherwise do nothing.
 
         Safe to call unconditionally from a host model's ``__init__``.
+
+        Raises:
+            ValueError: If the config enables conditioning while a trainer is attached, since no
+                training entry point passes a prompt (see the class docstring).
         """
         # Models carrying their own prompt machinery (``PromptStreamingMixin``, used by the
         # prompt-aware training classes) build and own their projection themselves.
@@ -85,8 +88,16 @@ class LangIdPromptMixin:
 
         model_defaults = self.cfg.get('model_defaults') or {}
         if not model_defaults.get('initialize_lang_id_prompt', False):
-            self._reject_legacy_lang_id_prompt_config(model_defaults)
             return
+
+        if getattr(self, '_trainer', None) is not None:
+            raise ValueError(
+                "`model_defaults.initialize_lang_id_prompt=true` is inference-only: the prompt "
+                "projection would be a trainable parameter that no training or validation step "
+                "conditions on, which fails under DDP and otherwise scores unconditioned metrics. "
+                "Transcribe with `transcribe(target_lang=...)` or the chunked streaming script "
+                "instead of attaching a trainer."
+            )
 
         prompt_dictionary = model_defaults.get('lang_id_prompt_dictionary', None)
         if not prompt_dictionary:
@@ -115,12 +126,29 @@ class LangIdPromptMixin:
             f"languages={list(self.lang_id_prompt_dictionary.keys())}"
         )
 
+    @property
+    def default_lang_id_prompt(self) -> Optional[str]:
+        """The language this model conditions on when a request does not name one.
+
+        Lets callers stay out of the business of guessing language keys: a multilingual model
+        advertises its own language-agnostic prompt instead of every call site hardcoding one.
+
+        Returns:
+            The most language-agnostic key the checkpoint defines, or None if the model has no
+            language-ID prompts or defines none of the candidate keys.
+        """
+        if not self.use_lang_id_prompt:
+            return None
+        return next(
+            (key for key in self.DEFAULT_LANG_ID_PROMPT_PREFERENCE if key in self.lang_id_prompt_dictionary), None
+        )
+
     def resolve_lang_id_prompt(self, target_lang: Optional[str]) -> int:
         """Resolve a language/task name to its prompt index.
 
         The prompt projection is part of the trained forward pass and must always be applied, so this
         always returns an index. When ``target_lang`` is missing or unknown, the model's
-        language-agnostic ``unk`` prompt is used and a warning is logged.
+        :attr:`default_lang_id_prompt` is used and a warning is logged.
 
         Args:
             target_lang: A key of ``lang_id_prompt_dictionary`` (e.g. ``"en-US"``), or None.
@@ -134,23 +162,26 @@ class LangIdPromptMixin:
             return self.lang_id_prompt_dictionary[target_lang]
 
         preview = self._language_preview()
+        fallback = self.default_lang_id_prompt
+        if fallback is None:
+            raise ValueError(
+                f"Cannot pick a default language-ID prompt: the model defines none of "
+                f"{list(self.DEFAULT_LANG_ID_PROMPT_PREFERENCE)}. Please pass an explicit "
+                f"`target_lang`. Available: {preview}"
+            )
+
         if target_lang is None:
             logging.warning(
-                "No `target_lang` provided for a language-ID prompt model; falling back to the 'unk' prompt. "
-                "Pass `target_lang=<lang>` (e.g. target_lang=en-US) to force a specific language."
+                f"No `target_lang` provided for a language-ID prompt model; falling back to the "
+                f"'{fallback}' prompt. Pass `target_lang=<lang>` (e.g. target_lang=en-US) to force a "
+                f"specific language."
             )
         else:
             logging.warning(
-                f"Unknown target_lang='{target_lang}' (available: {preview}); falling back to the 'unk' prompt."
+                f"Unknown target_lang='{target_lang}' (available: {preview}); falling back to the "
+                f"'{fallback}' prompt."
             )
-
-        unk_id = self.lang_id_prompt_dictionary.get('unk')
-        if unk_id is None:
-            raise ValueError(
-                "No 'unk' entry in the model's lang_id_prompt_dictionary to use as a fallback prompt. "
-                f"Please pass an explicit `target_lang`. Available: {preview}"
-            )
-        return unk_id
+        return self.lang_id_prompt_dictionary[fallback]
 
     def create_lang_id_prompt(
         self, batch_size: int, prompt_id: int, dtype: torch.dtype, device: torch.device
@@ -235,46 +266,6 @@ class LangIdPromptMixin:
         prompt = self.create_lang_id_prompt(encoded.shape[0], prompt_id, dtype=encoded.dtype, device=encoded.device)
         return self.apply_lang_id_prompt(encoded, prompt)
 
-    def set_inference_prompt(self, target_lang: str) -> None:
-        """Select the language used by ``conformer_stream_step`` (cache-aware streaming).
-
-        Shares its name and semantics with ``PromptStreamingMixin.set_inference_prompt`` so that
-        cache-aware entry points work with either prompt implementation.
-
-        Args:
-            target_lang: A key of ``lang_id_prompt_dictionary`` (e.g. ``"en-US"``, ``"auto"``).
-        """
-        self._assert_lang_id_prompt_supported()
-
-        if target_lang not in self.lang_id_prompt_dictionary:
-            raise ValueError(f"Unknown target language '{target_lang}'. Available: {self._language_preview()}")
-        self._inference_lang_id_prompt_index = self.lang_id_prompt_dictionary[target_lang]
-        logging.info(f"Inference prompt set to '{target_lang}' (index {self._inference_lang_id_prompt_index})")
-
-    def _apply_prompt_to_encoded(self, encoded: Tensor) -> Tensor:
-        """Apply the prompt selected by :meth:`set_inference_prompt`.
-
-        Overrides the ``ASRModuleMixin`` no-op hook that ``conformer_stream_step`` calls, so that
-        cache-aware streaming conditions on the requested language. Returns ``encoded`` untouched
-        unless the model has language-ID prompts and a language has been selected.
-
-        Args:
-            encoded: Encoder output of shape ``(B, D, T)``.
-
-        Returns:
-            Encoder output of shape ``(B, D, T)``.
-        """
-        if not self.use_lang_id_prompt or self._inference_lang_id_prompt_index is None:
-            return encoded
-
-        prompt = self.create_lang_id_prompt(
-            encoded.shape[0],
-            self._inference_lang_id_prompt_index,
-            dtype=encoded.dtype,
-            device=encoded.device,
-        )
-        return self.apply_lang_id_prompt(encoded, prompt)
-
     def _assert_lang_id_prompt_supported(self) -> None:
         if not self.use_lang_id_prompt:
             raise ValueError(f"{type(self).__name__} was not trained with language-ID prompt conditioning.")
@@ -282,20 +273,6 @@ class LangIdPromptMixin:
     def _language_preview(self) -> str:
         available = list(self.lang_id_prompt_dictionary.keys())
         return f"{available[:10]}{'...' if len(available) > 10 else ''}"
-
-    @staticmethod
-    def _reject_legacy_lang_id_prompt_config(model_defaults) -> None:
-        """Fail loudly on checkpoints that still use the pre-rename config keys."""
-        legacy = [key for key in _LEGACY_CONFIG_KEYS if model_defaults.get(key, None) is not None]
-        if not legacy:
-            return
-        renames = ", ".join(f"`{key}` -> `{_LEGACY_CONFIG_KEYS[key]}`" for key in legacy)
-        raise ValueError(
-            f"This checkpoint uses the legacy language-ID prompt config keys ({renames}) under "
-            "`model_defaults`. Loading it as-is would silently disable language conditioning. Re-export "
-            "the checkpoint with the current key names, renaming the `prompt_kernel.*` weights to "
-            "`lang_id_prompt_kernel.*` as well."
-        )
 
 
 class _Float32PromptProjection(torch.nn.Sequential):

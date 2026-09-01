@@ -84,12 +84,9 @@ class BufferedRNNTPipeline(BasePipeline):
         """Initialize prompt support, plus the default language for prompt-conditioned models."""
         super().init_prompt_support()
 
-        # Default prompt language used when the user does not pass `lang`. Unified models fall back
-        # to their language-agnostic "unk" prompt; prompt-streaming (`concat`) models keep the
-        # historical "en-US" default.
-        self._default_prompt_language_code = None
-        if self.prompt_enabled:
-            self._default_prompt_language_code = "unk" if self.asr_model.asr_model.use_lang_id_prompt else "en-US"
+        # Default prompt language used when the user does not pass `lang`, taken from the model's own
+        # vocabulary so that no language code is hardcoded here.
+        self._default_prompt_language_code = self._resolve_default_language_code() if self.prompt_enabled else None
 
     def init_parameters(self, cfg: DictConfig) -> None:
         """
@@ -211,9 +208,14 @@ class BufferedRNNTPipeline(BasePipeline):
         )
 
         if self.prompt_enabled:
-            # Use "en-US" as the default prompt for zero encoding
-            # This region is sliced out before decoding, so language choice doesn't matter
-            default_prompt_idx = self._resolve_prompt_index("en-US")
+            # This region is sliced out before decoding, so the language choice doesn't matter; any
+            # index the model defines will do, which keeps construction working for a model whose
+            # vocabulary contains none of the usual default keys.
+            default_prompt_idx = (
+                self._resolve_prompt_index(self._default_prompt_language_code)
+                if self._default_prompt_language_code
+                else next(iter(self._prompt_config['prompt_dict'].values()))
+            )
             prompt_indices = torch.tensor([default_prompt_idx], device=self.device, dtype=torch.long)
             prompt_vector = self._create_one_hot_prompts(prompt_indices)  # [1, num_prompts]
 

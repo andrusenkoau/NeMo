@@ -17,7 +17,6 @@ from typing import List, Optional
 
 import torch
 
-from nemo.collections.asr.parts.utils.lang_id_prompt import LangIdPromptMixin
 from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
@@ -31,7 +30,7 @@ from nemo.utils.cast_utils import cast_all
 __all__ = ['ASRModel']
 
 
-class ASRModel(ModelPT, WithOptionalCudaGraphs, LangIdPromptMixin, ABC):
+class ASRModel(ModelPT, WithOptionalCudaGraphs, ABC):
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
         val_loss = {}
         tensorboard_logs = {}

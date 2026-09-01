@@ -28,7 +28,8 @@ Supported models:
     language-ID prompt into the encoder output. Pass the target language via `target_lang` (a key
     from the model's `lang_id_prompt_dictionary`, e.g. "en"). If the model is prompt-conditioned and
     `target_lang` is omitted (or unknown), the language-agnostic "unk" prompt is used. `target_lang`
-    is ignored by models without prompt conditioning.
+    is ignored by models without prompt conditioning, and is separate from `langid`, which only
+    selects the number-to-words locale used when `clean_groundtruth_text=True`.
 
 The difference between streaming and buffered inference is the chunk size (or the latency of inference).
 Buffered inference will use large chunk sizes (5-10 seconds) + some additional right for context.
@@ -54,7 +55,8 @@ python speech_to_text_streaming_infer_rnnt.py \
     left_context_secs=10.0 \
     batch_size=32 \
     clean_groundtruth_text=False \
-    target_lang='en'    # for multilingual (prompt-conditioned) models; also used for groundtruth cleaning
+    langid='en' \
+    target_lang='en'    # for multilingual (prompt-conditioned) models only
 ```
 """
 import copy
@@ -152,11 +154,8 @@ class TranscriptionConfig:
         True  # whether to use the att_context_size as chunk size (important for extra-low latency)
     )
 
-    # Target language, used for two things:
-    #   1. Language-ID prompt conditioning for "unified" models: a key from the model's
-    #      `lang_id_prompt_dictionary` (e.g. "en-US"). Ignored by models without prompt support.
-    #   2. Groundtruth cleaning (convert_num_to_words) during WER computation when
-    #      `clean_groundtruth_text=True`. The base code is derived from it (e.g. "en" from "en-US").
+    # Language-ID prompt for "unified" models: a key from the model's `lang_id_prompt_dictionary`
+    # (e.g. "en-US"). Ignored by models without prompt support.
     target_lang: Optional[str] = None
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
@@ -191,6 +190,7 @@ class TranscriptionConfig:
     # Config for word / character error rate calculation
     calculate_wer: bool = True
     clean_groundtruth_text: bool = False
+    langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
 
     calculate_rtfx: bool = False
@@ -642,13 +642,11 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         logging.info(f"RTFx: {rtfx:.2f}")
 
     if cfg.calculate_wer:
-        # Derive the base language code for groundtruth cleaning (e.g. "en" from "en-US"); default "en".
-        cleaning_langid = cfg.target_lang.split('-')[0].split('_')[0].lower() if cfg.target_lang else "en"
         output_manifest_w_wer, total_res, _ = cal_write_wer(
             pred_manifest=output_filename,
             pred_text_attr_name=pred_text_attr_name,
             clean_groundtruth_text=cfg.clean_groundtruth_text,
-            langid=cleaning_langid,
+            langid=cfg.langid,
             use_cer=cfg.use_cer,
             output_filename=None,
             ignore_punctuation=True,

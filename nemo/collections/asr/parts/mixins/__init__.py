@@ -14,6 +14,7 @@
 
 from nemo.collections.asr.parts.mixins.asr_adapter_mixins import ASRAdapterModelMixin
 from nemo.collections.asr.parts.mixins.interctc_mixin import InterCTCMixin
+from nemo.collections.asr.parts.mixins.lang_id_prompt import LangIdPromptMixin
 from nemo.collections.asr.parts.mixins.mixins import (
     ASRAdapterModelMixin,
     ASRBPEMixin,
@@ -36,6 +37,7 @@ __all__ = [
     'ASRTranscriptionMixin',
     'DiarizationMixin',
     'InterCTCMixin',
+    'LangIdPromptMixin',
     'PromptStreamingMixin',
     'SpeakerKernelMixin',
     'TranscribeConfig',

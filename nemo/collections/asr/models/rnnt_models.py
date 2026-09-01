@@ -34,6 +34,7 @@ from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
     ASRModuleMixin,
     ASRTranscriptionMixin,
+    LangIdPromptMixin,
     TranscribeConfig,
     TranscriptionReturnType,
 )
@@ -57,7 +58,7 @@ from nemo.core.neural_types import (
 from nemo.utils import logging
 
 
-class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
+class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin, LangIdPromptMixin):
     """Base class for encoder decoder RNNT-based models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -716,7 +717,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             lang_id_prompt: Optional one-hot language-ID prompt of shape (B, num_lang_id_prompts),
                 broadcast across time. Only accepted by models trained with language-ID prompt
                 conditioning; see
-                :class:`~nemo.collections.asr.parts.utils.lang_id_prompt.LangIdPromptMixin`.
+                :class:`~nemo.collections.asr.parts.mixins.lang_id_prompt.LangIdPromptMixin`.
 
         Returns:
             A tuple of 2 elements -
