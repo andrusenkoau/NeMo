@@ -106,7 +106,9 @@ class RNNTInferenceWrapper(ASRInferenceWrapper):
             if prompt_vectors is not None:
                 # Unified models take the language-ID prompt under its own name; other
                 # prompt-conditioned models keep the generic `prompt` argument.
-                prompt_arg = 'lang_id_prompt' if self.asr_model.use_lang_id_prompt else 'prompt'
+                prompt_arg = (
+                    'lang_id_prompt' if getattr(self.asr_model, 'language_conditioning_enabled', False) else 'prompt'
+                )
                 model_args[prompt_arg] = prompt_vectors
 
             forward_outs = self.asr_model(**model_args)
@@ -135,8 +137,8 @@ class RNNTInferenceWrapper(ASRInferenceWrapper):
         """
         Convenience wrapper for prompt-enabled encoding.
 
-        Unified models (``use_lang_id_prompt``) broadcast the prompt across the encoder time dimension
-        themselves, so the prompt is forwarded as-is. Prompt-streaming models (``concat``) expect a
+        Unified models broadcast the prompt across the encoder time dimension themselves, so the
+        prompt is forwarded as-is. Prompt-streaming models (``concat``) expect a
         pre-expanded [B, T_enc, num_prompts] tensor, so the time dimension is estimated from the
         feature length for them — note that this estimate is off by one whenever the feature length
         is not a multiple of the subsampling factor.
@@ -147,7 +149,7 @@ class RNNTInferenceWrapper(ASRInferenceWrapper):
         Returns:
             (tuple[Tensor, Tensor]) encoder output and encoder output length.
         """
-        if not self.asr_model.use_lang_id_prompt:
+        if not getattr(self.asr_model, 'language_conditioning_enabled', False):
             encoder_time_steps = processed_signal.shape[2] // self.get_subsampling_factor()
             prompt_vectors = prompt_vectors.unsqueeze(1).expand(-1, encoder_time_steps, -1)
 

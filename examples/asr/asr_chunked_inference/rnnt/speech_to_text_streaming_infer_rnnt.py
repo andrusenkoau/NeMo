@@ -28,7 +28,7 @@ Supported models:
   - with language-ID prompt conditioning (multilingual models): additionally inject a language-ID
     prompt into the encoder output. The prompt encodes the language spoken in the audio, selected per
     utterance from each manifest record's `lang_field` (default "source_lang", a key from the model's
-    `lang_id_prompt_dictionary`, e.g. "en"). Passing `source_lang` overrides that field for every
+    `language_dictionary`, e.g. "en"). Passing `source_lang` overrides that field for every
     utterance (handy to force one language, e.g. to probe behaviour with the "wrong" one). When
     neither is present (or the value is unknown) the language-agnostic "unk" prompt is used. Both are
     ignored by models without prompt conditioning, and are separate from `langid`, which only selects
@@ -158,7 +158,7 @@ class TranscriptionConfig:
     )
 
     # Language-ID prompt for "unified" models: the language spoken in the audio, a key from the model's
-    # `lang_id_prompt_dictionary` (e.g. "en-US"). If `source_lang` is set it overrides every utterance
+    # `language_dictionary` (e.g. "en-US"). If `source_lang` is set it overrides every utterance
     # (handy to force a language, e.g. to probe behaviour with the "wrong" one); if it is None, each
     # record's `lang_field` is used instead. Ignored by models without prompt support.
     source_lang: Optional[str] = None
@@ -422,12 +422,12 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     # unknown. Indices follow `records` order (matching the shuffle=False, in_order=True dataloader),
     # so a running offset maps each batch to its languages; the one-hot is constant across chunks.
     lang_id_prompt_indices = None
-    if asr_model.use_lang_id_prompt:
+    if getattr(asr_model, 'language_conditioning_enabled', False):
         per_record_langs = [
             cfg.source_lang if cfg.source_lang is not None else record.get(cfg.lang_field, None) for record in records
         ]
         # Resolve each distinct language once to avoid repeating fallback warnings for every record.
-        resolved = {lang: asr_model.resolve_lang_id_prompt(lang) for lang in set(per_record_langs)}
+        resolved = {lang: asr_model.resolve_language(lang) for lang in set(per_record_langs)}
         lang_id_prompt_indices = torch.tensor(
             [resolved[lang] for lang in per_record_langs], dtype=torch.long, device=map_location
         )

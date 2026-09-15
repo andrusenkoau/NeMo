@@ -403,7 +403,7 @@ class CacheAwareRNNTInferenceWrapper(CacheAwareASRInferenceWrapper):
             (Tensor) prompt-conditioned encoder output of shape [B, D, T].
         """
         model = self.asr_model
-        if model.use_lang_id_prompt:
+        if getattr(model, 'language_conditioning_enabled', False):
             return model.apply_lang_id_prompt(encoded, prompt_vectors.to(encoded.device))
 
         if not getattr(model, "concat", False):

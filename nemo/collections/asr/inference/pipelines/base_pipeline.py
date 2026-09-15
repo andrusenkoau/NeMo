@@ -489,7 +489,9 @@ class BasePipeline(PipelineInterface):
     def init_prompt_support(self) -> None:
         """Initialize prompt support for multilingual models."""
         model = self.asr_model.asr_model
-        self.prompt_enabled = bool(model.use_lang_id_prompt or getattr(model, 'concat', False))
+        self.prompt_enabled = bool(
+            getattr(model, 'language_conditioning_enabled', False) or getattr(model, 'concat', False)
+        )
 
         if self.prompt_enabled:
             self._prompt_config = self._load_prompt_config()
@@ -504,10 +506,10 @@ class BasePipeline(PipelineInterface):
             (dict) Prompt configuration containing num_prompts, prompt_dict, and compute_dtype.
         """
         model = self.asr_model.asr_model
-        if model.use_lang_id_prompt:
+        if getattr(model, 'language_conditioning_enabled', False):
             return {
                 'num_prompts': model.num_lang_id_prompts,
-                'prompt_dict': model.lang_id_prompt_dictionary,
+                'prompt_dict': model.language_dictionary,
                 'compute_dtype': getattr(model, 'dtype', torch.float32),
             }
 
@@ -571,8 +573,8 @@ class BasePipeline(PipelineInterface):
             return None
 
         model = self.asr_model.asr_model
-        if model.use_lang_id_prompt:
-            return model.default_lang_id_prompt
+        if getattr(model, 'language_conditioning_enabled', False):
+            return model.default_language
 
         prompt_dict = self._prompt_config['prompt_dict']
         return next((code for code in ("auto", "en-US") if code in prompt_dict), None)

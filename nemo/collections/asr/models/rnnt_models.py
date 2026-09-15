@@ -35,7 +35,6 @@ from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
     ASRModuleMixin,
     ASRTranscriptionMixin,
-    LangIdPromptMixin,
     TranscribeConfig,
     TranscriptionReturnType,
 )
@@ -48,18 +47,11 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import (
-    AcousticEncodedRepresentation,
-    AudioSignal,
-    LabelsType,
-    LengthsType,
-    NeuralType,
-    SpectrogramType,
-)
+from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
 from nemo.utils import logging
 
 
-class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin, LangIdPromptMixin):
+class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -146,10 +138,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
-
-        # Setup language-ID prompt conditioning (from LangIdPromptMixin); no-op unless the model
-        # config enables it.
-        self.setup_lang_id_prompt()
 
     def setup_optim_normalization(self):
         """
@@ -263,7 +251,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         augmentor: DictConfig = None,
         verbose: bool = True,
         timestamps: Optional[bool] = None,
-        source_lang: Optional[str] = None,
         override_config: Optional[TranscribeConfig] = None,
     ) -> TranscriptionReturnType:
         """
@@ -293,10 +280,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             timestamps: Optional(Bool): timestamps will be returned if set to True as part of hypothesis object
                 (output.timestep['segment']/output.timestep['word']). Refer to `Hypothesis` class for more details.
                 Default is None and would retain the previous state set by using self.change_decoding_strategy().
-            source_lang: Optional(str) spoken-language prompt for prompt-conditioned ("unified") ASR
-                models, e.g. `"en-US"`; must be a key of the model's `lang_id_prompt_dictionary`. This is
-                the language of the audio, not a translation target. Defaults to the model's
-                language-agnostic `"unk"` prompt. Ignored by models without prompt conditioning.
             override_config: (Optional[TranscribeConfig]) override transcription config pre-defined by the user.
                 **Note**: All other arguments in the function will be ignored if override_config is passed.
                 You should call this argument as `model.transcribe(audio, override_config=TranscribeConfig(...))`.
@@ -345,7 +328,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             override_config=override_config,
             # Additional arguments
             partial_hypothesis=partial_hypothesis,
-            source_lang=source_lang,
         )
 
     def change_vocabulary(self, new_vocabulary: List[str], decoding_cfg: Optional[DictConfig] = None):
@@ -668,15 +650,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             input_signal_eltype = AudioSignal()
 
-        types = {
+        return {
             "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
-        if self.use_lang_id_prompt:
-            types["lang_id_prompt"] = NeuralType(('B', 'D'), LabelsType(), optional=True)
-        return types
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -687,12 +666,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     @typecheck()
     def forward(
-        self,
-        input_signal=None,
-        input_signal_length=None,
-        processed_signal=None,
-        processed_signal_length=None,
-        lang_id_prompt=None,
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -716,10 +690,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 of shape (B, D, T) that has undergone processing via some DALI preprocessor.
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
-            lang_id_prompt: Optional one-hot language-ID prompt of shape (B, num_lang_id_prompts),
-                broadcast across time. Only accepted by models trained with language-ID prompt
-                conditioning; see
-                :class:`~nemo.collections.asr.parts.mixins.lang_id_prompt.LangIdPromptMixin`.
 
         Returns:
             A tuple of 2 elements -
@@ -745,10 +715,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-
-        if lang_id_prompt is not None:
-            encoded = self.apply_lang_id_prompt(encoded, lang_id_prompt)
-
         return encoded, encoded_len
 
     # PTL-specific methods
@@ -979,8 +945,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-        encoded = self.apply_lang_id_prompt_for_transcribe(encoded, getattr(trcfg, 'source_lang', None))
-
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
 

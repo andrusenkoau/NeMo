@@ -1,4 +1,5 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import torch
 from torch import Tensor
@@ -23,25 +24,29 @@ __all__ = ['LangIdPromptMixin']
 
 
 class LangIdPromptMixin:
-    """Language-ID prompt conditioning for encoder-decoder ASR models ("unified" models).
+    """Language conditioning by projecting a one-hot language vector into the encoder output.
 
+    Used by :class:`~nemo.collections.asr.models.unified_rnnt_bpe_models.EncDecUnifiedRNNTBPEModel`.
     A one-hot language/task vector is concatenated to every encoder output frame and projected back
     to the encoder dimension, letting the decoder condition on the requested language. The mixin owns
-    the projection module, the prompt vocabulary, and the prompt tensor construction.
+    the projection module, the language vocabulary, and the prompt tensor construction.
 
     Inference only. The projection is part of the trained forward pass but no training entry point
     conditions on it, so :meth:`setup_lang_id_prompt` refuses to enable conditioning when a trainer
-    is attached. Training support arrives with the dedicated unified model class.
+    is attached. Language-conditioned training arrives with the cache-aware unified architecture,
+    which conditions inside the encoder instead.
 
-    Host models need to call :meth:`setup_lang_id_prompt` during ``__init__``. Conditioning is then
-    applied through whichever entry point suits the inference mode:
+    Host models call :meth:`setup_lang_id_prompt` during ``__init__``. Conditioning is then applied
+    through whichever entry point suits the inference mode:
 
-    - :meth:`apply_lang_id_prompt` — explicit prompt tensor, one row per utterance. Used by offline
-      transcription, buffered/chunked streaming, and batched cache-aware streaming, where different
-      streams in a batch may request different languages.
-    - :meth:`apply_lang_id_prompt_for_transcribe` — resolves a language name and applies it to a
-      whole batch. A no-op for models without prompt conditioning, so transcription paths can call
-      it unconditionally.
+    - :meth:`apply_lang_id_prompt_for_transcribe` — resolves one language name and applies it to a
+      whole batch. A no-op for models without conditioning, so transcription paths can call it
+      unconditionally.
+    - :meth:`apply_lang_id_prompt` — takes an explicit prompt tensor with one row per utterance, for
+      offline transcription, buffered/chunked streaming, and batched cache-aware streaming, where
+      different utterances or streams in one batch may request different languages. Build the tensor
+      with :meth:`create_lang_id_prompt` (one language for the batch) or :meth:`create_lang_id_prompts`
+      (one per row).
 
     Cache-aware streaming through ``conformer_stream_step`` is not supported: that path belongs to
     ``PromptStreamingMixin``, whose models are trained for it.
@@ -54,23 +59,23 @@ class LangIdPromptMixin:
           model_defaults:
             initialize_lang_id_prompt: true
             num_lang_id_prompts: 128
-            lang_id_prompt_dictionary: {en-US: 0, de-DE: 9, ..., unk: 127}
-
-    Models that were not trained with language-ID prompts keep ``use_lang_id_prompt = False`` and are
-    entirely unaffected.
+            language_dictionary: {en-US: 0, de-DE: 9, ..., unk: 127}
     """
 
-    # Plain class-level defaults so any host model can be interrogated without a `getattr` guard and
+    # Plain class-level defaults so a host model can be interrogated without a `getattr` guard and
     # before (or without) calling ``setup_lang_id_prompt``. ``lang_id_prompt_kernel`` is
     # intentionally NOT declared here: it is an ``nn.Module`` and a class attribute would shadow
     # ``nn.Module.__getattr__``'s lookup into ``_modules`` once the real module is registered.
     use_lang_id_prompt: bool = False
     num_lang_id_prompts: Optional[int] = None
-    lang_id_prompt_dictionary: Optional[Dict[str, int]] = None
+    language_dictionary: Optional[Dict[str, int]] = None
+
+    # Sticky language set by ``set_inference_language``, used when a request carries none.
+    _inference_language_id: Optional[int] = None
 
     # Keys tried in order when no language is requested, most language-agnostic first. Only keys the
     # checkpoint actually defines are considered, so a model with a narrower vocabulary still works.
-    DEFAULT_LANG_ID_PROMPT_PREFERENCE = ('unk', 'auto', 'en-US')
+    DEFAULT_LANGUAGE_PREFERENCE = ('unk', 'auto', 'en-US')
 
     def setup_lang_id_prompt(self) -> None:
         """Build the prompt projection if the model config asks for it, otherwise do nothing.
@@ -99,10 +104,10 @@ class LangIdPromptMixin:
                 "instead of attaching a trainer."
             )
 
-        prompt_dictionary = model_defaults.get('lang_id_prompt_dictionary', None)
-        if not prompt_dictionary:
+        language_dictionary = model_defaults.get('language_dictionary', None)
+        if not language_dictionary:
             raise ValueError(
-                "`model_defaults.lang_id_prompt_dictionary` must be a non-empty mapping of language/task "
+                "`model_defaults.language_dictionary` must be a non-empty mapping of language/task "
                 "name to prompt index when `model_defaults.initialize_lang_id_prompt=true`."
             )
 
@@ -115,84 +120,123 @@ class LangIdPromptMixin:
 
         self.use_lang_id_prompt = True
         self.num_lang_id_prompts = int(model_defaults.get('num_lang_id_prompts', 128))
-        self.lang_id_prompt_dictionary = prompt_dictionary
+        self.language_dictionary = language_dictionary
         self.lang_id_prompt_kernel = _Float32PromptProjection(
             torch.nn.Linear(self.num_lang_id_prompts + enc_hidden, enc_hidden * 2),
             torch.nn.ReLU(),
             torch.nn.Linear(enc_hidden * 2, enc_hidden),
         )
         logging.info(
-            f"Language-ID prompt conditioning enabled: num_lang_id_prompts={self.num_lang_id_prompts}, "
-            f"languages={list(self.lang_id_prompt_dictionary.keys())}"
+            f"Language conditioning enabled: num_lang_id_prompts={self.num_lang_id_prompts}, "
+            f"languages={list(self.language_dictionary.keys())}"
         )
 
     @property
-    def default_lang_id_prompt(self) -> Optional[str]:
+    def language_conditioning_enabled(self) -> bool:
+        """Whether this model takes the spoken language as an input.
+
+        The capability question every caller actually has, kept separate from
+        :attr:`use_lang_id_prompt`, which names one particular mechanism for answering it.
+        """
+        return self.use_lang_id_prompt
+
+    @property
+    def default_language(self) -> Optional[str]:
         """The language this model conditions on when a request does not name one.
 
         Lets callers stay out of the business of guessing language keys: a multilingual model
-        advertises its own language-agnostic prompt instead of every call site hardcoding one.
+        advertises its own language-agnostic entry instead of every call site hardcoding one.
 
         Returns:
-            The most language-agnostic key the checkpoint defines, or None if the model has no
-            language-ID prompts or defines none of the candidate keys.
+            The most language-agnostic key the checkpoint defines, or None if the model is not
+            language-conditioned or defines none of the candidate keys.
         """
         if not self.use_lang_id_prompt:
             return None
-        return next(
-            (key for key in self.DEFAULT_LANG_ID_PROMPT_PREFERENCE if key in self.lang_id_prompt_dictionary), None
-        )
+        return next((key for key in self.DEFAULT_LANGUAGE_PREFERENCE if key in self.language_dictionary), None)
 
-    def resolve_lang_id_prompt(self, source_lang: Optional[str]) -> int:
-        """Resolve a spoken-language name to its prompt index.
+    def language_to_id(self, language: Union[str, int]) -> int:
+        """Resolve a language name (or a raw prompt index) to the index the model conditions on.
 
-        The prompt projection is part of the trained forward pass and must always be applied, so this
-        always returns an index. When ``source_lang`` is missing or unknown, the model's
-        :attr:`default_lang_id_prompt` is used and a warning is logged.
+        Strict: an unknown language is an error. Use :meth:`resolve_language` on paths where the
+        request may name no language, or one this model does not know.
 
         Args:
-            source_lang: A key of ``lang_id_prompt_dictionary`` (e.g. ``"en-US"``), or None. This is
-                the language spoken in the audio; the unified model is ASR-only, so there is no
-                separate translation target.
+            language: A key of :attr:`language_dictionary` (e.g. ``"en-US"``), or an index into the
+                prompt vocabulary.
+
+        Returns:
+            The prompt index to condition on.
+        """
+        self._assert_lang_id_prompt_supported()
+        if isinstance(language, int) or (torch.is_tensor(language) and language.dim() == 0):
+            return int(language)
+        if language not in self.language_dictionary:
+            raise ValueError(f"Unknown language '{language}'. Known languages: {sorted(self.language_dictionary)}.")
+        return self.language_dictionary[language]
+
+    def set_inference_language(self, language: Optional[Union[str, int]] = None) -> None:
+        """Fix the language assumed by transcription and streaming when a request carries none.
+
+        For inference modes that have no single call to thread a language through. An explicitly
+        requested language always takes precedence over the one set here.
+
+        Args:
+            language: A key of :attr:`language_dictionary`, a raw prompt index, or None to go back to
+                :attr:`default_language`.
+        """
+        self._assert_lang_id_prompt_supported()
+        self._inference_language_id = None if language is None else self.language_to_id(language)
+
+    def resolve_language(self, language: Optional[str]) -> int:
+        """Resolve a requested language to a prompt index, falling back instead of failing.
+
+        The prompt projection is part of the trained forward pass and must always be applied, so this
+        always returns an index. When ``language`` is missing or unknown, the language set by
+        :meth:`set_inference_language` is used, then :attr:`default_language`, with a warning.
+
+        Args:
+            language: A key of :attr:`language_dictionary` (e.g. ``"en-US"``), or None. This is the
+                language spoken in the audio; the unified model is ASR-only, so there is no separate
+                translation target.
 
         Returns:
             The prompt index to condition on.
         """
         self._assert_lang_id_prompt_supported()
 
-        if source_lang is not None and source_lang in self.lang_id_prompt_dictionary:
-            return self.lang_id_prompt_dictionary[source_lang]
+        if language is not None and language in self.language_dictionary:
+            return self.language_dictionary[language]
+
+        if language is None and self._inference_language_id is not None:
+            return self._inference_language_id
 
         preview = self._language_preview()
-        fallback = self.default_lang_id_prompt
+        fallback = self.default_language
         if fallback is None:
             raise ValueError(
-                f"Cannot pick a default language-ID prompt: the model defines none of "
-                f"{list(self.DEFAULT_LANG_ID_PROMPT_PREFERENCE)}. Please pass an explicit "
-                f"`source_lang`. Available: {preview}"
+                f"Cannot pick a default language: the model defines none of "
+                f"{list(self.DEFAULT_LANGUAGE_PREFERENCE)}. Please request an explicit language. "
+                f"Available: {preview}"
             )
 
-        if source_lang is None:
+        if language is None:
             logging.warning(
-                f"No `source_lang` provided for a language-ID prompt model; falling back to the "
-                f"'{fallback}' prompt. Pass `source_lang=<lang>` (e.g. source_lang=en-US) to force a "
-                f"specific language."
+                f"No language requested for a language-conditioned model; falling back to "
+                f"'{fallback}'. Pass a language (e.g. source_lang=en-US) to force a specific one."
             )
         else:
-            logging.warning(
-                f"Unknown source_lang='{source_lang}' (available: {preview}); falling back to the "
-                f"'{fallback}' prompt."
-            )
-        return self.lang_id_prompt_dictionary[fallback]
+            logging.warning(f"Unknown language '{language}' (available: {preview}); falling back to '{fallback}'.")
+        return self.language_dictionary[fallback]
 
     def create_lang_id_prompt(
         self, batch_size: int, prompt_id: int, dtype: torch.dtype, device: torch.device
     ) -> Tensor:
-        """Create a one-hot language-ID prompt shared by a whole batch.
+        """Create a one-hot language prompt shared by a whole batch.
 
         Args:
             batch_size: Number of utterances in the batch.
-            prompt_id: Prompt index, e.g. from :meth:`resolve_lang_id_prompt`.
+            prompt_id: Prompt index, e.g. from :meth:`resolve_language`.
             dtype: Dtype of the returned tensor.
             device: Device of the returned tensor.
 
@@ -204,14 +248,14 @@ class LangIdPromptMixin:
         return prompt
 
     def create_lang_id_prompts(self, prompt_ids: Tensor, dtype: torch.dtype, device: torch.device) -> Tensor:
-        """Create a one-hot language-ID prompt with a possibly different language per utterance.
+        """Create a one-hot language prompt with a possibly different language per utterance.
 
         Use this when a batch mixes languages (e.g. per-sample ``lang`` fields from a manifest);
         pass a single index to :meth:`create_lang_id_prompt` instead when the whole batch shares one.
 
         Args:
             prompt_ids: 1-D tensor (or sequence) of per-utterance prompt indices, e.g. each from
-                :meth:`resolve_lang_id_prompt`.
+                :meth:`resolve_language`.
             dtype: Dtype of the returned tensor.
             device: Device of the returned tensor.
 
@@ -225,7 +269,7 @@ class LangIdPromptMixin:
         return prompt
 
     def apply_lang_id_prompt(self, encoded: Tensor, prompt: Tensor) -> Tensor:
-        """Condition the encoder output on a language-ID prompt.
+        """Condition the encoder output on a language prompt.
 
         Each row of ``prompt`` may select a different language, so this also serves batched streaming
         where every stream requests its own language.
@@ -273,29 +317,30 @@ class LangIdPromptMixin:
     def apply_lang_id_prompt_for_transcribe(self, encoded: Tensor, source_lang: Optional[str]) -> Tensor:
         """Resolve ``source_lang`` and condition the encoder output on it, for whole-batch inference.
 
-        A no-op for models without language-ID prompts, so transcription paths can call it directly.
+        A no-op for models without language conditioning, so transcription paths can call it directly.
 
         Args:
             encoded: Encoder output of shape ``(B, D, T)``.
-            source_lang: A key of ``lang_id_prompt_dictionary`` (the language spoken in the audio), or
-                None to use the default (``unk``) prompt.
+            source_lang: A key of :attr:`language_dictionary` (the language spoken in the audio), or
+                None to use the language set by :meth:`set_inference_language`, else
+                :attr:`default_language`.
 
         Returns:
-            Encoder output of shape ``(B, D, T)``, conditioned if the model supports prompts.
+            Encoder output of shape ``(B, D, T)``, conditioned if the model supports it.
         """
         if not self.use_lang_id_prompt:
             return encoded
 
-        prompt_id = self.resolve_lang_id_prompt(source_lang)
+        prompt_id = self.resolve_language(source_lang)
         prompt = self.create_lang_id_prompt(encoded.shape[0], prompt_id, dtype=encoded.dtype, device=encoded.device)
         return self.apply_lang_id_prompt(encoded, prompt)
 
     def _assert_lang_id_prompt_supported(self) -> None:
         if not self.use_lang_id_prompt:
-            raise ValueError(f"{type(self).__name__} was not trained with language-ID prompt conditioning.")
+            raise ValueError(f"{type(self).__name__} was not trained with language conditioning.")
 
     def _language_preview(self) -> str:
-        available = list(self.lang_id_prompt_dictionary.keys())
+        available = list(self.language_dictionary.keys())
         return f"{available[:10]}{'...' if len(available) > 10 else ''}"
 
 
