@@ -40,7 +40,6 @@ from nemo.collections.asr.models.ssl_models import (  # noqa: F401
     SpeechEncDecSelfSupervisedModel,
 )
 from nemo.collections.asr.models.transformer_bpe_models import EncDecTransfModelBPE  # noqa: F401
-from nemo.collections.asr.models.unified_rnnt_bpe_models import EncDecUnifiedRNNTBPEModel  # noqa: F401
 
 __all__ = [
     'ASRModel',
@@ -62,7 +61,6 @@ __all__ = [
     'EncDecRNNTModel',
     'EncDecSpeakerLabelModel',
     'EncDecTransfModelBPE',
-    'EncDecUnifiedRNNTBPEModel',
     'SortformerEncLabelModel',
     'SpeechEncDecSelfSupervisedModel',
 ]

@@ -27,12 +27,7 @@ Model Classes
 
 .. autoclass:: nemo.collections.asr.models.EncDecRNNTBPEModelWithPrompt
     :show-inheritance:
-    :members: transcribe, set_inference_prompt, initialize_prompt_feature, change_vocabulary, setup_training_data, setup_optimization, setup_validation_data, setup_test_data, register_artifact
-
-
-.. autoclass:: nemo.collections.asr.models.EncDecUnifiedRNNTBPEModel
-    :show-inheritance:
-    :members: transcribe, forward, set_inference_language, language_to_id, default_language
+    :members: transcribe, forward, resolve_prompt_language, default_prompt_language, set_inference_prompt, initialize_prompt_feature, change_vocabulary, setup_training_data, setup_optimization, setup_validation_data, setup_test_data, register_artifact
 
 
 .. autoclass:: nemo.collections.asr.models.EncDecHybridRNNTCTCBPEModelWithPrompt
@@ -144,10 +139,6 @@ Mixins
     :members:
 
 .. autoclass:: nemo.collections.asr.parts.mixins.interctc_mixin.InterCTCMixin
-    :show-inheritance:
-    :members:
-
-.. autoclass:: nemo.collections.asr.parts.mixins.lang_id_prompt.LangIdPromptMixin
     :show-inheritance:
     :members:
 

@@ -23,16 +23,15 @@ audio duration.
 
 Supported models:
 - Standard (offline) RNNT / Hybrid RNNT-CTC models: transcribed here in a buffered/streaming fashion.
-- Unified (offline/streaming) models, in both variants:
-  - without language-ID prompt conditioning: run as-is, no extra arguments needed.
-  - with language-ID prompt conditioning (multilingual models): additionally inject a language-ID
-    prompt into the encoder output. The prompt encodes the language spoken in the audio, selected per
-    utterance from each manifest record's `lang_field` (default "source_lang", a key from the model's
-    `language_dictionary`, e.g. "en"). Passing `source_lang` overrides that field for every
-    utterance (handy to force one language, e.g. to probe behaviour with the "wrong" one). When
-    neither is present (or the value is unknown) the language-agnostic "unk" prompt is used. Both are
-    ignored by models without prompt conditioning, and are separate from `langid`, which only selects
-    the number-to-words locale used when `clean_groundtruth_text=True`.
+- Prompt-conditioned multilingual RNNT models (`EncDecRNNTBPEModelWithPrompt`): additionally inject a
+  language-ID prompt into the encoder output. The prompt encodes the language spoken in the audio,
+  selected per utterance from each manifest record's `lang_field` (default "lang", the same field
+  offline transcription reads, holding a key of the model's `prompt_dictionary`, e.g. "en" or
+  "en-US"). Passing `target_lang` overrides that field for every utterance (handy to force one
+  language, e.g. to probe behaviour with the "wrong" one). When neither is present, or the value is
+  unknown, the model's own default language is used.
+  Both are ignored by models without prompt conditioning, and are separate from `langid`, which only
+  selects the number-to-words locale used when `clean_groundtruth_text=True`.
 
 The difference between streaming and buffered inference is the chunk size (or the latency of inference).
 Buffered inference will use large chunk sizes (5-10 seconds) + some additional right for context.
@@ -59,7 +58,7 @@ python speech_to_text_streaming_infer_rnnt.py \
     batch_size=32 \
     clean_groundtruth_text=False \
     langid='en' \
-    source_lang='en'    # multilingual (prompt-conditioned) models only; overrides each record's lang_field
+    target_lang='en'    # prompt-conditioned models only; overrides each record's lang_field
 ```
 """
 import copy
@@ -157,12 +156,14 @@ class TranscriptionConfig:
         True  # whether to use the att_context_size as chunk size (important for extra-low latency)
     )
 
-    # Language-ID prompt for "unified" models: the language spoken in the audio, a key from the model's
-    # `language_dictionary` (e.g. "en-US"). If `source_lang` is set it overrides every utterance
+    # Language-ID prompt for prompt-conditioned models: the language spoken in the audio, a key of the
+    # model's `prompt_dictionary` (e.g. "en-US"). If `target_lang` is set it overrides every utterance
     # (handy to force a language, e.g. to probe behaviour with the "wrong" one); if it is None, each
     # record's `lang_field` is used instead. Ignored by models without prompt support.
-    source_lang: Optional[str] = None
-    lang_field: str = "source_lang"
+    target_lang: Optional[str] = None
+    # "lang" matches the Lhotse manifest field that offline transcription reads, so the same manifest
+    # conditions both paths identically.
+    lang_field: str = "lang"
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
     # device anyway, and do inference on CPU only if CUDA device is not found.
@@ -415,24 +416,24 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         in_order=True,
     )
 
-    # Language-ID prompt setup (shared resolution logic with offline transcription).
-    # The prompt encodes the spoken language, resolved per utterance: an explicit `source_lang`
-    # overrides every record (e.g. to force a language); otherwise each record's `lang_field` is used,
-    # falling back to the model's default ("unk") prompt when neither is present or the value is
-    # unknown. Indices follow `records` order (matching the shuffle=False, in_order=True dataloader),
-    # so a running offset maps each batch to its languages; the one-hot is constant across chunks.
-    lang_id_prompt_indices = None
-    if getattr(asr_model, 'language_conditioning_enabled', False):
+    # Language-ID prompt setup. The prompt encodes the spoken language, resolved per utterance: an
+    # explicit `target_lang` overrides every record (e.g. to force a language); otherwise each
+    # record's `lang_field` is used, falling back to the model's own default language when neither is
+    # present or the value is unknown. Indices follow `records` order (matching the shuffle=False,
+    # in_order=True dataloader), so a running offset maps each batch to its languages. The model
+    # builds the one-hot from these indices at the encoder's own length, once per chunk.
+    prompt_indices = None
+    if getattr(asr_model, 'concat', False):
         per_record_langs = [
-            cfg.source_lang if cfg.source_lang is not None else record.get(cfg.lang_field, None) for record in records
+            cfg.target_lang if cfg.target_lang is not None else record.get(cfg.lang_field, None) for record in records
         ]
         # Resolve each distinct language once to avoid repeating fallback warnings for every record.
-        resolved = {lang: asr_model.resolve_language(lang) for lang in set(per_record_langs)}
-        lang_id_prompt_indices = torch.tensor(
+        resolved = {lang: asr_model.resolve_prompt_language(lang) for lang in set(per_record_langs)}
+        prompt_indices = torch.tensor(
             [resolved[lang] for lang in per_record_langs], dtype=torch.long, device=map_location
         )
         source = (
-            f"source_lang='{cfg.source_lang}'" if cfg.source_lang is not None else f"lang_field='{cfg.lang_field}'"
+            f"target_lang='{cfg.target_lang}'" if cfg.target_lang is not None else f"lang_field='{cfg.lang_field}'"
         )
         logging.info(
             f"Language-ID prompt conditioning enabled for {len(per_record_langs)} utterances from {source}; "
@@ -443,9 +444,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     with torch.no_grad(), torch.inference_mode():
         all_hyps = []
         audio_data: AudioBatch
-        # Offset into `lang_id_prompt_indices`; advanced by each batch since the dataloader preserves
+        # Offset into `prompt_indices`; advanced by each batch since the dataloader preserves
         # `records` order (shuffle=False, in_order=True, drop_last=False).
-        lang_id_prompt_offset = 0
+        prompt_offset = 0
         timer.start(device=map_location)
         for audio_data in tqdm(audio_dataloader):
             # get audio
@@ -455,14 +456,11 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             batch_size = audio_batch.shape[0]
             device = audio_batch.device
 
-            # Build this batch's language-ID prompt (one row per utterance, constant across chunks).
-            lang_id_prompt_batch = None
-            if lang_id_prompt_indices is not None:
-                batch_prompt_ids = lang_id_prompt_indices[lang_id_prompt_offset : lang_id_prompt_offset + batch_size]
-                lang_id_prompt_batch = asr_model.create_lang_id_prompts(
-                    batch_prompt_ids, dtype=compute_dtype, device=map_location
-                )
-                lang_id_prompt_offset += batch_size
+            # This batch's language-ID indices (one row per utterance, constant across chunks).
+            batch_prompt_indices = None
+            if prompt_indices is not None:
+                batch_prompt_indices = prompt_indices[prompt_offset : prompt_offset + batch_size]
+                prompt_offset += batch_size
 
             # add biasing requests to the decoder
             if use_per_stream_biasing:
@@ -522,8 +520,8 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                     input_signal=buffer.samples,
                     input_signal_length=buffer.context_size_batch.total(),
                 )
-                if lang_id_prompt_batch is not None:
-                    forward_kwargs["lang_id_prompt"] = lang_id_prompt_batch
+                if batch_prompt_indices is not None:
+                    forward_kwargs["prompt_indices"] = batch_prompt_indices
 
                 encoder_output, encoder_output_len = asr_model(**forward_kwargs)
 
